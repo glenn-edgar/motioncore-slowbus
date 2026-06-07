@@ -31,6 +31,8 @@
 #include "pico/unique_id.h"
 #include "hardware/watchdog.h"
 #include "hardware/adc.h"
+#include "hardware/irq.h"
+#include "hardware/structs/adc.h"   // adc_hw, ADC_FCS_OVER_BITS (overflow resync)
 #include <string.h>   // strcmp for KB lookup by name
 #include "FreeRTOS.h"
 #include "task.h"
@@ -76,8 +78,12 @@
 #define CMD_MON_PING             0x0200u // KB0: liveness round-trip
 #define CMD_MON_SNAPSHOT         0x0201u // KB0: one-shot system report set
 #define CMD_MON_STREAM           0x0202u // KB0: [enable u8][period_ms u16][mask u16]
-#define CMD_ADC_READ             0x0104u // KB1 (api/HIL): read ADC0 (GP26)
-#define ADC0_GPIO                26u
+#define CMD_ADC_READ             0x0104u // KB1 (api/HIL): snapshot the 3 decimated ADC channels
+#define ADC_NCH                  3       // ADC0..2 = GP26/27/28
+#define ADC0_GPIO                26u     // ADC channel ch lives on GP(ADC0_GPIO+ch)
+#define ADC_BOXCAR               8       // raw samples averaged per channel per 1 kHz output
+#define ADC_CLKDIV               1999.0f // 24 kHz total -> 8 kHz/ch -> /8 boxcar = ~1 kHz/ch
+#define ADC_FIFO_THRESH          4       // FIFO IRQ trigger level
 #define KB0_VER                  1u
 // KB0 report opcodes (s2m, src=0xFB). Common header: [batch u16][seq u8][total u8][ver u8].
 #define OP_MON_SYS               0x0030u
@@ -549,19 +555,77 @@ static uint16_t      g_stream_period_ms = 1000;
 static uint32_t      g_stream_next_ms;
 static uint16_t      g_stream_batch;
 
-// KB1 (api/HIL): CMD_ADC_READ -> read ADC0 (GP26) -> OP_SHELL_REPLY [req_id][status][value u16].
-// (Direct blocking read for now; switches to the central decimated ADC service with KB2/KB3.)
+// ---- central ADC service ---------------------------------------------------
+// One SAR ADC, free-running round-robin over ADC0..2 (GP26/27/28) -> FIFO. A
+// single FIFO ISR (on core1) demuxes the round-robin stream into per-channel
+// accumulators and boxcar-decimates to ~1 kHz/channel. SINGLE writer (ISR),
+// lock-free readers — aligned 16-bit reads are atomic on M0+. This is the shared
+// spine "ADC needed by many sources": KB1 reads the buffer here, and the KB2/KB3
+// interlock callbacks will hang off this same 1 kHz decimation tick later.
+static volatile uint16_t g_adc_latest[ADC_NCH];   // decimated mean per channel
+static volatile uint32_t g_adc_decim_count;       // full decimated sets emitted (liveness)
+static volatile uint32_t g_adc_resyncs;           // FIFO-overflow phase resyncs (should stay 0)
+static uint32_t adc_acc[ADC_NCH];                 // ISR-private accumulators
+static uint16_t adc_acc_n[ADC_NCH];
+static uint8_t  adc_phase;                         // round-robin position 0..ADC_NCH-1
+
+static void adc_fifo_isr(void) {
+    // Overflow desyncs the round-robin phase (dropped samples). Rare in this
+    // system (FIFO 8 deep, drained every IRQ), but if it ever happens, restart
+    // cleanly so phase realigns to channel 0.
+    if (adc_hw->fcs & ADC_FCS_OVER_BITS) {
+        adc_run(false);
+        adc_fifo_drain();
+        hw_set_bits(&adc_hw->fcs, ADC_FCS_OVER_BITS | ADC_FCS_UNDER_BITS);
+        for (uint8_t i = 0; i < ADC_NCH; i++) { adc_acc[i] = 0; adc_acc_n[i] = 0; }
+        adc_phase = 0; adc_select_input(0); g_adc_resyncs++;
+        adc_run(true);
+        return;
+    }
+    while (!adc_fifo_is_empty()) {
+        uint16_t raw = adc_fifo_get() & 0x0FFFu;       // 12-bit sample
+        uint8_t ch = adc_phase;
+        adc_acc[ch] += raw;
+        if (++adc_acc_n[ch] >= ADC_BOXCAR) {
+            g_adc_latest[ch] = (uint16_t)(adc_acc[ch] / ADC_BOXCAR);
+            adc_acc[ch] = 0; adc_acc_n[ch] = 0;
+            if (ch == ADC_NCH - 1) g_adc_decim_count++;
+        }
+        if (++adc_phase >= ADC_NCH) adc_phase = 0;
+    }
+}
+
+// Bring up the ADC service. MUST be called from core1 so ADC_IRQ_FIFO is enabled
+// on core1's NVIC — ISR, interlock callbacks, and consuming KBs all same-core.
+static void adc_service_init(void) {
+    adc_init();
+    for (uint8_t i = 0; i < ADC_NCH; i++) adc_gpio_init(ADC0_GPIO + i);
+    adc_set_round_robin((1u << ADC_NCH) - 1);          // channels 0..ADC_NCH-1
+    adc_select_input(0);                               // phase 0 == channel 0
+    adc_phase = 0;
+    adc_fifo_setup(true, false, ADC_FIFO_THRESH, false, false); // en, no DREQ, IRQ@thresh
+    adc_set_clkdiv(ADC_CLKDIV);
+    irq_set_exclusive_handler(ADC_IRQ_FIFO, adc_fifo_isr);
+    adc_irq_set_enabled(true);
+    irq_set_enabled(ADC_IRQ_FIFO, true);
+    adc_run(true);
+}
+
+// KB1 (api/HIL): CMD_ADC_READ -> snapshot the 3 decimated channels from the
+// central ADC buffer (NOT a fresh blocking read) -> OP_SHELL_REPLY
+// [req_id][status][ch0 u16][ch1 u16][ch2 u16].
 void kb1_on_adc(void *handle, unsigned node_index) {
     (void)node_index;
     cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
     uint16_t req_id = (uint16_t)rt->event_data_ptr->data.integer;
-    adc_select_input(0);                 // ADC0 = GP26
-    uint16_t v = adc_read();             // 12-bit
     appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
     uint8_t *p = r.payload; uint8_t n = 0;
     p[n++] = (uint8_t)req_id; p[n++] = (uint8_t)(req_id >> 8);
     p[n++] = SHELL_OK;
-    p[n++] = (uint8_t)v; p[n++] = (uint8_t)(v >> 8);
+    for (uint8_t ch = 0; ch < ADC_NCH; ch++) {
+        uint16_t v = g_adc_latest[ch];             // lock-free single 16-bit read
+        p[n++] = (uint8_t)v; p[n++] = (uint8_t)(v >> 8);
+    }
     r.len = n; (void)xQueueSend(g_up_q, &r, 0);
 }
 
@@ -618,9 +682,9 @@ static void app_engine_task(void *arg) {
     p.total_node_count = h->node_count; p.allocator_0_size = 256;
     p.event_queue_high_priority_size = 8; p.event_queue_low_priority_size = 64; p.delta_time = 0.1;
 
-    // ADC0 (GP26) for KB1 CMD_ADC_READ. (Central decimated ADC service arrives with KB2/KB3.)
-    adc_init();
-    adc_gpio_init(ADC0_GPIO);
+    // Central ADC service: free-running round-robin + 1 kHz FIFO ISR on core1.
+    // (Started here so ADC_IRQ_FIFO is owned by core1.)
+    adc_service_init();
 
     g_rt = cfl_runtime_create(&g_perm, &p, h);
     if (!g_rt) chassis_panic(RST_PANIC, 3);
