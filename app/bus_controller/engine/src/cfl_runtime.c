@@ -241,7 +241,15 @@
                   * so an event for another KB (e.g. a firmware-injected command)
                   * must run in ITS window, not this iteration's. */
                  uint16_t owner = cfl_find_owning_active_kb(handle, event_data.node_id);
-                 if (owner == 0xFFFF) continue;   /* no active owner -> drop safely */
+                 if (owner == 0xFFFF) {
+                     /* node_id past the whole node table is genuine corruption ->
+                      * keep the loud guard. A valid node whose KB just isn't active
+                      * (e.g. a command for a KB4-deleted interlock) is dropped. */
+                     if (event_data.node_id >= handle->flash_handle->node_count) {
+                         EXCEPTION("cfl_runtime_run: event node_id out of range");
+                     }
+                     continue;
+                 }
                  handle->current_kb_idx = owner;
                  handle->kb_start_index = handle->flash_handle->kb_table[owner].start_index;
                  handle->kb_node_count  = handle->flash_handle->kb_table[owner].node_count;
