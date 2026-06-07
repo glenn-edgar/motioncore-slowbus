@@ -229,11 +229,125 @@ WDT bites. (chain_tree's own per-KB exception/heartbeat is intra-KB resilience;
 cross-core liveness stays the RTOS watchdog. KB0 is monitor/telemetry, **not** a
 cross-KB supervisor — that role, where needed, is KB4's via user functions.)
 
+## KB0 monitor — the proof-of-concept message set
+
+KB0 is built first as the PoC: it exercises the whole core1 plumbing (USB → core0 →
+inter-core queue → KB0 tick → data-flow → up-queue → core0 → USB) without the
+interlock/ADC/I²C machinery, and proves the "multiple packets, each a different msg
+id" pattern.
+
+**Addressing.** core1 is a virtual slave at **`BUS_ADDR_APPCORE = 0xFB`**. core0
+routes `dest == 0xFB` to the inter-core down-queue (not the PHY); replies come back
+`src = 0xFB`. **Reporting is distributed:** core0 answers monitor commands at **addr
+0** (its own USB/bus health), KB0 answers at **0xFB** (app/engine health). The host
+queries both and merges by opcode — a monitor must survive what it monitors, and
+core0 stays queryable even if core1 is down.
+
+**Commands** (host → responder, in `OP_SHELL_EXEC` body `[req_id u16][cmd u16][args]`):
+- `CMD_MON_PING (0x0200)` — no args → `OP_SHELL_REPLY [req_id][status][uptime_ms u32]
+  [boot u16][kb0_ver u8]`. Reuses the existing req/reply path (no new Pi decoder);
+  its real job is standing up the inter-core seam.
+- `CMD_MON_SNAPSHOT (0x0201)` — `[category_mask u16]` (reserved; send all in v1) →
+  `OP_SHELL_REPLY[OK]` ack, then the report packets, then `OP_MON_END`.
+- `CMD_MON_STREAM (0x0202)` — `[enable u8][period_ms u16][category_mask u16]`
+  (periodic emission; gated on `host_connected`).
+- candidates: `CMD_MON_LOG_READ`, `CMD_MON_RESET`, `CMD_MON_DESCRIBE`.
+
+**Common report header** (every `OP_MON_*` data packet): `[batch u16][seq u8][total
+u8][ver u8]`. `batch = req_id` for a snapshot; a per-cycle id for stream. Host
+verifies it got `total` distinct `seq`s; `END.count` confirms.
+
+**Reports from KB0 (`src = 0xFB`):**
+- `OP_MON_SYS (0x0030)` — `uptime_ms u32, boot_count u16, reset_cause u8, crashed_kb
+  u8, panic_code u32, status_word u64`.
+- `OP_MON_TASKS (0x0031)` — `n u8, {task_id u8, stack_hwm_words u16, load_permil u16}
+  × n`. task_id: 0 bus, 1 uplink, 2 app_engine, 3 watchdog, 4 idle_core0, 5
+  idle_core1 (idle tasks give per-core load). Load via FreeRTOS run-time stats
+  (`time_us_32` clock).
+- `OP_MON_MEM (0x0032)` — FreeRTOS `{free, min_free, total}` + chain_tree `{perm_used,
+  perm_cap, heap_free, heap_cap}` (caps real now; used/free sentinel until accessors).
+- `OP_MON_TICK (0x0034)` — `tick_hz_x100 u16, deadline_miss_count u16 (real-time loss,
+  reset-on-read), max_overrun_us u16`, then per event queue `{depth, max_ever, cap}`
+  for **high-priority** and **normal**.
+- `OP_MON_KB (0x0035)` — `n u8, {kb_id u8, active u8, state u8, arena_used u16,
+  arena_cap u16, crash_count u8} × n` (each KB's bump arena use+size).
+- `OP_MON_LOG (0x0033)` — EEPROM log batch (faked till the part lands).
+- `OP_MON_EVENT (0x0038)` — async status-word **edge** push (unsolicited).
+
+**Reports from core0 (`src = 0`, distributed):**
+- `OP_MON_LINK (0x0036)` — USB host link: frames tx/rx, CRC/decode errors, host
+  attach/detach count, TX-ring HWM.
+- `OP_MON_BUS (0x0037)` — RS-485: frames tx/rx, poll cycles, CRC/NAK, per-slave
+  up/down counts, RX-ring overruns.
+
+**Terminator:** `OP_MON_END (0x003F)` — `[batch u16][count u8][status u8][ver u8]`;
+`status` 0=OK, 1=TRUNCATED (distinguishes lost-packet from sent-fewer).
+
+**v1 scope:** PING + SNAPSHOT; reports `SYS, TASKS, MEM` (original three) plus `TICK`
+and `KB` (pulled in by the real-time-loss / event-depth / per-KB-arena / crash
+requirements). STREAM, LOG, EVENT, and the core0 LINK/BUS reports follow.
+
+## Crash & watchdog model
+
+**Two kinds of KB crash, handled differently:**
+- **Soft** (chain exception / heartbeat timeout) — catchable: the KB's recovery scope,
+  else KB4 restarts it (`cfl_delete/add_test`), with the supervisor's leaky-bucket
+  limiting restarts. No reset; reported live via `OP_MON_KB.crash_count` +
+  `OP_MON_EVENT`. The link stays up.
+- **Hard** (a C fault in a user function — null deref, bad memory, stack overflow) —
+  **uncatchable** by chain_tree (a CPU exception), and in a shared tick thread it
+  faults all of core1. The only safe response is a **recorded whole-chip reset**.
+
+**Reset policy = whole-chip for v1.** Simple and clean: the BC re-enumerates, the Pi
+controller auto-resyncs, KB4 re-applies the EEPROM power-on posture (live faults
+re-trip in ~1 ms). Safe in context — **the slaves hold their own interlocks**, so a BC
+reboot is a brief loss of *supervision*, not of slave-side safety. (core1-only reset
+is a future availability upgrade, once veto-continuity across the restart is solved.)
+
+**Detection + attribution:**
+- A **fault handler on each core** (read `SIO->CPUID`) records `{which_core,
+  fault_pc, current_kb}` to the crash slot and resets *immediately* — faster than the
+  WDT timeout. **Stamp `current_kb`** into the crash slot before each KB's tick so a
+  hard fault is attributable to the KB that was running.
+- **Per-core alive timestamps** so a WDT-bite *hang* is attributed to the right core.
+- **One chip-wide HW WDT**, petted only when **both cores' thread heartbeats** are
+  fresh — this already catches a core0 crash (a dead core0 can't keep its heartbeats
+  fresh → no pet → reset). No second watchdog *task* (redundant with heartbeat-gating).
+- `reset_cause` enum: `POWER, CORE0_FAULT, CORE1_FAULT, KB_CRASH, CORE0_HANG,
+  CORE1_HANG, MALLOC` — surfaced (with `crashed_kb`) in `OP_MON_SYS` after reboot.
+
+## core0 host link — the "USB connected throughout" condition
+
+`host_link` (core0) replaces the SAMD21 s_engine dongle chain. Parallel behaviors
+need no `fork` — in C, "emit timed REGISTER/HEARTBEAT" (`host_link_tick`) and
+"dispatch incoming frames" (`host_link_feed`) are just two functions both running each
+loop. The pervasive **USB-connected** condition is handled: `host_link_tick(h, now,
+connected)` **emits nothing while disconnected** (no stale-frame accrual), and the app
+calls `host_link_reset_boot()` on the disconnect edge so the next host gets a fresh
+ladder (bench-proven: `step3` ×2). Optional future hardening: opcode-state-legality
+NAKs (`NAK_ERR_STATE`) for a misbehaving host.
+
+## Constraint on KB-shape drafting
+
+When KB0–KB4 chain shapes are drafted, each KB starts from **two questions, not from
+a flat sequential state machine** (the SAMD21 s_engine lesson):
+1. **What runs in parallel?** Use `fork` for concurrent behaviors within a state —
+   e.g. KB0 = `{command-handler ‖ stream-emitter ‖ status-edge-watcher}`; KB4 =
+   `{request-server ‖ supervisor-of-KB2/KB3}`.
+2. **What conditions gate it, throughout?** Express pervasive conditions via
+   status-bit/bitmask gating of data-flow, aux/boolean node functions, and a parallel
+   watcher branch that fires a transition when a condition flips. Known conditions:
+   - **`host_connected`** — a core0→core1 signal; KB0's stream gates on it (don't
+     stream into a dead link) and resets stream state on disconnect (the core1 mirror
+     of `host_link_reset_boot`).
+   - **`config_ready`** — the boot-gate; KB4 refuses interlock arming until the EEPROM
+     config is loaded.
+
 ## Open items / build order
 
 Open: core0 command arbitration (Pi vs core1); confirm the status-word scope;
 verify cross-KB `delete/add_test` re-entrancy; allocate the s2m opcode catalog for
-KB0's msg ids + the re-arm command id.
+KB0's msg ids + the re-arm command id; the core0→core1 `host_connected` signal.
 
 Suggested build order:
 1. Fan-in mailboxes + tick-as-sole-injector.

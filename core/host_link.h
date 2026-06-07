@@ -102,7 +102,12 @@ void host_link_set_callbacks(host_link_t *h, host_link_bus_cb on_bus_msg,
 void host_link_feed(host_link_t *h, uint8_t byte);
 
 // Timed work: re-announce REGISTER until OPERATIONAL, then emit HEARTBEAT.
-void host_link_tick(host_link_t *h, uint32_t now_ms);
+// `connected` = host-link up (CDC DTR). When down, emit nothing — the host
+// can't read it and the frames would just accrue stale in the TX ring; on the
+// disconnect edge the caller also calls host_link_reset_boot() so the next host
+// gets a fresh ladder. (The "is USB connected throughout the protocol" condition,
+// the SAMD21 lesson, gating emission here.)
+void host_link_tick(host_link_t *h, uint32_t now_ms, bool connected);
 
 // Re-arm the ladder to BOOT and re-announce REGISTER. Call on a host (re)attach
 // edge — the RP2040 has no DTR-triggered reset, so this is how a newly-attached

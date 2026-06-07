@@ -127,7 +127,8 @@ void host_link_feed(host_link_t *h, uint8_t byte) {
         on_frame(h, &meta, payload);
 }
 
-void host_link_tick(host_link_t *h, uint32_t now_ms) {
+void host_link_tick(host_link_t *h, uint32_t now_ms, bool connected) {
+    if (!connected) return;   // host link down: stay quiet, don't accrue stale frames
     if (h->state != HL_OPERATIONAL) {
         if ((int32_t)(now_ms - h->next_register_ms) >= 0) {
             emit_register(h);

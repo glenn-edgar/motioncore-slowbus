@@ -377,7 +377,7 @@ int main(void) {
             host_link_feed(&g_hl, (uint8_t)c);
 
         uint32_t now = to_ms_since_boot(get_absolute_time());
-        host_link_tick(&g_hl, now);
+        host_link_tick(&g_hl, now, conn);
         sweep_step(now);
         emit_liveness_edges();
 

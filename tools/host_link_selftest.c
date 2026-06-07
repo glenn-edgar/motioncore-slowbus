@@ -78,7 +78,7 @@ int main(void) {
     printf("== host_link sync ladder ==\n");
 
     // 1. boot REGISTER on first tick.
-    host_link_tick(&H, 0);
+    host_link_tick(&H, 0, true);
     drain_s2m();
     CHECK(g_seen[OP_REGISTER] == 1, "boot announces OP_REGISTER");
     CHECK(g_last.payload_len == 38 && g_last_pl[0] == 2, "REGISTER is 38-byte v2");
@@ -96,7 +96,7 @@ int main(void) {
     // 3. OPERATIONAL_BEGIN -> OPERATIONAL -> HEARTBEAT on tick.
     feed_m2s(0, OP_OPERATIONAL_BEGIN, NULL, 0);
     CHECK(host_link_state(&H) == HL_OPERATIONAL, "OPERATIONAL_BEGIN -> OPERATIONAL");
-    host_link_tick(&H, 1000);
+    host_link_tick(&H, 1000, true);
     drain_s2m();
     CHECK(g_seen[OP_HEARTBEAT] >= 1, "OPERATIONAL emits OP_HEARTBEAT");
 

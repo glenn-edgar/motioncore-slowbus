@@ -349,7 +349,7 @@ static void uplink_task(void *arg) {
         int c;
         while ((c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT)
             host_link_feed(&g_hl, (uint8_t)c);     // may invoke on_bus_msg/on_local_shell
-        host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()));
+        host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), conn);
         n = host_link_tx_drain(&g_hl, out, sizeof out);
         UNLOCK();
 
