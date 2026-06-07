@@ -159,6 +159,30 @@ pico_enable_stdio_usb(bus_data_test 1)
 pico_enable_stdio_uart(bus_data_test 0)
 pico_add_extra_outputs(bus_data_test)
 
+# ---------------------------------------------------------------------------
+# Uplink bring-up: USB-CDC libcomm host link (northbound) + inline bus bridge
+# (southbound). The Pi-side linux/bus_controller drives the sync ladder, sees
+# identity=bus_controller, and bridges commands through to SAMD21 slave 3.
+# Binary frames on USB -> CRLF translation compiled out; raw byte I/O only.
+# ---------------------------------------------------------------------------
+set(LIBCOMM_DIR ${PORT_DIR}/vendor/libcomm)
+add_executable(uplink_test
+    ${CMAKE_CURRENT_LIST_DIR}/app/uplink_test/main.c
+    ${CMAKE_CURRENT_LIST_DIR}/core/host_link.c
+    ${LIBCOMM_DIR}/frame.c
+    ${PORT_DIR}/phy_pio_rs485.c
+    ${CORE_DIR}/bus_frame.c
+    ${CORE_DIR}/bus_crc8.c)
+pico_generate_pio_header(uplink_test ${PORT_DIR}/rs485.pio)
+target_include_directories(uplink_test PRIVATE ${COMMON_INC} ${LIBCOMM_DIR})
+target_compile_definitions(uplink_test PRIVATE
+    PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0)
+target_compile_options(uplink_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_link_libraries(uplink_test pico_stdlib hardware_pio hardware_clocks pico_unique_id)
+pico_enable_stdio_usb(uplink_test 1)
+pico_enable_stdio_uart(uplink_test 0)
+pico_add_extra_outputs(uplink_test)
+
 # Full HIL API suite over the bus (echo/sysinfo/stack/gpio/dac-adc/interlocks).
 add_executable(bus_api_test
     ${CMAKE_CURRENT_LIST_DIR}/app/bus_api_test/main.c

@@ -9,6 +9,7 @@ build/
 
 # Host self-test artifacts
 tools/st
+tools/hl
 
 # Editor / OS
 *.o
