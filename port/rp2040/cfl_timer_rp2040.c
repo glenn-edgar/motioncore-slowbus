@@ -13,6 +13,11 @@
  * resulting commands into the runtime. Default no-op (e.g. host link tests). */
 __attribute__((weak)) void cfl_embed_pre_tick(void) {}
 
+/* Real-time-loss counters (read+reset by the monitor's OP_MON_TICK): a tick whose
+ * requested wait is <= 0 means the engine fell behind its 10 Hz schedule. */
+volatile uint32_t g_cfl_deadline_miss = 0;
+volatile uint32_t g_cfl_max_overrun_us = 0;
+
 struct cfl_timer_context { double wait_seconds; int32_t last_second; };
 static struct cfl_timer_context g_ctx;
 
@@ -33,6 +38,11 @@ cfl_timer_error_t cfl_timer_wait(cfl_timer_handle_t handle, double wait_seconds,
         uint32_t ms = (uint32_t)(wait_seconds * 1000.0 + 0.5);
         if (ms == 0) ms = 1;
         vTaskDelay(pdMS_TO_TICKS(ms));
+    } else {
+        g_cfl_deadline_miss++;                       // engine fell behind its schedule
+        uint32_t over = (uint32_t)(-wait_seconds * 1e6);
+        if (over > g_cfl_max_overrun_us) g_cfl_max_overrun_us = over;
+        taskYIELD();
     }
     cfl_embed_pre_tick();                 /* inject this tick's inter-core events */
     double t = now_seconds();

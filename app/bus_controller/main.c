@@ -78,8 +78,13 @@
 #define OP_MON_SYS               0x0030u
 #define OP_MON_TASKS             0x0031u
 #define OP_MON_MEM               0x0032u
+#define OP_MON_TICK              0x0034u
+#define OP_MON_KB                0x0035u
 #define OP_MON_END               0x003Fu
 #define MON_VER                  1u
+
+extern volatile uint32_t g_cfl_deadline_miss;    // from cfl_timer_rp2040.c
+extern volatile uint32_t g_cfl_max_overrun_us;
 
 // ---- roster flags + liveness states (match SAMD21 bus_roster) --------------
 #define FLAG_ENABLED             0x02u
@@ -455,7 +460,7 @@ void kb0_on_snapshot(void *handle, unsigned node_index) {
     (void)node_index;
     cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
     uint16_t batch = (uint16_t)rt->event_data_ptr->data.integer;   // = req_id
-    const uint8_t total = 3;
+    const uint8_t total = 5;
     uint8_t b[APPCORE_PAY_MAX]; int n;
 
     // ack — OP_SHELL_REPLY [req_id][status]
@@ -490,6 +495,28 @@ void kb0_on_snapshot(void *handle, unsigned node_index) {
     mon_w32(b,&n,(uint32_t)cfl_heap_free_bytes(rt->heap));
     mon_w32(b,&n,(uint32_t)((uint32_t)cfl_heap_used_bytes(rt->heap)+cfl_heap_free_bytes(rt->heap)));
     mon_push(OP_MON_MEM, b, (uint8_t)n);
+
+    // OP_MON_TICK seq3 — engine cadence + real-time loss + event-queue depths
+    n=0; mon_w16(b,&n,batch); b[n++]=3; b[n++]=total; b[n++]=MON_VER;
+    mon_w16(b,&n,1000);                              // tick_hz_x100 (10 Hz)
+    mon_w16(b,&n,(uint16_t)g_cfl_deadline_miss);     // real-time loss (reset-on-read)
+    mon_w16(b,&n,(uint16_t)g_cfl_max_overrun_us);
+    g_cfl_deadline_miss = 0; g_cfl_max_overrun_us = 0;
+    b[n++]=(uint8_t)cfl_high_priority_count(rt->event_queue); b[n++]=8;   // hi depth/cap
+    b[n++]=(uint8_t)cfl_low_priority_count(rt->event_queue);  b[n++]=64;  // lo depth/cap
+    mon_push(OP_MON_TICK, b, (uint8_t)n);
+
+    // OP_MON_KB seq4 — per-KB {id, active, state, arena_used, arena_cap, crash_count}
+    n=0; mon_w16(b,&n,batch); b[n++]=4; b[n++]=total; b[n++]=MON_VER;
+    b[n++]=1;                                        // n KBs reported (kb0)
+    uint16_t au = cfl_heap_arena_used_bytes(rt->arena_system, 0);
+    uint16_t af = cfl_heap_arena_free_bytes(rt->arena_system, 0);
+    b[n++]=0;                                        // kb_id 0
+    b[n++]=1;                                        // active
+    b[n++]=0;                                        // state (n/a)
+    mon_w16(b,&n,au); mon_w16(b,&n,(uint16_t)(au+af));
+    b[n++]=0;                                        // crash_count
+    mon_push(OP_MON_KB, b, (uint8_t)n);
 
     // OP_MON_END [batch][count][status][ver]
     n=0; mon_w16(b,&n,batch); b[n++]=total; b[n++]=0; b[n++]=MON_VER;
@@ -588,7 +615,7 @@ int main(void) {
     g_lock = xSemaphoreCreateMutex();
     if (!g_lock) chassis_panic(RST_PANIC, 1);
     g_down_q = xQueueCreate(8, sizeof(appcore_cmd_t));
-    g_up_q   = xQueueCreate(8, sizeof(appcore_rep_t));
+    g_up_q   = xQueueCreate(16, sizeof(appcore_rep_t));   // headroom for a snapshot burst (7 frames)
     if (!g_down_q || !g_up_q) chassis_panic(RST_PANIC, 2);
 
     uint32_t t0 = time_us_32();
