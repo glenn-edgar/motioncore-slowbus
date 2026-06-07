@@ -69,20 +69,35 @@ endfunction()
 # libcomm host link + autonomous poll sweep + liveness. Dedicated target (not
 # slow_bus_image): brings host_link, the commission block, and the chassis
 # hardening, not the bus_sched/bus_node skeleton. WiFi uplink + core1 app deferred.
+# core1 chain_tree engine (static-link) + the KB0 generated chain (gc-sections trims).
+set(BC_DIR ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller)
+file(GLOB KB0_ENGINE_SRCS CONFIGURE_DEPENDS ${BC_DIR}/engine/src/*.c)
+file(GLOB KB0_INCR_SRCS   CONFIGURE_DEPENDS ${BC_DIR}/kb0/incr/*.c)
+
 add_executable(bus_controller
     ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/main.c
     ${CMAKE_CURRENT_LIST_DIR}/core/host_link.c
     ${CMAKE_CURRENT_LIST_DIR}/app/chassis/commission.c
     ${PORT_DIR}/phy_pio_rs485.c
+    ${PORT_DIR}/cfl_timer_rp2040.c
     ${CORE_DIR}/bus_frame.c
     ${CORE_DIR}/bus_crc8.c
-    ${LIBCOMM_DIR}/frame.c)
+    ${LIBCOMM_DIR}/frame.c
+    ${KB0_ENGINE_SRCS}
+    ${KB0_INCR_SRCS}
+    ${BC_DIR}/kb0/user_functions.c)
 pico_generate_pio_header(bus_controller ${PORT_DIR}/rs485.pio)
 target_include_directories(bus_controller PRIVATE
-    ${COMMON_INC} ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis)
+    ${COMMON_INC} ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
+    ${BC_DIR}/engine/include ${BC_DIR}/kb0/incr)
 target_compile_definitions(bus_controller PRIVATE
-    PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0)
-target_compile_options(bus_controller PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0 CFL_32BIT=1)
+# Force-include the printf-stub so the chain_tree runtime's diagnostics can't
+# corrupt the binary USB frame stream. -Wno-* keeps the vendored engine quiet.
+target_compile_options(bus_controller PRIVATE -Wall -Wextra -Wno-unused-parameter
+    $<$<COMPILE_LANGUAGE:C>:-include>
+    $<$<COMPILE_LANGUAGE:C>:${BC_DIR}/engine/cfl_embed_stubs.h>)
+target_link_options(bus_controller PRIVATE -Wl,--gc-sections)
 target_link_libraries(bus_controller
     pico_stdlib pico_multicore hardware_watchdog hardware_flash pico_unique_id
     hardware_pio hardware_clocks pico_async_context_freertos

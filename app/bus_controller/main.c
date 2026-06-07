@@ -43,6 +43,12 @@
 #include "opcodes.h"
 #include "commission.h"
 
+// core1 chain_tree engine (KB0)
+#include "cfl_runtime.h"
+#include "cfl_event_queue.h"
+#include "chaintree_handle.h"
+#include "chaintree_handle_events.h"   // EVENT_CMD_MON_PING
+
 // ---- identity announced in REGISTER (interim: SAMD21 BC class; see memory) --
 #define CLASS_ID_BUS_CONTROLLER  0x5E589000u
 #define BC_INSTANCE_ID           42u
@@ -85,6 +91,7 @@ static const char *const RST_NAME[] = { "POWER", "WDT", "PANIC", "STACK", "MALLO
 #define CRASH_MAGIC 0x5B0BC0DEu
 typedef struct { uint32_t magic, boot_count, last_cause, panic_code; } crash_slot_t;
 static crash_slot_t g_crash __attribute__((section(".uninitialized_data")));
+static void chassis_panic(uint32_t cause, uint32_t code);   // defined below
 
 // ---- monitored-thread heartbeats -------------------------------------------
 enum { HB_BUS = 0, HB_UPLINK, HB_APP, HB_COUNT };
@@ -391,35 +398,76 @@ static void uplink_task(void *arg) {
     }
 }
 
-// ---- core1 application engine (KB0 monitor PoC, first slice) ----------------
-// Stands up the inter-core seam: drain the down-queue, dispatch, push replies to
-// the up-queue (core0 relays them to USB). For now a direct C handler for
-// CMD_MON_PING; the chain_tree engine + the KB0 chain replace this next.
+// ---- core1 application engine: the chain_tree KB0 (static-link) -------------
+// cfl_runtime_run is the forever loop = this thread's body. The RP2040 timer
+// (cfl_timer_rp2040.c) yields each tick and calls cfl_embed_pre_tick(), where we
+// drain the inter-core down-queue and inject the commands as chain_tree events.
+// KB0's MON_PING_REPLY one-shot fires -> kb0_on_ping builds the OP_SHELL_REPLY and
+// pushes the up-queue (core0 relays it to USB).
+static cfl_runtime_handle_t *g_rt;
+static cfl_perm_t            g_perm;
+static char                  g_perm_buf[16 * 1024] __attribute__((aligned(8)));
+static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
+
+static void kb0_push_ping_reply(uint16_t req_id) {
+    appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+    uint32_t up = to_ms_since_boot(get_absolute_time());
+    uint16_t boot = (uint16_t)g_crash.boot_count;
+    uint8_t *p = r.payload; uint8_t n = 0;
+    p[n++] = (uint8_t)req_id; p[n++] = (uint8_t)(req_id >> 8);
+    p[n++] = SHELL_OK;
+    p[n++] = (uint8_t)up; p[n++] = (uint8_t)(up >> 8);
+    p[n++] = (uint8_t)(up >> 16); p[n++] = (uint8_t)(up >> 24);
+    p[n++] = (uint8_t)boot; p[n++] = (uint8_t)(boot >> 8);
+    p[n++] = KB0_VER;
+    r.len = n;
+    (void)xQueueSend(g_up_q, &r, 0);
+}
+
+// chain_tree user-fn overrides (weak defaults in kb0/user_functions.c).
+void kb0_on_ping(void *handle, unsigned node_index) {
+    (void)node_index;
+    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
+    uint16_t req_id = (uint16_t)rt->event_data_ptr->data.integer;   // injected req_id
+    kb0_push_ping_reply(req_id);
+}
+void kb0_on_cmd_timeout(void *handle, unsigned node_index) { (void)handle; (void)node_index; }
+
+// per-tick hook (weak default in cfl_timer_rp2040.c): bump the core1 heartbeat and
+// inject this tick's inter-core commands into the runtime's event queue.
+void cfl_embed_pre_tick(void) {
+    g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
+    appcore_cmd_t c;
+    while (xQueueReceive(g_down_q, &c, 0) == pdTRUE) {
+        if (c.cmd == CMD_MON_PING) {
+            cfl_send_integer_event(g_rt->event_queue, CFL_EVENT_PRIORITY_HIGH,
+                                   g_kb0_node, EVENT_CMD_MON_PING, (cfl_int_t)c.req_id);
+        } else {   // unknown command -> direct UNKNOWN_CMD reply (no chain handler)
+            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+            r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
+            r.payload[2] = SHELL_UNKNOWN_CMD; r.len = 3;
+            (void)xQueueSend(g_up_q, &r, 0);
+        }
+    }
+}
+
 static void app_engine_task(void *arg) {
     (void)arg;
-    for (;;) {
-        g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
+    const chaintree_handle_t *h = &g_chaintree_handle;
+    cfl_runtime_create_params_t p; memset(&p, 0, sizeof p);
+    p.perm = &g_perm; p.perm_buffer = g_perm_buf; p.perm_buffer_size = (uint16_t)sizeof g_perm_buf;
+    p.heap_size = 4096; p.max_allocator_count = cfl_calculate_arrena_number(h);
+    p.total_node_count = h->node_count; p.allocator_0_size = 256;
+    p.event_queue_high_priority_size = 8; p.event_queue_low_priority_size = 64; p.delta_time = 0.1;
 
-        appcore_cmd_t c;
-        if (xQueueReceive(g_down_q, &c, pdMS_TO_TICKS(10)) != pdTRUE) continue;
-
-        appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
-        uint8_t *p = r.payload; uint8_t n = 0;
-        p[n++] = (uint8_t)c.req_id; p[n++] = (uint8_t)(c.req_id >> 8);   // [req_id]
-        if (c.cmd == CMD_MON_PING) {
-            uint32_t up = to_ms_since_boot(get_absolute_time());
-            uint16_t boot = (uint16_t)g_crash.boot_count;
-            p[n++] = SHELL_OK;
-            p[n++] = (uint8_t)up;  p[n++] = (uint8_t)(up >> 8);
-            p[n++] = (uint8_t)(up >> 16); p[n++] = (uint8_t)(up >> 24);
-            p[n++] = (uint8_t)boot; p[n++] = (uint8_t)(boot >> 8);
-            p[n++] = KB0_VER;
-        } else {
-            p[n++] = SHELL_UNKNOWN_CMD;
-        }
-        r.len = n;
-        (void)xQueueSend(g_up_q, &r, pdMS_TO_TICKS(5));
-    }
+    g_rt = cfl_runtime_create(&g_perm, &p, h);
+    if (!g_rt) chassis_panic(RST_PANIC, 3);
+    cfl_runtime_reset(g_rt);
+    cfl_add_test_by_index(g_rt, 0);                 // activate kb0
+    g_kb0_node = h->kb_table[0].start_index;        // event-injection target
+    g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
+    cfl_runtime_run(g_rt);                           // forever loop (the thread body)
+    for (;;) vTaskDelay(pdMS_TO_TICKS(100));         // not reached
 }
 
 // ---- watchdog: free-running-clock liveness gate -> pet HW WDT ---------------
