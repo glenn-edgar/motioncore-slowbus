@@ -73,6 +73,7 @@
 #define BUS_ADDR_APPCORE         0xFBu   // core1 virtual-slave address
 #define CMD_MON_PING             0x0200u // KB0: liveness round-trip
 #define CMD_MON_SNAPSHOT         0x0201u // KB0: one-shot system report set
+#define CMD_MON_STREAM           0x0202u // KB0: [enable u8][period_ms u16][mask u16]
 #define KB0_VER                  1u
 // KB0 report opcodes (s2m, src=0xFB). Common header: [batch u16][seq u8][total u8][ver u8].
 #define OP_MON_SYS               0x0030u
@@ -456,15 +457,11 @@ static void mon_push(uint16_t op, const uint8_t *body, uint8_t len) {
     (void)xQueueSend(g_up_q, &r, 0);
 }
 
-void kb0_on_snapshot(void *handle, unsigned node_index) {
-    (void)node_index;
-    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
-    uint16_t batch = (uint16_t)rt->event_data_ptr->data.integer;   // = req_id
+// Emit the report set (SYS/TASKS/MEM/TICK/KB + END) tagged with `batch`. Shared by
+// the on-command SNAPSHOT and the periodic STREAM. Uses g_rt (the runtime handle).
+static void kb0_emit_reports(uint16_t batch) {
     const uint8_t total = 5;
     uint8_t b[APPCORE_PAY_MAX]; int n;
-
-    // ack — OP_SHELL_REPLY [req_id][status]
-    n=0; mon_w16(b,&n,batch); b[n++]=SHELL_OK; mon_push(OP_SHELL_REPLY, b, (uint8_t)n);
 
     // OP_MON_SYS seq0
     n=0; mon_w16(b,&n,batch); b[n++]=0; b[n++]=total; b[n++]=MON_VER;
@@ -490,10 +487,10 @@ void kb0_on_snapshot(void *handle, unsigned node_index) {
     mon_w32(b,&n,(uint32_t)xPortGetFreeHeapSize());
     mon_w32(b,&n,(uint32_t)xPortGetMinimumEverFreeHeapSize());
     mon_w32(b,&n,(uint32_t)configTOTAL_HEAP_SIZE);
-    mon_w32(b,&n,(uint32_t)cfl_perm_used_bytes(rt->perm));
+    mon_w32(b,&n,(uint32_t)cfl_perm_used_bytes(g_rt->perm));
     mon_w32(b,&n,(uint32_t)sizeof g_perm_buf);
-    mon_w32(b,&n,(uint32_t)cfl_heap_free_bytes(rt->heap));
-    mon_w32(b,&n,(uint32_t)((uint32_t)cfl_heap_used_bytes(rt->heap)+cfl_heap_free_bytes(rt->heap)));
+    mon_w32(b,&n,(uint32_t)cfl_heap_free_bytes(g_rt->heap));
+    mon_w32(b,&n,(uint32_t)((uint32_t)cfl_heap_used_bytes(g_rt->heap)+cfl_heap_free_bytes(g_rt->heap)));
     mon_push(OP_MON_MEM, b, (uint8_t)n);
 
     // OP_MON_TICK seq3 — engine cadence + real-time loss + event-queue depths
@@ -502,15 +499,15 @@ void kb0_on_snapshot(void *handle, unsigned node_index) {
     mon_w16(b,&n,(uint16_t)g_cfl_deadline_miss);     // real-time loss (reset-on-read)
     mon_w16(b,&n,(uint16_t)g_cfl_max_overrun_us);
     g_cfl_deadline_miss = 0; g_cfl_max_overrun_us = 0;
-    b[n++]=(uint8_t)cfl_high_priority_count(rt->event_queue); b[n++]=8;   // hi depth/cap
-    b[n++]=(uint8_t)cfl_low_priority_count(rt->event_queue);  b[n++]=64;  // lo depth/cap
+    b[n++]=(uint8_t)cfl_high_priority_count(g_rt->event_queue); b[n++]=8;   // hi depth/cap
+    b[n++]=(uint8_t)cfl_low_priority_count(g_rt->event_queue);  b[n++]=64;  // lo depth/cap
     mon_push(OP_MON_TICK, b, (uint8_t)n);
 
     // OP_MON_KB seq4 — per-KB {id, active, state, arena_used, arena_cap, crash_count}
     n=0; mon_w16(b,&n,batch); b[n++]=4; b[n++]=total; b[n++]=MON_VER;
     b[n++]=1;                                        // n KBs reported (kb0)
-    uint16_t au = cfl_heap_arena_used_bytes(rt->arena_system, 0);
-    uint16_t af = cfl_heap_arena_free_bytes(rt->arena_system, 0);
+    uint16_t au = cfl_heap_arena_used_bytes(g_rt->arena_system, 0);
+    uint16_t af = cfl_heap_arena_free_bytes(g_rt->arena_system, 0);
     b[n++]=0;                                        // kb_id 0
     b[n++]=1;                                        // active
     b[n++]=0;                                        // state (n/a)
@@ -522,6 +519,22 @@ void kb0_on_snapshot(void *handle, unsigned node_index) {
     n=0; mon_w16(b,&n,batch); b[n++]=total; b[n++]=0; b[n++]=MON_VER;
     mon_push(OP_MON_END, b, (uint8_t)n);
 }
+
+// CMD_MON_SNAPSHOT: ack + one report set, batch = req_id (from the injected event).
+void kb0_on_snapshot(void *handle, unsigned node_index) {
+    (void)node_index;
+    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
+    uint16_t req_id = (uint16_t)rt->event_data_ptr->data.integer;
+    uint8_t ack[3]; int n=0; mon_w16(ack,&n,req_id); ack[n++]=SHELL_OK;
+    mon_push(OP_SHELL_REPLY, ack, (uint8_t)n);
+    kb0_emit_reports(req_id);
+}
+
+// CMD_MON_STREAM state (firmware-paced; periodic kb0_emit_reports gated on host_connected).
+static volatile bool g_stream_on;
+static uint16_t      g_stream_period_ms = 1000;
+static uint32_t      g_stream_next_ms;
+static uint16_t      g_stream_batch;
 
 // per-tick hook (weak default in cfl_timer_rp2040.c): bump the core1 heartbeat and
 // inject this tick's inter-core commands into the runtime's event queue.
@@ -535,11 +548,31 @@ void cfl_embed_pre_tick(void) {
         } else if (c.cmd == CMD_MON_SNAPSHOT) {
             cfl_send_integer_event(g_rt->event_queue, CFL_EVENT_PRIORITY_HIGH,
                                    g_kb0_node, EVENT_CMD_MON_SNAPSHOT, (cfl_int_t)c.req_id);
+        } else if (c.cmd == CMD_MON_STREAM) {   // [enable u8][period_ms u16][mask u16]
+            if (c.alen >= 3) {
+                g_stream_on = c.args[0];
+                g_stream_period_ms = (uint16_t)c.args[1] | ((uint16_t)c.args[2] << 8);
+                if (g_stream_period_ms < 50) g_stream_period_ms = 50;
+                g_stream_next_ms = to_ms_since_boot(get_absolute_time()) + g_stream_period_ms;
+            }
+            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+            r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
+            r.payload[2] = SHELL_OK; r.len = 3;
+            (void)xQueueSend(g_up_q, &r, 0);
         } else {   // unknown command -> direct UNKNOWN_CMD reply (no chain handler)
             appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
             r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
             r.payload[2] = SHELL_UNKNOWN_CMD; r.len = 3;
             (void)xQueueSend(g_up_q, &r, 0);
+        }
+    }
+
+    // STREAM pacing: emit a report set every period while enabled + host connected.
+    if (g_stream_on && g_host_connected) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if ((int32_t)(now - g_stream_next_ms) >= 0) {
+            kb0_emit_reports(g_stream_batch++);
+            g_stream_next_ms = now + g_stream_period_ms;
         }
     }
 }
