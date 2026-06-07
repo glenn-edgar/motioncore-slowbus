@@ -1,0 +1,24 @@
+; ============================================================================
+; rs485.pio — 9-bit half-duplex UART PHY for the slow bus (fixed 115200, LSB-first).
+;
+; The 9th data bit is the MPCM address/data marker (bit8: 1=address/dest, 0=data),
+; matching the SAMD21 SERCOM 9-bit frame. 1 start + 9 data + 1 stop, 8 cycles/bit
+; (clkdiv = sys_clk / (8 * baud)).
+; ============================================================================
+
+; ---- 9-bit TX: side-set drives the line; idle/stop = high -------------------
+.program uart_tx9
+.side_set 1 opt
+    pull       side 1 [7]   ; idle/stop high; stall for a 9-bit word in OSR
+    set x, 8   side 0 [7]   ; start bit (low); x=8 => 9 data bits
+bitloop:
+    out pins, 1             ; shift out one data bit, LSB first (OSR shift right)
+    jmp x-- bitloop [6]     ; 8 cycles/bit; falls back to pull (stop bit high)
+
+; ---- 9-bit RX: autopush a right-justified 9-bit word (shift right, thresh 9) -
+.program uart_rx9
+    wait 0 pin 0           ; wait for the start bit (line goes low)
+    set x, 8   [10]        ; 9 data bits; delay ~1.5 bit to sample mid-bit
+bitloop:
+    in pins, 1             ; sample one bit, LSB first
+    jmp x-- bitloop [6]    ; 8 cycles/bit; autopush at 9 bits -> RX FIFO

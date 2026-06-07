@@ -1,0 +1,27 @@
+# Build output
+/build/
+build/
+*.uf2
+*.elf
+*.bin
+*.map
+*.dis
+
+# Host self-test artifacts
+tools/st
+
+# Editor / OS
+*.o
+*.d
+.DS_Store
+compile_commands.json
+
+# Bench scratch
+var/
+
+# Vendored engine reference (large copy of chain_tree_c; integrate w/ app core later)
+reference/
+
+# Static/shared lib artifacts
+*.a
+*.so
