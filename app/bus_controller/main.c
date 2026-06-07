@@ -504,9 +504,9 @@ static void kb0_emit_reports(uint16_t batch) {
     mon_w32(b,&n,(uint32_t)xPortGetFreeHeapSize());
     mon_w32(b,&n,(uint32_t)xPortGetMinimumEverFreeHeapSize());
     mon_w32(b,&n,(uint32_t)configTOTAL_HEAP_SIZE);
-    mon_w32(b,&n,(uint32_t)cfl_perm_used_bytes(g_rt->perm));
+    mon_w32(b,&n,(uint32_t)cfl_perm_used_bytes(g_rt->perm));   // perm USED / total
     mon_w32(b,&n,(uint32_t)sizeof g_perm_buf);
-    mon_w32(b,&n,(uint32_t)cfl_heap_free_bytes(g_rt->heap));
+    mon_w32(b,&n,(uint32_t)cfl_heap_used_bytes(g_rt->heap));   // heap USED / total (was FREE — mislabeled)
     mon_w32(b,&n,(uint32_t)((uint32_t)cfl_heap_used_bytes(g_rt->heap)+cfl_heap_free_bytes(g_rt->heap)));
     mon_push(OP_MON_MEM, b, (uint8_t)n);
 
@@ -678,7 +678,7 @@ static void app_engine_task(void *arg) {
     const chaintree_handle_t *h = &g_chaintree_handle;
     cfl_runtime_create_params_t p; memset(&p, 0, sizeof p);
     p.perm = &g_perm; p.perm_buffer = g_perm_buf; p.perm_buffer_size = (uint16_t)sizeof g_perm_buf;
-    p.heap_size = 8192; p.max_allocator_count = cfl_calculate_arrena_number(h);
+    p.heap_size = 4096; p.max_allocator_count = cfl_calculate_arrena_number(h);  // ~250 B in use; 4 KB = generous margin for KB2/3/4
     p.total_node_count = h->node_count; p.allocator_0_size = 256;
     p.event_queue_high_priority_size = 8; p.event_queue_low_priority_size = 64; p.delta_time = 0.1;
 
@@ -698,7 +698,9 @@ static void app_engine_task(void *arg) {
         uint16_t node = h->kb_table[i].start_index;
         if (cfl_add_test_by_index(g_rt, i)) {
             g_appkb[g_appkb_n].node = node;
-            g_appkb[g_appkb_n].arena_id = g_appkb_n;
+            // Real arena id from the runtime — NOT activation order. Arena 0 is the
+            // reserved system allocator; KB arenas are handed out starting at id 1.
+            g_appkb[g_appkb_n].arena_id = g_rt->kb_allocator_ids[i];
             g_appkb[g_appkb_n].active = 1;
             g_appkb_n++;
         }
@@ -768,9 +770,12 @@ int main(void) {
     uint32_t t0 = time_us_32();
     for (int i = 0; i < HB_COUNT; i++) g_hb_us[i] = t0;
 
-    xTaskCreate(bus_control_task, "bus",    configMINIMAL_STACK_SIZE * 4, NULL, 2, &t_bus);
-    xTaskCreate(uplink_task,      "uplink", configMINIMAL_STACK_SIZE * 4, NULL, 2, &t_up);
-    xTaskCreate(app_engine_task,  "app",    configMINIMAL_STACK_SIZE * 4, NULL, 3, &t_app);
+    // 8 KB stacks for the working threads (+4 KB over prior *4) — app/engine ran
+    // the tightest at ~360 B headroom and the chain_tree walker deepens with each
+    // KB; FreeRTOS heap has the room. Watchdog stays at 2 KB (trivial loop).
+    xTaskCreate(bus_control_task, "bus",    configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_bus);
+    xTaskCreate(uplink_task,      "uplink", configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_up);
+    xTaskCreate(app_engine_task,  "app",    configMINIMAL_STACK_SIZE * 8, NULL, 3, &t_app);
     xTaskCreate(watchdog_task,    "wd",     configMINIMAL_STACK_SIZE * 2, NULL, 1, &t_wd);
     vTaskCoreAffinitySet(t_bus, 1u << 0);
     vTaskCoreAffinitySet(t_up,  1u << 0);
