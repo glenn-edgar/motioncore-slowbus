@@ -15,6 +15,7 @@
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
+#include "hardware/irq.h"
 #include "rs485.pio.h"
 
 #ifndef PHY_RX_PIN
@@ -28,6 +29,32 @@ static uint     s_sm_tx, s_sm_rx;
 static uint     s_off_tx, s_off_rx;
 static uint32_t s_baud = BUS_DEFAULT_BAUD;
 static uint32_t s_rx_words, s_rx_overrun;
+
+// ---- IRQ-backed RX ring ----------------------------------------------------
+// The 8-deep PIO RX FIFO drains too fast (~760 us full at 115200) to survive an
+// RTOS thread preemption mid-frame. A PIO RX-FIFO-not-empty interrupt drains the
+// FIFO into this software ring in ISR context, so bus_phy_rx_pop() (a thread or
+// a bare superloop) reads from a buffer that scheduling can never overflow.
+// SPSC: ISR is the sole producer, the bus consumer the sole reader (same core).
+#define RX_RING_SIZE  512u            // power of 2
+#define RX_RING_MASK  (RX_RING_SIZE - 1u)
+static volatile uint16_t s_ring[RX_RING_SIZE];
+static volatile uint32_t s_ring_head, s_ring_tail;   // free-running counters
+static bool     s_irq_installed;
+
+static void phy_rx_isr(void) {
+    while (!pio_sm_is_rx_fifo_empty(PHY_PIO, s_sm_rx)) {
+        uint32_t w = pio_sm_get(PHY_PIO, s_sm_rx);    // also clears the IRQ source
+        uint16_t v = (uint16_t)((w >> 23) & 0x1FFu);  // right-justify (see rx_pop note)
+        if ((uint32_t)(s_ring_head - s_ring_tail) < RX_RING_SIZE) {
+            s_ring[s_ring_head & RX_RING_MASK] = v;
+            s_ring_head++;
+            s_rx_words++;
+        } else {
+            s_rx_overrun++;                           // ring full -> drop
+        }
+    }
+}
 
 static void apply_clkdiv(uint32_t baud) {
     float div = (float)clock_get_hz(clk_sys) / (float)(BITS_PER * baud);
@@ -70,6 +97,17 @@ void bus_phy_init(uint32_t baud) {
     pio_sm_init(PHY_PIO, s_sm_rx, s_off_rx, &cr);
 
     apply_clkdiv(s_baud);
+
+    // RX ring + PIO RX-FIFO-not-empty interrupt (drain FIFO -> ring in the ISR).
+    s_ring_head = s_ring_tail = 0;
+    if (!s_irq_installed) {
+        irq_set_exclusive_handler(PIO0_IRQ_0, phy_rx_isr);
+        irq_set_enabled(PIO0_IRQ_0, true);
+        s_irq_installed = true;
+    }
+    pio_set_irq0_source_enabled(PHY_PIO,
+        (enum pio_interrupt_source)(pis_sm0_rx_fifo_not_empty + s_sm_rx), true);
+
     pio_sm_set_enabled(PHY_PIO, s_sm_tx, true);
     pio_sm_set_enabled(PHY_PIO, s_sm_rx, true);
 }
@@ -93,17 +131,17 @@ bool bus_phy_tx_busy(void) {
 }
 
 bool bus_phy_rx_pop(uint16_t *word9) {
-    if (pio_sm_is_rx_fifo_empty(PHY_PIO, s_sm_rx)) return false;
-    uint32_t w = pio_sm_get(PHY_PIO, s_sm_rx);
-    s_rx_words++;
-    // shift-right ISR autopushed at 9 bits -> the word sits in the TOP 9 bits
-    // [31:23], LSB-first order preserved. Right-justify it.
-    if (word9) *word9 = (uint16_t)((w >> 23) & 0x1FFu);
+    if (s_ring_head == s_ring_tail) return false;     // ring empty
+    if (word9) *word9 = s_ring[s_ring_tail & RX_RING_MASK];
+    s_ring_tail++;
     return true;
 }
 
 void bus_phy_rx_flush(void) {
+    // Drop the FIFO then the ring. A frame arriving in this window is the
+    // caller's own about-to-send echo or pre-grant noise — intentionally dropped.
     pio_sm_clear_fifos(PHY_PIO, s_sm_rx);
+    s_ring_tail = s_ring_head;
 }
 
 uint32_t bus_phy_rx_overrun(void) {

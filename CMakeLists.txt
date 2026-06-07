@@ -32,6 +32,7 @@ set(PORT_SRCS
     ${PORT_DIR}/phy_pio_rs485.c
 )
 
+set(LIBCOMM_DIR ${PORT_DIR}/vendor/libcomm)
 set(COMMON_INC ${CORE_DIR} ${PORT_DIR} ${CMAKE_CURRENT_LIST_DIR})
 
 # Helper: define a firmware image for a role with its own uplink + extra srcs.
@@ -64,17 +65,31 @@ function(slow_bus_image name)
     pico_add_extra_outputs(${name})
 endfunction()
 
-# Bus controller, USB-CDC uplink (UPLINK=usb) — the proven model, built first.
-slow_bus_image(bus_controller
-    SRCS ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/main.c
-         ${PORT_DIR}/uplink_usb_cdc.c
-    DEFS ROLE_BUS_CONTROLLER=1 UPLINK_USB=1)
-
-# Bus controller, WiFi-to-proxy uplink (UPLINK=wifi) — same frames, over a socket.
-slow_bus_image(bus_controller_wifi WIFI
-    SRCS ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/main.c
-         ${PORT_DIR}/uplink_wifi_proxy.c
-    DEFS ROLE_BUS_CONTROLLER=1 UPLINK_WIFI=1)
+# Bus controller — FreeRTOS-SMP (core0 = bus_control + uplink threads), USB-CDC
+# libcomm host link + autonomous poll sweep + liveness. Dedicated target (not
+# slow_bus_image): brings host_link, the commission block, and the chassis
+# hardening, not the bus_sched/bus_node skeleton. WiFi uplink + core1 app deferred.
+add_executable(bus_controller
+    ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/main.c
+    ${CMAKE_CURRENT_LIST_DIR}/core/host_link.c
+    ${CMAKE_CURRENT_LIST_DIR}/app/chassis/commission.c
+    ${PORT_DIR}/phy_pio_rs485.c
+    ${CORE_DIR}/bus_frame.c
+    ${CORE_DIR}/bus_crc8.c
+    ${LIBCOMM_DIR}/frame.c)
+pico_generate_pio_header(bus_controller ${PORT_DIR}/rs485.pio)
+target_include_directories(bus_controller PRIVATE
+    ${COMMON_INC} ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis)
+target_compile_definitions(bus_controller PRIVATE
+    PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0)
+target_compile_options(bus_controller PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_link_libraries(bus_controller
+    pico_stdlib pico_multicore hardware_watchdog hardware_flash pico_unique_id
+    hardware_pio hardware_clocks pico_async_context_freertos
+    FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
+pico_enable_stdio_usb(bus_controller 1)
+pico_enable_stdio_uart(bus_controller 0)
+pico_add_extra_outputs(bus_controller)
 
 # Slave node: null uplink, node role, WiFi off.
 slow_bus_image(slave
@@ -165,7 +180,6 @@ pico_add_extra_outputs(bus_data_test)
 # identity=bus_controller, and bridges commands through to SAMD21 slave 3.
 # Binary frames on USB -> CRLF translation compiled out; raw byte I/O only.
 # ---------------------------------------------------------------------------
-set(LIBCOMM_DIR ${PORT_DIR}/vendor/libcomm)
 add_executable(uplink_test
     ${CMAKE_CURRENT_LIST_DIR}/app/uplink_test/main.c
     ${CMAKE_CURRENT_LIST_DIR}/core/host_link.c
