@@ -33,6 +33,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#include "queue.h"
 
 #include "host_link.h"
 #include "bus_phy.h"
@@ -62,6 +63,11 @@
 #define SHELL_OK                 0u
 #define SHELL_UNKNOWN_CMD        1u
 
+// ---- core1 application engine (KB0 monitor PoC) -----------------------------
+#define BUS_ADDR_APPCORE         0xFBu   // core1 virtual-slave address
+#define CMD_MON_PING             0x0200u // KB0: liveness round-trip
+#define KB0_VER                  1u
+
 // ---- roster flags + liveness states (match SAMD21 bus_roster) --------------
 #define FLAG_ENABLED             0x02u
 #define ST_UNKNOWN               0u
@@ -81,9 +87,9 @@ typedef struct { uint32_t magic, boot_count, last_cause, panic_code; } crash_slo
 static crash_slot_t g_crash __attribute__((section(".uninitialized_data")));
 
 // ---- monitored-thread heartbeats -------------------------------------------
-enum { HB_BUS = 0, HB_UPLINK, HB_COUNT };
+enum { HB_BUS = 0, HB_UPLINK, HB_APP, HB_COUNT };
 static volatile uint32_t g_hb[HB_COUNT], g_hb_us[HB_COUNT];
-static TaskHandle_t t_bus, t_up, t_wd;
+static TaskHandle_t t_bus, t_up, t_app, t_wd;
 
 #define WD_PERIOD_MS      100
 #define WD_HW_TIMEOUT_MS 4000
@@ -111,6 +117,18 @@ static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
 static bool     g_cmd_pending;
 static uint8_t  g_cmd_slave; static uint16_t g_cmd_op, g_cmd_req_id;
 static uint8_t  g_cmd_body[BUS_PAYLOAD_MAX]; static uint8_t g_cmd_len;
+
+// ---- inter-core seam (core0 <-> core1 app engine), FreeRTOS queues ----------
+// down: a host shell-exec addressed to 0xFB; up: a frame for the host. Cross-core
+// safe (xQueue is SMP-safe), single in/out per direction. host_connected is a
+// core0-published condition core1 gates on (the "USB connected throughout" rule).
+#define APPCORE_ARGS_MAX  64
+#define APPCORE_PAY_MAX   96
+typedef struct { uint16_t req_id, cmd; uint8_t alen; uint8_t args[APPCORE_ARGS_MAX]; } appcore_cmd_t;
+typedef struct { uint8_t dest; uint16_t opcode; uint8_t len; uint8_t payload[APPCORE_PAY_MAX]; } appcore_rep_t;
+static QueueHandle_t   g_down_q;   // core0 -> core1
+static QueueHandle_t   g_up_q;     // core1 -> core0
+static volatile bool   g_host_connected;
 
 // ---- PHY-owned-by-bus-thread helpers (NO lock; PHY has a single owner) ------
 static bus_asm_t g_bc; static uint8_t g_bus_seq;
@@ -181,6 +199,18 @@ static void emit_liveness_edges(void) {
 // ---- host_link callbacks (run under the uplink thread's lock) ---------------
 static void on_bus_msg(void *u, uint8_t dest, uint16_t opcode, const uint8_t *body, uint8_t len) {
     (void)u;
+    // core1 app engine: route to the inter-core down-queue, not the bus.
+    if (dest == BUS_ADDR_APPCORE) {
+        if (opcode != OP_SHELL_EXEC || len < 4) return;   // [req_id u16][cmd u16][args]
+        appcore_cmd_t c;
+        c.req_id = (uint16_t)body[0] | ((uint16_t)body[1] << 8);
+        c.cmd    = (uint16_t)body[2] | ((uint16_t)body[3] << 8);
+        c.alen   = (uint8_t)(len - 4);
+        if (c.alen > APPCORE_ARGS_MAX) c.alen = APPCORE_ARGS_MAX;
+        memcpy(c.args, &body[4], c.alen);
+        (void)xQueueSend(g_down_q, &c, 0);                // non-blocking; drop if full
+        return;
+    }
     if (g_cmd_pending) return;                 // one in flight; the Pi tracker retries
     if (len > sizeof g_cmd_body) len = sizeof g_cmd_body;
     g_cmd_slave = dest; g_cmd_op = opcode; g_cmd_len = len;
@@ -343,18 +373,52 @@ static void uplink_task(void *arg) {
             UNLOCK();
         }
         prev_conn = conn;
+        g_host_connected = conn;                   // core0-published condition for core1
 
-        uint8_t out[64]; uint32_t n;
+        uint8_t out[64]; uint32_t n; appcore_rep_t up;
         LOCK();
         int c;
         while ((c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT)
             host_link_feed(&g_hl, (uint8_t)c);     // may invoke on_bus_msg/on_local_shell
         host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), conn);
+        while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)   // relay core1 replies/reports
+            (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
         n = host_link_tx_drain(&g_hl, out, sizeof out);
         UNLOCK();
 
         if (n) { for (uint32_t i = 0; i < n; i++) putchar_raw(out[i]); stdio_flush(); }
         vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+// ---- core1 application engine (KB0 monitor PoC, first slice) ----------------
+// Stands up the inter-core seam: drain the down-queue, dispatch, push replies to
+// the up-queue (core0 relays them to USB). For now a direct C handler for
+// CMD_MON_PING; the chain_tree engine + the KB0 chain replace this next.
+static void app_engine_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
+
+        appcore_cmd_t c;
+        if (xQueueReceive(g_down_q, &c, pdMS_TO_TICKS(10)) != pdTRUE) continue;
+
+        appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+        uint8_t *p = r.payload; uint8_t n = 0;
+        p[n++] = (uint8_t)c.req_id; p[n++] = (uint8_t)(c.req_id >> 8);   // [req_id]
+        if (c.cmd == CMD_MON_PING) {
+            uint32_t up = to_ms_since_boot(get_absolute_time());
+            uint16_t boot = (uint16_t)g_crash.boot_count;
+            p[n++] = SHELL_OK;
+            p[n++] = (uint8_t)up;  p[n++] = (uint8_t)(up >> 8);
+            p[n++] = (uint8_t)(up >> 16); p[n++] = (uint8_t)(up >> 24);
+            p[n++] = (uint8_t)boot; p[n++] = (uint8_t)(boot >> 8);
+            p[n++] = KB0_VER;
+        } else {
+            p[n++] = SHELL_UNKNOWN_CMD;
+        }
+        r.len = n;
+        (void)xQueueSend(g_up_q, &r, pdMS_TO_TICKS(5));
     }
 }
 
@@ -409,16 +473,21 @@ int main(void) {
 
     g_lock = xSemaphoreCreateMutex();
     if (!g_lock) chassis_panic(RST_PANIC, 1);
+    g_down_q = xQueueCreate(8, sizeof(appcore_cmd_t));
+    g_up_q   = xQueueCreate(8, sizeof(appcore_rep_t));
+    if (!g_down_q || !g_up_q) chassis_panic(RST_PANIC, 2);
 
     uint32_t t0 = time_us_32();
     for (int i = 0; i < HB_COUNT; i++) g_hb_us[i] = t0;
 
     xTaskCreate(bus_control_task, "bus",    configMINIMAL_STACK_SIZE * 4, NULL, 2, &t_bus);
     xTaskCreate(uplink_task,      "uplink", configMINIMAL_STACK_SIZE * 4, NULL, 2, &t_up);
+    xTaskCreate(app_engine_task,  "app",    configMINIMAL_STACK_SIZE * 4, NULL, 3, &t_app);
     xTaskCreate(watchdog_task,    "wd",     configMINIMAL_STACK_SIZE * 2, NULL, 1, &t_wd);
     vTaskCoreAffinitySet(t_bus, 1u << 0);
     vTaskCoreAffinitySet(t_up,  1u << 0);
-    // watchdog floats; core1 reserved for the application engine (next step).
+    vTaskCoreAffinitySet(t_app, 1u << 1);   // core1 = application engine
+    // watchdog floats.
 
     vTaskStartScheduler();
     for (;;) { tight_loop_contents(); }
