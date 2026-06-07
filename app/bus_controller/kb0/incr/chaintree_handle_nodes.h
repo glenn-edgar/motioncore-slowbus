@@ -4,8 +4,8 @@
 
 #include "chaintree_support.h"
 
-#define CT_Q83FY0HC_NODE_COUNT 20
+#define CT_K6OENYBG_NODE_COUNT 31
 
-extern const chaintree_node_t ct_q83fy0hc_nodes[CT_Q83FY0HC_NODE_COUNT];
+extern const chaintree_node_t ct_k6oenybg_nodes[CT_K6OENYBG_NODE_COUNT];
 
 #endif /* CHAINTREE_HANDLE_NODES_H */

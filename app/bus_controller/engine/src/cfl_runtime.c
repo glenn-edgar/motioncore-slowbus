@@ -169,7 +169,21 @@
  /* ========================================================================
   * RUNTIME EVENT LOOP
   * ======================================================================== */
- 
+
+/* Find the active KB whose node range contains node_id. Used to route events
+ * popped from the shared queue to their owning KB's window — so events injected
+ * from outside the engine (firmware) or from another KB execute correctly
+ * instead of tripping cfl_execute_event's out-of-bounds guard. 0xFFFF = none. */
+ static uint16_t cfl_find_owning_active_kb(cfl_runtime_handle_t *handle, uint16_t node_id) {
+     const chaintree_handle_t *fh = handle->flash_handle;
+     for (uint16_t k = 0; k < fh->kb_count; k++) {
+         if (!TEST_IS_ACTIVE(handle, k)) continue;
+         uint16_t s = fh->kb_table[k].start_index;
+         if (node_id >= s && node_id < s + fh->kb_table[k].node_count) return k;
+     }
+     return 0xFFFF;
+ }
+
  bool cfl_runtime_run(cfl_runtime_handle_t *handle) {
      CFL_EVENT_DATA_T event_data;
      cfl_tick_result_t tick_result;
@@ -222,15 +236,29 @@
                      continue;
                  }
  
+                 /* Route to the active KB that owns the target node. The shared
+                  * queue is drained entirely during the first active KB's pass,
+                  * so an event for another KB (e.g. a firmware-injected command)
+                  * must run in ITS window, not this iteration's. */
+                 uint16_t owner = cfl_find_owning_active_kb(handle, event_data.node_id);
+                 if (owner == 0xFFFF) continue;   /* no active owner -> drop safely */
+                 handle->current_kb_idx = owner;
+                 handle->kb_start_index = handle->flash_handle->kb_table[owner].start_index;
+                 handle->kb_node_count  = handle->flash_handle->kb_table[owner].node_count;
+                 handle->kb_max_level   = handle->flash_handle->kb_table[owner].max_depth + 1;
+
                  handle->event_data_ptr = &event_data;
- 
+
                  if (cfl_execute_event(handle) == false) {
                      cfl_delete_test_by_index(handle, handle->current_kb_idx);
                  }
              }
- 
-             /* Check if start node is still enabled after processing all events */
-             if (!cfl_engine_node_is_enabled(handle, handle->kb_start_index)) {
+
+             /* Check if start node is still enabled after processing all events.
+              * Use kb_idx's own start node — the drain above may have re-pointed
+              * kb_start_index to a routed event's owner KB. */
+             if (!cfl_engine_node_is_enabled(handle,
+                     handle->flash_handle->kb_table[kb_idx].start_index)) {
                  cfl_delete_test_by_index(handle, kb_idx);
              }
          }

@@ -4,8 +4,8 @@
 
 #include <stdint.h>
 
-#define CT_Q83FY0HC_LINK_TABLE_SIZE 8
+#define CT_K6OENYBG_LINK_TABLE_SIZE 12
 
-extern const uint16_t ct_q83fy0hc_link_table[CT_Q83FY0HC_LINK_TABLE_SIZE];
+extern const uint16_t ct_k6oenybg_link_table[CT_K6OENYBG_LINK_TABLE_SIZE];
 
 #endif /* CHAINTREE_HANDLE_LINKS_H */

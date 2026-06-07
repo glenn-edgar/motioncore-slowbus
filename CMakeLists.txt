@@ -100,7 +100,7 @@ target_compile_options(bus_controller PRIVATE -Wall -Wextra -Wno-unused-paramete
 target_link_options(bus_controller PRIVATE -Wl,--gc-sections)
 target_link_libraries(bus_controller
     pico_stdlib pico_multicore hardware_watchdog hardware_flash pico_unique_id
-    hardware_pio hardware_clocks pico_async_context_freertos
+    hardware_pio hardware_clocks hardware_adc pico_async_context_freertos
     FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
 pico_enable_stdio_usb(bus_controller 1)
 pico_enable_stdio_uart(bus_controller 0)

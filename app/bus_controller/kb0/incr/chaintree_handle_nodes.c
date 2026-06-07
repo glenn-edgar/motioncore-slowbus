@@ -2,7 +2,7 @@
 #include "chaintree_handle_nodes.h"
 
 /* Node array - preserves original indices; filtered nodes leave gaps */
-const chaintree_node_t ct_q83fy0hc_nodes[20] = {
+const chaintree_node_t ct_k6oenybg_nodes[31] = {
     /* [0] _0 */
     {
         .node_index = 0,
@@ -11,9 +11,9 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .link_start = 0,
         .link_count = 0x0002,  /* count=2, auto_start=false */
         .main_function_index = 3,
-        .init_function_index = 3,
+        .init_function_index = 4,
         .aux_function_index = 2,
-        .term_function_index = 4,
+        .term_function_index = 5,
         .node_data_id = 1
     },
     /* [1] _0 [AUTO_START] */
@@ -24,9 +24,9 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .link_start = 2,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
-        .init_function_index = 1,
+        .init_function_index = 2,
         .aux_function_index = 1,
-        .term_function_index = 2,
+        .term_function_index = 3,
         .node_data_id = 65535
     },
     /* [2] _0 */
@@ -37,9 +37,9 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .link_start = 5,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
-        .init_function_index = 5,
+        .init_function_index = 6,
         .aux_function_index = 3,
-        .term_function_index = 6,
+        .term_function_index = 7,
         .node_data_id = 2
     },
     /* [3] _1 */
@@ -50,7 +50,7 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .link_start = 5,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
-        .init_function_index = 7,
+        .init_function_index = 8,
         .aux_function_index = 0,
         .term_function_index = 0,
         .node_data_id = 65535
@@ -76,9 +76,9 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .link_start = 5,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
-        .init_function_index = 1,
+        .init_function_index = 2,
         .aux_function_index = 1,
-        .term_function_index = 2,
+        .term_function_index = 3,
         .node_data_id = 65535
     },
     /* [6] _0 */
@@ -89,9 +89,9 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .link_start = 8,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
-        .init_function_index = 5,
+        .init_function_index = 6,
         .aux_function_index = 3,
-        .term_function_index = 6,
+        .term_function_index = 7,
         .node_data_id = 3
     },
     /* [7] _1 */
@@ -99,10 +99,10 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .node_index = 7,
         .parent_index = 5,
         .depth = 2,
-        .link_start = 0,
+        .link_start = 8,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
-        .init_function_index = 8,
+        .init_function_index = 9,
         .aux_function_index = 0,
         .term_function_index = 0,
         .node_data_id = 65535
@@ -112,6 +112,71 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .node_index = 8,
         .parent_index = 5,
         .depth = 2,
+        .link_start = 8,
+        .link_count = 0x0000,  /* count=0, auto_start=false */
+        .main_function_index = 4,
+        .init_function_index = 0,
+        .aux_function_index = 0,
+        .term_function_index = 0,
+        .node_data_id = 65535
+    },
+    /* [9] _0 */
+    {
+        .node_index = 9,
+        .parent_index = 65535,
+        .depth = 0,
+        .link_start = 8,
+        .link_count = 0x0001,  /* count=1, auto_start=false */
+        .main_function_index = 3,
+        .init_function_index = 4,
+        .aux_function_index = 2,
+        .term_function_index = 5,
+        .node_data_id = 4
+    },
+    /* [10] _0 [AUTO_START] */
+    {
+        .node_index = 10,
+        .parent_index = 9,
+        .depth = 1,
+        .link_start = 9,
+        .link_count = 0x8003,  /* count=3, auto_start=true */
+        .main_function_index = 1,
+        .init_function_index = 2,
+        .aux_function_index = 1,
+        .term_function_index = 3,
+        .node_data_id = 65535
+    },
+    /* [11] _0 */
+    {
+        .node_index = 11,
+        .parent_index = 10,
+        .depth = 2,
+        .link_start = 12,
+        .link_count = 0x0000,  /* count=0, auto_start=false */
+        .main_function_index = 5,
+        .init_function_index = 6,
+        .aux_function_index = 3,
+        .term_function_index = 7,
+        .node_data_id = 5
+    },
+    /* [12] _1 */
+    {
+        .node_index = 12,
+        .parent_index = 10,
+        .depth = 2,
+        .link_start = 12,
+        .link_count = 0x0000,  /* count=0, auto_start=false */
+        .main_function_index = 2,
+        .init_function_index = 1,
+        .aux_function_index = 0,
+        .term_function_index = 0,
+        .node_data_id = 65535
+    },
+    /* [13] _2 */
+    {
+        .node_index = 13,
+        .parent_index = 10,
+        .depth = 2,
         .link_start = 0,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 4,
@@ -120,9 +185,9 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .term_function_index = 0,
         .node_data_id = 65535
     },
-    /* [9] kb0 */
+    /* [14] kb1 */
     {
-        .node_index = 9,
+        .node_index = 14,
         .parent_index = 65535,
         .depth = 0,
         .link_start = 0,
@@ -132,41 +197,6 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .aux_function_index = 0,
         .term_function_index = 0,
         .node_data_id = 65535
-    },
-    /* [10] FILTERED */ {
-        .node_index = 10, .parent_index = 0xFFFF, .depth = 0,
-        .link_start = 0, .link_count = 0,
-        .main_function_index = 0, .init_function_index = 0,
-        .aux_function_index = 0, .term_function_index = 0,
-        .node_data_id = 0xFFFF
-    },
-    /* [11] FILTERED */ {
-        .node_index = 11, .parent_index = 0xFFFF, .depth = 0,
-        .link_start = 0, .link_count = 0,
-        .main_function_index = 0, .init_function_index = 0,
-        .aux_function_index = 0, .term_function_index = 0,
-        .node_data_id = 0xFFFF
-    },
-    /* [12] FILTERED */ {
-        .node_index = 12, .parent_index = 0xFFFF, .depth = 0,
-        .link_start = 0, .link_count = 0,
-        .main_function_index = 0, .init_function_index = 0,
-        .aux_function_index = 0, .term_function_index = 0,
-        .node_data_id = 0xFFFF
-    },
-    /* [13] FILTERED */ {
-        .node_index = 13, .parent_index = 0xFFFF, .depth = 0,
-        .link_start = 0, .link_count = 0,
-        .main_function_index = 0, .init_function_index = 0,
-        .aux_function_index = 0, .term_function_index = 0,
-        .node_data_id = 0xFFFF
-    },
-    /* [14] FILTERED */ {
-        .node_index = 14, .parent_index = 0xFFFF, .depth = 0,
-        .link_start = 0, .link_count = 0,
-        .main_function_index = 0, .init_function_index = 0,
-        .aux_function_index = 0, .term_function_index = 0,
-        .node_data_id = 0xFFFF
     },
     /* [15] FILTERED */ {
         .node_index = 15, .parent_index = 0xFFFF, .depth = 0,
@@ -196,9 +226,92 @@ const chaintree_node_t ct_q83fy0hc_nodes[20] = {
         .aux_function_index = 0, .term_function_index = 0,
         .node_data_id = 0xFFFF
     },
-    /* [19] event_string_table */
+    /* [19] FILTERED */ {
+        .node_index = 19, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [20] kb0 */
     {
-        .node_index = 19,
+        .node_index = 20,
+        .parent_index = 65535,
+        .depth = 0,
+        .link_start = 8,
+        .link_count = 0x0000,  /* count=0, auto_start=false */
+        .main_function_index = 0,
+        .init_function_index = 0,
+        .aux_function_index = 0,
+        .term_function_index = 0,
+        .node_data_id = 65535
+    },
+    /* [21] FILTERED */ {
+        .node_index = 21, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [22] FILTERED */ {
+        .node_index = 22, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [23] FILTERED */ {
+        .node_index = 23, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [24] FILTERED */ {
+        .node_index = 24, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [25] FILTERED */ {
+        .node_index = 25, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [26] FILTERED */ {
+        .node_index = 26, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [27] FILTERED */ {
+        .node_index = 27, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [28] FILTERED */ {
+        .node_index = 28, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [29] FILTERED */ {
+        .node_index = 29, .parent_index = 0xFFFF, .depth = 0,
+        .link_start = 0, .link_count = 0,
+        .main_function_index = 0, .init_function_index = 0,
+        .aux_function_index = 0, .term_function_index = 0,
+        .node_data_id = 0xFFFF
+    },
+    /* [30] event_string_table */
+    {
+        .node_index = 30,
         .parent_index = 65535,
         .depth = 0,
         .link_start = 0,

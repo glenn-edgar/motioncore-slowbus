@@ -30,6 +30,8 @@
 #include "pico/stdlib.h"
 #include "pico/unique_id.h"
 #include "hardware/watchdog.h"
+#include "hardware/adc.h"
+#include <string.h>   // strcmp for KB lookup by name
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -74,6 +76,8 @@
 #define CMD_MON_PING             0x0200u // KB0: liveness round-trip
 #define CMD_MON_SNAPSHOT         0x0201u // KB0: one-shot system report set
 #define CMD_MON_STREAM           0x0202u // KB0: [enable u8][period_ms u16][mask u16]
+#define CMD_ADC_READ             0x0104u // KB1 (api/HIL): read ADC0 (GP26)
+#define ADC0_GPIO                26u
 #define KB0_VER                  1u
 // KB0 report opcodes (s2m, src=0xFB). Common header: [batch u16][seq u8][total u8][ver u8].
 #define OP_MON_SYS               0x0030u
@@ -421,6 +425,13 @@ static cfl_runtime_handle_t *g_rt;
 static cfl_perm_t            g_perm;
 static char                  g_perm_buf[16 * 1024] __attribute__((aligned(8)));
 static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
+static uint16_t              g_kb1_node;   // KB1 (api) start node
+
+// Activated-KB registry (one row per real KB, in activation order = arena id).
+// Drives the OP_MON_KB report generically as KBs are added (kb2/kb3/kb4 later).
+#define MAX_APP_KBS 6
+static struct { uint16_t node; uint8_t arena_id; uint8_t active; } g_appkb[MAX_APP_KBS];
+static uint8_t               g_appkb_n;
 
 static void kb0_push_ping_reply(uint16_t req_id) {
     appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
@@ -505,14 +516,16 @@ static void kb0_emit_reports(uint16_t batch) {
 
     // OP_MON_KB seq4 — per-KB {id, active, state, arena_used, arena_cap, crash_count}
     n=0; mon_w16(b,&n,batch); b[n++]=4; b[n++]=total; b[n++]=MON_VER;
-    b[n++]=1;                                        // n KBs reported (kb0)
-    uint16_t au = cfl_heap_arena_used_bytes(g_rt->arena_system, 0);
-    uint16_t af = cfl_heap_arena_free_bytes(g_rt->arena_system, 0);
-    b[n++]=0;                                        // kb_id 0
-    b[n++]=1;                                        // active
-    b[n++]=0;                                        // state (n/a)
-    mon_w16(b,&n,au); mon_w16(b,&n,(uint16_t)(au+af));
-    b[n++]=0;                                        // crash_count
+    b[n++]=g_appkb_n;                                // n KBs reported (all activated)
+    for (uint8_t k=0; k<g_appkb_n; k++) {
+        uint16_t au = cfl_heap_arena_used_bytes(g_rt->arena_system, g_appkb[k].arena_id);
+        uint16_t af = cfl_heap_arena_free_bytes(g_rt->arena_system, g_appkb[k].arena_id);
+        b[n++]=k;                                    // kb_id
+        b[n++]=g_appkb[k].active;                    // active
+        b[n++]=0;                                    // state (n/a)
+        mon_w16(b,&n,au); mon_w16(b,&n,(uint16_t)(au+af));
+        b[n++]=0;                                    // crash_count
+    }
     mon_push(OP_MON_KB, b, (uint8_t)n);
 
     // OP_MON_END [batch][count][status][ver]
@@ -536,6 +549,22 @@ static uint16_t      g_stream_period_ms = 1000;
 static uint32_t      g_stream_next_ms;
 static uint16_t      g_stream_batch;
 
+// KB1 (api/HIL): CMD_ADC_READ -> read ADC0 (GP26) -> OP_SHELL_REPLY [req_id][status][value u16].
+// (Direct blocking read for now; switches to the central decimated ADC service with KB2/KB3.)
+void kb1_on_adc(void *handle, unsigned node_index) {
+    (void)node_index;
+    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
+    uint16_t req_id = (uint16_t)rt->event_data_ptr->data.integer;
+    adc_select_input(0);                 // ADC0 = GP26
+    uint16_t v = adc_read();             // 12-bit
+    appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+    uint8_t *p = r.payload; uint8_t n = 0;
+    p[n++] = (uint8_t)req_id; p[n++] = (uint8_t)(req_id >> 8);
+    p[n++] = SHELL_OK;
+    p[n++] = (uint8_t)v; p[n++] = (uint8_t)(v >> 8);
+    r.len = n; (void)xQueueSend(g_up_q, &r, 0);
+}
+
 // per-tick hook (weak default in cfl_timer_rp2040.c): bump the core1 heartbeat and
 // inject this tick's inter-core commands into the runtime's event queue.
 void cfl_embed_pre_tick(void) {
@@ -548,6 +577,9 @@ void cfl_embed_pre_tick(void) {
         } else if (c.cmd == CMD_MON_SNAPSHOT) {
             cfl_send_integer_event(g_rt->event_queue, CFL_EVENT_PRIORITY_HIGH,
                                    g_kb0_node, EVENT_CMD_MON_SNAPSHOT, (cfl_int_t)c.req_id);
+        } else if (c.cmd == CMD_ADC_READ) {      // KB1 (api): route to KB1's start node
+            cfl_send_integer_event(g_rt->event_queue, CFL_EVENT_PRIORITY_HIGH,
+                                   g_kb1_node, EVENT_CMD_ADC_READ, (cfl_int_t)c.req_id);
         } else if (c.cmd == CMD_MON_STREAM) {   // [enable u8][period_ms u16][mask u16]
             if (c.alen >= 3) {
                 g_stream_on = c.args[0];
@@ -582,15 +614,33 @@ static void app_engine_task(void *arg) {
     const chaintree_handle_t *h = &g_chaintree_handle;
     cfl_runtime_create_params_t p; memset(&p, 0, sizeof p);
     p.perm = &g_perm; p.perm_buffer = g_perm_buf; p.perm_buffer_size = (uint16_t)sizeof g_perm_buf;
-    p.heap_size = 4096; p.max_allocator_count = cfl_calculate_arrena_number(h);
+    p.heap_size = 8192; p.max_allocator_count = cfl_calculate_arrena_number(h);
     p.total_node_count = h->node_count; p.allocator_0_size = 256;
     p.event_queue_high_priority_size = 8; p.event_queue_low_priority_size = 64; p.delta_time = 0.1;
+
+    // ADC0 (GP26) for KB1 CMD_ADC_READ. (Central decimated ADC service arrives with KB2/KB3.)
+    adc_init();
+    adc_gpio_init(ADC0_GPIO);
 
     g_rt = cfl_runtime_create(&g_perm, &p, h);
     if (!g_rt) chassis_panic(RST_PANIC, 3);
     cfl_runtime_reset(g_rt);
-    cfl_add_test_by_index(g_rt, 0);                 // activate kb0
-    g_kb0_node = h->kb_table[0].start_index;        // event-injection target
+    // Activate every real KB and record its start node. The image also carries a per-KB
+    // "<kb>_functions" metadata KB (names ending in "_functions") — skip those. Arenas are
+    // created in activation order, so arena_id == g_appkb_n at the time of the add.
+    for (uint16_t i = 0; i < h->kb_count && g_appkb_n < MAX_APP_KBS; i++) {
+        const char *nm = h->kb_table[i].kb_name;
+        if (strstr(nm, "_functions")) continue;
+        uint16_t node = h->kb_table[i].start_index;
+        if (cfl_add_test_by_index(g_rt, i)) {
+            g_appkb[g_appkb_n].node = node;
+            g_appkb[g_appkb_n].arena_id = g_appkb_n;
+            g_appkb[g_appkb_n].active = 1;
+            g_appkb_n++;
+        }
+        if (strcmp(nm, "kb0") == 0)      g_kb0_node = node;
+        else if (strcmp(nm, "kb1") == 0) g_kb1_node = node;
+    }
     g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
     cfl_runtime_run(g_rt);                           // forever loop (the thread body)
     for (;;) vTaskDelay(pdMS_TO_TICKS(100));         // not reached
