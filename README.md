@@ -83,3 +83,7 @@ Flash = mount the BOOTSEL drive, copy the `.uf2`.
 5. Peer (slave→slave) between two Pico slaves.
 6. WiFi-proxy uplink behind the same seam.
 7. Reliable DATA ack tracking + bus-progress WDT.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Glenn Edgar.
