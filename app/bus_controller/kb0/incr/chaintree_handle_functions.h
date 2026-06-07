@@ -25,10 +25,10 @@ typedef enum {
     ONE_SHOT_FUNC_CFL_COLUMN_TERM = 2,
     ONE_SHOT_FUNC_CFL_GATE_NODE_INIT = 3,
     ONE_SHOT_FUNC_CFL_GATE_NODE_TERM = 4,
-    ONE_SHOT_FUNC_CFL_LOG_MESSAGE = 5,
-    ONE_SHOT_FUNC_CFL_WAIT_INIT = 6,
-    ONE_SHOT_FUNC_CFL_WAIT_TERM = 7,
-    ONE_SHOT_FUNC_MON_PING_REPLY = 8,
+    ONE_SHOT_FUNC_CFL_WAIT_INIT = 5,
+    ONE_SHOT_FUNC_CFL_WAIT_TERM = 6,
+    ONE_SHOT_FUNC_MON_PING_REPLY = 7,
+    ONE_SHOT_FUNC_MON_SNAPSHOT = 8,
     ONE_SHOT_FUNC_MON_CMD_TIMEOUT = 9,
     ONE_SHOT_FUNC_COUNT = 10
 } ONE_SHOT_FUNC_t;
@@ -42,14 +42,14 @@ typedef enum {
     BOOL_FUNC_COUNT = 4
 } BOOL_FUNC_t;
 
-extern const main_function_t ct_oeogzsbm_main_functions[6];
-extern const one_shot_function_t ct_oeogzsbm_one_shot_functions[10];
-extern const boolean_function_t ct_oeogzsbm_boolean_functions[4];
+extern const main_function_t ct_q83fy0hc_main_functions[6];
+extern const one_shot_function_t ct_q83fy0hc_one_shot_functions[10];
+extern const boolean_function_t ct_q83fy0hc_boolean_functions[4];
 
-extern const uint16_t ct_oeogzsbm_main_function_usage_count[6];
+extern const uint16_t ct_q83fy0hc_main_function_usage_count[6];
 
-extern const char *ct_oeogzsbm_main_function_names[6];
-extern const char *ct_oeogzsbm_one_shot_function_names[10];
-extern const char *ct_oeogzsbm_boolean_function_names[4];
+extern const char *ct_q83fy0hc_main_function_names[6];
+extern const char *ct_q83fy0hc_one_shot_function_names[10];
+extern const char *ct_q83fy0hc_boolean_function_names[4];
 
 #endif /* CHAINTREE_HANDLE_FUNCTIONS_H */

@@ -72,7 +72,14 @@
 // ---- core1 application engine (KB0 monitor PoC) -----------------------------
 #define BUS_ADDR_APPCORE         0xFBu   // core1 virtual-slave address
 #define CMD_MON_PING             0x0200u // KB0: liveness round-trip
+#define CMD_MON_SNAPSHOT         0x0201u // KB0: one-shot system report set
 #define KB0_VER                  1u
+// KB0 report opcodes (s2m, src=0xFB). Common header: [batch u16][seq u8][total u8][ver u8].
+#define OP_MON_SYS               0x0030u
+#define OP_MON_TASKS             0x0031u
+#define OP_MON_MEM               0x0032u
+#define OP_MON_END               0x003Fu
+#define MON_VER                  1u
 
 // ---- roster flags + liveness states (match SAMD21 bus_roster) --------------
 #define FLAG_ENABLED             0x02u
@@ -433,6 +440,62 @@ void kb0_on_ping(void *handle, unsigned node_index) {
 }
 void kb0_on_cmd_timeout(void *handle, unsigned node_index) { (void)handle; (void)node_index; }
 
+// ---- KB0 SNAPSHOT report emit (ack + SYS/TASKS/MEM + END) -------------------
+static void mon_w16(uint8_t *p, int *n, uint16_t v) { p[(*n)++]=(uint8_t)v; p[(*n)++]=(uint8_t)(v>>8); }
+static void mon_w32(uint8_t *p, int *n, uint32_t v) { for (int i=0;i<4;i++) p[(*n)++]=(uint8_t)(v>>(8*i)); }
+static void mon_w64(uint8_t *p, int *n, uint64_t v) { for (int i=0;i<8;i++) p[(*n)++]=(uint8_t)(v>>(8*i)); }
+static void mon_push(uint16_t op, const uint8_t *body, uint8_t len) {
+    appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = op;
+    if (len > APPCORE_PAY_MAX) len = APPCORE_PAY_MAX;
+    memcpy(r.payload, body, len); r.len = len;
+    (void)xQueueSend(g_up_q, &r, 0);
+}
+
+void kb0_on_snapshot(void *handle, unsigned node_index) {
+    (void)node_index;
+    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
+    uint16_t batch = (uint16_t)rt->event_data_ptr->data.integer;   // = req_id
+    const uint8_t total = 3;
+    uint8_t b[APPCORE_PAY_MAX]; int n;
+
+    // ack — OP_SHELL_REPLY [req_id][status]
+    n=0; mon_w16(b,&n,batch); b[n++]=SHELL_OK; mon_push(OP_SHELL_REPLY, b, (uint8_t)n);
+
+    // OP_MON_SYS seq0
+    n=0; mon_w16(b,&n,batch); b[n++]=0; b[n++]=total; b[n++]=MON_VER;
+    mon_w32(b,&n,(uint32_t)to_ms_since_boot(get_absolute_time()));
+    mon_w16(b,&n,(uint16_t)g_crash.boot_count);
+    b[n++]=(uint8_t)g_crash.last_cause;
+    b[n++]=0xFF;                                  // crashed_kb (n/a until KB-crash attribution)
+    mon_w32(b,&n,g_crash.panic_code);
+    mon_w64(b,&n,0);                              // status_word (none yet)
+    mon_push(OP_MON_SYS, b, (uint8_t)n);
+
+    // OP_MON_TASKS seq1 — {task_id, stack_hwm_words, load_permil(0xFFFF n/a)}
+    n=0; mon_w16(b,&n,batch); b[n++]=1; b[n++]=total; b[n++]=MON_VER;
+    b[n++]=4;
+    TaskHandle_t th[4] = { t_bus, t_up, t_app, t_wd };
+    for (int i=0;i<4;i++) { b[n++]=(uint8_t)i;
+        mon_w16(b,&n,(uint16_t)uxTaskGetStackHighWaterMark(th[i]));
+        mon_w16(b,&n,0xFFFF); }                   // load: runtime-stats follow-up
+    mon_push(OP_MON_TASKS, b, (uint8_t)n);
+
+    // OP_MON_MEM seq2 — FreeRTOS heap + chain_tree perm/heap
+    n=0; mon_w16(b,&n,batch); b[n++]=2; b[n++]=total; b[n++]=MON_VER;
+    mon_w32(b,&n,(uint32_t)xPortGetFreeHeapSize());
+    mon_w32(b,&n,(uint32_t)xPortGetMinimumEverFreeHeapSize());
+    mon_w32(b,&n,(uint32_t)configTOTAL_HEAP_SIZE);
+    mon_w32(b,&n,(uint32_t)cfl_perm_used_bytes(rt->perm));
+    mon_w32(b,&n,(uint32_t)sizeof g_perm_buf);
+    mon_w32(b,&n,(uint32_t)cfl_heap_free_bytes(rt->heap));
+    mon_w32(b,&n,(uint32_t)((uint32_t)cfl_heap_used_bytes(rt->heap)+cfl_heap_free_bytes(rt->heap)));
+    mon_push(OP_MON_MEM, b, (uint8_t)n);
+
+    // OP_MON_END [batch][count][status][ver]
+    n=0; mon_w16(b,&n,batch); b[n++]=total; b[n++]=0; b[n++]=MON_VER;
+    mon_push(OP_MON_END, b, (uint8_t)n);
+}
+
 // per-tick hook (weak default in cfl_timer_rp2040.c): bump the core1 heartbeat and
 // inject this tick's inter-core commands into the runtime's event queue.
 void cfl_embed_pre_tick(void) {
@@ -442,6 +505,9 @@ void cfl_embed_pre_tick(void) {
         if (c.cmd == CMD_MON_PING) {
             cfl_send_integer_event(g_rt->event_queue, CFL_EVENT_PRIORITY_HIGH,
                                    g_kb0_node, EVENT_CMD_MON_PING, (cfl_int_t)c.req_id);
+        } else if (c.cmd == CMD_MON_SNAPSHOT) {
+            cfl_send_integer_event(g_rt->event_queue, CFL_EVENT_PRIORITY_HIGH,
+                                   g_kb0_node, EVENT_CMD_MON_SNAPSHOT, (cfl_int_t)c.req_id);
         } else {   // unknown command -> direct UNKNOWN_CMD reply (no chain handler)
             appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
             r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
