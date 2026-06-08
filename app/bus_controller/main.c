@@ -37,6 +37,7 @@
 #include "hardware/pio.h"           // servo bank + quad PIO
 #include "hardware/clocks.h"        // clock_get_hz (servo 1 us/tick)
 #include "hardware/pwm.h"           // HIL PWM on GP14
+#include "hardware/i2c.h"           // HIL I2C manager on GP10/11
 #include "servo_bank.pio.h"         // generated: servo_bank_program
 #include "quadrature_encoder.pio.h" // generated: quad decoder (GP17/18)
 #include <string.h>   // strcmp for KB lookup by name
@@ -104,7 +105,14 @@
 #define CMD_PWM_SET              0x0109u // [duty u16 LE] 0..HIL_PWM_TOP on GP14 (fixed 20 kHz)
 #define CMD_QUAD_READ            0x010Au // [] -> [count s32 LE] (GP17 A / GP18 B)
 #define CMD_QUAD_CLEAR           0x010Bu // [] -> zero the quad count
+#define CMD_I2C_SCAN             0x010Cu // [] -> [addr u8]... (7-bit ACKing devices)
+#define CMD_I2C_WRITE            0x010Du // [addr u8][data...] -> []
+#define CMD_I2C_READ             0x010Eu // [addr u8][len u8] -> [data...]
+#define CMD_I2C_WRITE_READ       0x010Fu // [addr u8][rlen u8][wdata...] -> [rdata...]
 #define SHELL_BAD_ARGS           2u      // matches the SAMD21 BAD_ARGS status
+#define SHELL_IO_ERROR           3u      // I2C NACK / bus timeout
+#define HIL_I2C_BAUD             100000u // 100 kHz standard mode
+#define HIL_I2C_MAX_LEN          64u     // cap per transfer (fits the appcore payload)
 // CMD_GPIO_CONFIG mode byte (arg[2]); SERVO is the next slice.
 #define GPIO_MODE_INPUT          0u
 #define GPIO_MODE_OUTPUT         1u
@@ -112,9 +120,9 @@
 #define GPIO_MODE_INPUT_PULLDOWN 3u
 #define GPIO_MODE_SERVO          4u
 #define GPIO_MODE_PULSE_COUNT    5u      // 1 kHz-sampled edge counter, GP2..GP9 only
-// Pins the HIL GPIO/pulse commands must never touch: straps GP0/1, PWM GP14,
-// RS-485 GP15/16, quad GP17/18, ADC GP26/27/28.
-#define GPIO_RESERVED_MASK ((1u<<0)|(1u<<1)|(1u<<14)|(1u<<15)|(1u<<16)|(1u<<17)|(1u<<18)|(1u<<26)|(1u<<27)|(1u<<28))
+// Pins the HIL GPIO/pulse commands must never touch: straps GP0/1, I2C GP10/11,
+// PWM GP14, RS-485 GP15/16, quad GP17/18, ADC GP26/27/28.
+#define GPIO_RESERVED_MASK ((1u<<0)|(1u<<1)|(1u<<10)|(1u<<11)|(1u<<14)|(1u<<15)|(1u<<16)|(1u<<17)|(1u<<18)|(1u<<26)|(1u<<27)|(1u<<28))
 #define KB0_VER                  1u
 // KB0 report opcodes (s2m, src=0xFB). Common header: [batch u16][seq u8][total u8][ver u8].
 #define OP_MON_SYS               0x0030u
@@ -778,6 +786,7 @@ static void adc_publish_10hz(void) {
 // (1 us/tick), repeat. The frame raises all active servos together at t0 and
 // drops each at its width (common-rising-edge). One program serves any N.
 #define CMD_SERVO_SET_ALL  0x0106u   // [width_us u16 LE] x up to 8 (GP2..GP9)
+#define CMD_SERVO_STOP     0x0110u   // terminate servo mode -> GP2.. back to GPIO
 #define SERVO_FRAME_US     20000u    // 50 Hz
 #define SERVO_MIN_US       500u
 #define SERVO_MAX_US       2500u
@@ -840,6 +849,21 @@ static void servo_set_n(uint8_t n) {
     g_servo_ready = true;
 }
 
+// Terminate servo mode: release GP2..GP(base+n-1) back to normal GPIO (SIO input)
+// and clear the bank so those pins are freely reconfigurable. The SM is left
+// claimed + enabled (idle on an empty FIFO, output now disconnected from the
+// pins) so a later servo_set_n re-enables cheaply. NOT disabling the SM avoids a
+// race where the feeder is blocked in pio_sm_put_blocking on a full FIFO.
+static void servo_stop_all(void) {
+    if (g_servo_n == 0) return;
+    uint8_t n = g_servo_n;
+    g_servo_ready = false;                            // feeder stops feeding next cycle
+    g_servo_n = 0;                                    // unblocks GPIO reconfig of GP2..
+    g_servo_frame_len = 0;
+    for (uint8_t i = 0; i < n; i++)
+        gpio_init(HIL_GPIO_BASE + i);                 // PIO func -> SIO input (servo output gone)
+}
+
 // 20 ms feeder: push one frame per period. The blocking puts are paced by the SM
 // (it plays the long all-low tail while we sleep), so the busy-wait is only
 // ~max-width ms per 20 ms, and only once servos are configured. TODO: DMA
@@ -882,6 +906,20 @@ static void quad_init_hw(void) {
     pio_add_program(g_quad_pio, &quadrature_encoder_program);   // .origin 0 -> offset 0
     quadrature_encoder_program_init(g_quad_pio, g_quad_sm, HIL_PIN_QUAD0_A, 0);
 }
+
+// ---- I2C manager (master, i2c1, GP10 SDA / GP11 SCL, 100 kHz) ---------------
+// Internal pull-ups only — fine for short bench wires / one device; a real bus
+// wants external pull-ups. Transactions are timed-out so a stuck bus can't hang
+// the engine / trip the watchdog.
+static void i2c_init_hw(void) {
+    i2c_init(HIL_I2C_INST, HIL_I2C_BAUD);
+    gpio_set_function(HIL_PIN_I2C_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(HIL_PIN_I2C_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(HIL_PIN_I2C_SDA);
+    gpio_pull_up(HIL_PIN_I2C_SCL);
+}
+// per-transfer timeout: ~one byte at 100 kHz is ~90 us; pad generously.
+static uint i2c_to_us(uint len) { return 2000u + len * 200u; }
 
 // ---- GPIO + pulse-count command surface (handled inline on core1) -----------
 // true if (port,pin) is a HIL-touchable GPIO: port must be 0 (RP2040 is flat),
@@ -1005,6 +1043,10 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
         servo_build();                                   // feeder picks up the new frame next cycle
         hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
     }
+    case CMD_SERVO_STOP: {
+        servo_stop_all();
+        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
+    }
     case CMD_PWM_SET: {
         if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
         uint16_t duty = (uint16_t)c->args[0] | ((uint16_t)c->args[1] << 8);
@@ -1020,6 +1062,43 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
     case CMD_QUAD_CLEAR: {
         g_quad_zero = quadrature_encoder_get_count(g_quad_pio, g_quad_sm);
         hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
+    }
+    case CMD_I2C_SCAN: {
+        uint8_t found[112]; uint8_t n = 0;            // 7-bit addrs 0x08..0x77
+        for (uint8_t a = 0x08; a <= 0x77; a++) {
+            uint8_t d;
+            if (i2c_read_timeout_us(HIL_I2C_INST, a, &d, 1, false, i2c_to_us(1)) >= 0) found[n++] = a;
+        }
+        hil_reply(c->req_id, SHELL_OK, found, n); return true;
+    }
+    case CMD_I2C_WRITE: {
+        if (c->alen < 1) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        uint8_t addr = c->args[0], wlen = (uint8_t)(c->alen - 1);
+        int ret = i2c_write_timeout_us(HIL_I2C_INST, addr, &c->args[1], wlen, false, i2c_to_us(wlen));
+        hil_reply(c->req_id, (ret == (int)wlen || (wlen == 0 && ret == 0)) ? SHELL_OK : SHELL_IO_ERROR, NULL, 0);
+        return true;
+    }
+    case CMD_I2C_READ: {
+        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        uint8_t addr = c->args[0], len = c->args[1];
+        if (len > HIL_I2C_MAX_LEN) len = HIL_I2C_MAX_LEN;
+        uint8_t buf[HIL_I2C_MAX_LEN];
+        int ret = i2c_read_timeout_us(HIL_I2C_INST, addr, buf, len, false, i2c_to_us(len));
+        if (ret == (int)len) hil_reply(c->req_id, SHELL_OK, buf, len);
+        else                 hil_reply(c->req_id, SHELL_IO_ERROR, NULL, 0);
+        return true;
+    }
+    case CMD_I2C_WRITE_READ: {
+        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        uint8_t addr = c->args[0], rlen = c->args[1], wlen = (uint8_t)(c->alen - 2);
+        if (rlen > HIL_I2C_MAX_LEN) rlen = HIL_I2C_MAX_LEN;
+        uint8_t buf[HIL_I2C_MAX_LEN];
+        int wret = i2c_write_timeout_us(HIL_I2C_INST, addr, &c->args[2], wlen, true /*repeated start*/, i2c_to_us(wlen));
+        if (wret != (int)wlen) { hil_reply(c->req_id, SHELL_IO_ERROR, NULL, 0); return true; }
+        int rret = i2c_read_timeout_us(HIL_I2C_INST, addr, buf, rlen, false, i2c_to_us(rlen));
+        if (rret == (int)rlen) hil_reply(c->req_id, SHELL_OK, buf, rlen);
+        else                   hil_reply(c->req_id, SHELL_IO_ERROR, NULL, 0);
+        return true;
     }
     default: return false;
     }
@@ -1099,6 +1178,7 @@ static void app_engine_task(void *arg) {
     adc_service_init();
     pwm_init_hw();      // GP14 PWM armed at 0% duty
     quad_init_hw();     // GP17/18 quad decoder (pio1 offset 0, before any servo)
+    i2c_init_hw();      // GP10/11 I2C manager (master, 100 kHz)
 
     g_rt = cfl_runtime_create(&g_perm, &p, h);
     if (!g_rt) chassis_panic(RST_PANIC, 3);
