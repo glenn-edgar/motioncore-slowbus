@@ -43,14 +43,14 @@ typedef enum {
     BOOL_FUNC_COUNT = 4
 } BOOL_FUNC_t;
 
-extern const main_function_t ct_k6oenybg_main_functions[6];
-extern const one_shot_function_t ct_k6oenybg_one_shot_functions[11];
-extern const boolean_function_t ct_k6oenybg_boolean_functions[4];
+extern const main_function_t ct_m6s5rj6o_main_functions[6];
+extern const one_shot_function_t ct_m6s5rj6o_one_shot_functions[11];
+extern const boolean_function_t ct_m6s5rj6o_boolean_functions[4];
 
-extern const uint16_t ct_k6oenybg_main_function_usage_count[6];
+extern const uint16_t ct_m6s5rj6o_main_function_usage_count[6];
 
-extern const char *ct_k6oenybg_main_function_names[6];
-extern const char *ct_k6oenybg_one_shot_function_names[11];
-extern const char *ct_k6oenybg_boolean_function_names[4];
+extern const char *ct_m6s5rj6o_main_function_names[6];
+extern const char *ct_m6s5rj6o_one_shot_function_names[11];
+extern const char *ct_m6s5rj6o_boolean_function_names[4];
 
 #endif /* CHAINTREE_HANDLE_FUNCTIONS_H */

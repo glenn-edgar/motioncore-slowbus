@@ -50,8 +50,10 @@
 // core1 chain_tree engine (KB0)
 #include "cfl_runtime.h"
 #include "cfl_event_queue.h"
+#include "cfl_blackboard.h"            // 10 Hz ADC streams -> chain_tree blackboard
 #include "chaintree_handle.h"
 #include "chaintree_handle_events.h"   // EVENT_CMD_MON_PING
+#include "chaintree_handle_blackboard.h" // chaintree_handle_bb_init_hashes()
 
 // ---- identity announced in REGISTER (interim: SAMD21 BC class; see memory) --
 #define CLASS_ID_BUS_CONTROLLER  0x5E589000u
@@ -84,6 +86,8 @@
 #define ADC_BOXCAR               8       // raw samples averaged per channel per 1 kHz output
 #define ADC_CLKDIV               1999.0f // 24 kHz total -> 8 kHz/ch -> /8 boxcar = ~1 kHz/ch
 #define ADC_FIFO_THRESH          4       // FIFO IRQ trigger level
+#define ADC_WIN_SAMPLES          100     // 1 kHz samples per 10 Hz window (100 ms)
+#define CMD_ADC_STATS            0x0105u // KB1/firmware: read the 10 Hz mean/max/rms streams
 #define KB0_VER                  1u
 // KB0 report opcodes (s2m, src=0xFB). Common header: [batch u16][seq u8][total u8][ver u8].
 #define OP_MON_SYS               0x0030u
@@ -569,6 +573,34 @@ static uint32_t adc_acc[ADC_NCH];                 // ISR-private accumulators
 static uint16_t adc_acc_n[ADC_NCH];
 static uint8_t  adc_phase;                         // round-robin position 0..ADC_NCH-1
 
+// --- 10 Hz window statistics (mean/max/rms over 100 ms of 1 kHz samples) -----
+// Second decimation tier for chain_tree. RMS is the AC component (std-dev with the
+// DC bias removed) — the meaningful figure for transformer-/CT-coupled AC current.
+// Stats run over the 1 kHz Stage-A outputs (100/window): sum of squares fits u32
+// (100 * 4095^2 < 2^32). Effective AC bandwidth ~440 Hz (Stage-A boxcar) — ample
+// for 50/60 Hz line current; switch accumulation to raw samples + u64 if wider.
+typedef struct { uint32_t sum, sumsq; uint16_t max, n; } adc_win_t;
+static adc_win_t          g_win_acc[ADC_NCH];      // ISR-private: current window
+static volatile adc_win_t g_win_done[ADC_NCH];     // ISR-published: last completed window
+static volatile uint32_t  g_adc_win_count;         // completed windows (liveness)
+
+// Integer sqrt (no FPU/libm in the ISR path) for the RMS finalize.
+static uint16_t isqrt32(uint32_t v) {
+    uint32_t op = v, res = 0, one = 1u << 30;
+    while (one > op) one >>= 2;
+    while (one != 0) {
+        if (op >= res + one) { op -= res + one; res += one << 1; }
+        res >>= 1; one >>= 2;
+    }
+    return (uint16_t)res;
+}
+
+// Cached blackboard slot pointers (chain_tree-facing 10 Hz streams), bound once.
+static int32_t *g_bb_mean[ADC_NCH], *g_bb_max[ADC_NCH], *g_bb_rms[ADC_NCH];
+// Mirror of the finalized stats for the CMD_ADC_STATS reply.
+typedef struct { uint16_t mean, max, rms; } adc_stat_t;
+static adc_stat_t g_adc_stats[ADC_NCH];
+
 static void adc_fifo_isr(void) {
     // Overflow desyncs the round-robin phase (dropped samples). Rare in this
     // system (FIFO 8 deep, drained every IRQ), but if it ever happens, restart
@@ -587,9 +619,24 @@ static void adc_fifo_isr(void) {
         uint8_t ch = adc_phase;
         adc_acc[ch] += raw;
         if (++adc_acc_n[ch] >= ADC_BOXCAR) {
-            g_adc_latest[ch] = (uint16_t)(adc_acc[ch] / ADC_BOXCAR);
+            uint16_t s = (uint16_t)(adc_acc[ch] / ADC_BOXCAR);
+            g_adc_latest[ch] = s;                        // 1 kHz tier (interlock callbacks)
             adc_acc[ch] = 0; adc_acc_n[ch] = 0;
             if (ch == ADC_NCH - 1) g_adc_decim_count++;
+
+            // 10 Hz tier: accumulate this 1 kHz sample into the window stats.
+            g_win_acc[ch].sum   += s;
+            g_win_acc[ch].sumsq += (uint32_t)s * s;
+            if (s > g_win_acc[ch].max) g_win_acc[ch].max = s;
+            if (++g_win_acc[ch].n >= ADC_WIN_SAMPLES) {  // window complete -> publish
+                g_win_done[ch].sum   = g_win_acc[ch].sum;
+                g_win_done[ch].sumsq = g_win_acc[ch].sumsq;
+                g_win_done[ch].max   = g_win_acc[ch].max;
+                g_win_done[ch].n     = g_win_acc[ch].n;
+                if (ch == ADC_NCH - 1) g_adc_win_count++;
+                g_win_acc[ch].sum = 0; g_win_acc[ch].sumsq = 0;
+                g_win_acc[ch].max = 0; g_win_acc[ch].n = 0;
+            }
         }
         if (++adc_phase >= ADC_NCH) adc_phase = 0;
     }
@@ -631,6 +678,30 @@ void kb1_on_adc(void *handle, unsigned node_index) {
 
 // per-tick hook (weak default in cfl_timer_rp2040.c): bump the core1 heartbeat and
 // inject this tick's inter-core commands into the runtime's event queue.
+// Finalize the last completed 10 Hz window per channel (mean/max/AC-rms) and mirror
+// it to g_adc_stats + the chain_tree blackboard streams. Engine-thread context;
+// masks ADC_IRQ briefly (same core) for a coherent copy of g_win_done.
+static void adc_publish_10hz(void) {
+    adc_win_t w[ADC_NCH];
+    irq_set_enabled(ADC_IRQ_FIFO, false);
+    for (int ch = 0; ch < ADC_NCH; ch++) {
+        w[ch].sum = g_win_done[ch].sum; w[ch].sumsq = g_win_done[ch].sumsq;
+        w[ch].max = g_win_done[ch].max; w[ch].n     = g_win_done[ch].n;
+    }
+    irq_set_enabled(ADC_IRQ_FIFO, true);
+    for (int ch = 0; ch < ADC_NCH; ch++) {
+        if (w[ch].n == 0) continue;                          // no window completed yet
+        uint16_t mean = (uint16_t)(w[ch].sum / w[ch].n);
+        uint32_t msq  = w[ch].sumsq / w[ch].n;
+        uint32_t m2   = (uint32_t)mean * mean;
+        uint16_t rms  = (msq > m2) ? isqrt32(msq - m2) : 0;   // AC RMS = std-dev (DC removed)
+        g_adc_stats[ch].mean = mean; g_adc_stats[ch].max = w[ch].max; g_adc_stats[ch].rms = rms;
+        if (g_bb_mean[ch]) *g_bb_mean[ch] = mean;            // publish chain_tree streams
+        if (g_bb_max[ch])  *g_bb_max[ch]  = (int32_t)w[ch].max;
+        if (g_bb_rms[ch])  *g_bb_rms[ch]  = rms;
+    }
+}
+
 void cfl_embed_pre_tick(void) {
     g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
     appcore_cmd_t c;
@@ -644,6 +715,19 @@ void cfl_embed_pre_tick(void) {
         } else if (c.cmd == CMD_ADC_READ) {      // KB1 (api): route to KB1's start node
             cfl_send_integer_event(g_rt->event_queue, CFL_EVENT_PRIORITY_HIGH,
                                    g_kb1_node, EVENT_CMD_ADC_READ, (cfl_int_t)c.req_id);
+        } else if (c.cmd == CMD_ADC_STATS) {     // read the 10 Hz streams from the blackboard
+            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+            uint8_t *p = r.payload; uint8_t n = 0;
+            p[n++] = (uint8_t)c.req_id; p[n++] = (uint8_t)(c.req_id >> 8); p[n++] = SHELL_OK;
+            for (int ch = 0; ch < ADC_NCH; ch++) {           // [mean][max][rms] per channel, from bb
+                int32_t mn = g_bb_mean[ch] ? *g_bb_mean[ch] : 0;
+                int32_t mx = g_bb_max[ch]  ? *g_bb_max[ch]  : 0;
+                int32_t rm = g_bb_rms[ch]  ? *g_bb_rms[ch]  : 0;
+                p[n++]=(uint8_t)mn; p[n++]=(uint8_t)(mn>>8);
+                p[n++]=(uint8_t)mx; p[n++]=(uint8_t)(mx>>8);
+                p[n++]=(uint8_t)rm; p[n++]=(uint8_t)(rm>>8);
+            }
+            r.len = n; (void)xQueueSend(g_up_q, &r, 0);
         } else if (c.cmd == CMD_MON_STREAM) {   // [enable u8][period_ms u16][mask u16]
             if (c.alen >= 3) {
                 g_stream_on = c.args[0];
@@ -663,6 +747,8 @@ void cfl_embed_pre_tick(void) {
         }
     }
 
+    adc_publish_10hz();   // finalize 10 Hz mean/max/rms -> blackboard streams
+
     // STREAM pacing: emit a report set every period while enabled + host connected.
     if (g_stream_on && g_host_connected) {
         uint32_t now = to_ms_since_boot(get_absolute_time());
@@ -676,6 +762,7 @@ void cfl_embed_pre_tick(void) {
 static void app_engine_task(void *arg) {
     (void)arg;
     const chaintree_handle_t *h = &g_chaintree_handle;
+    chaintree_handle_bb_init_hashes();   // blackboard field name-hashes are static-init'd to 0
     cfl_runtime_create_params_t p; memset(&p, 0, sizeof p);
     p.perm = &g_perm; p.perm_buffer = g_perm_buf; p.perm_buffer_size = (uint16_t)sizeof g_perm_buf;
     p.heap_size = 4096; p.max_allocator_count = cfl_calculate_arrena_number(h);  // ~250 B in use; 4 KB = generous margin for KB2/3/4
@@ -707,6 +794,16 @@ static void app_engine_task(void *arg) {
         if (strcmp(nm, "kb0") == 0)      g_kb0_node = node;
         else if (strcmp(nm, "kb1") == 0) g_kb1_node = node;
     }
+    // Bind the chain_tree blackboard slots for the 10 Hz ADC streams (NULL if absent).
+    static const char *const nm_mean[ADC_NCH] = { "adc0_mean", "adc1_mean", "adc2_mean" };
+    static const char *const nm_max[ADC_NCH]  = { "adc0_max",  "adc1_max",  "adc2_max"  };
+    static const char *const nm_rms[ADC_NCH]  = { "adc0_rms",  "adc1_rms",  "adc2_rms"  };
+    for (int ch = 0; ch < ADC_NCH; ch++) {
+        g_bb_mean[ch] = (int32_t *)cfl_bb_field_by_name(g_rt, nm_mean[ch]);
+        g_bb_max[ch]  = (int32_t *)cfl_bb_field_by_name(g_rt, nm_max[ch]);
+        g_bb_rms[ch]  = (int32_t *)cfl_bb_field_by_name(g_rt, nm_rms[ch]);
+    }
+
     g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
     cfl_runtime_run(g_rt);                           // forever loop (the thread body)
     for (;;) vTaskDelay(pdMS_TO_TICKS(100));         // not reached

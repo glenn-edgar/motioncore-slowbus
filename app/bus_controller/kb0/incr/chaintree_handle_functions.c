@@ -26,7 +26,7 @@ extern bool cfl_column_null_boolean_fn(void *handle, unsigned node_index, unsign
 extern bool cfl_gate_node_null_boolean_fn(void *handle, unsigned node_index, unsigned event_type, unsigned event_id, void *event_data);
 extern bool cfl_wait_for_event_boolean_fn(void *handle, unsigned node_index, unsigned event_type, unsigned event_id, void *event_data);
 
-const main_function_t ct_k6oenybg_main_functions[] = {
+const main_function_t ct_m6s5rj6o_main_functions[] = {
     cfl_null_main_fn,
     cfl_column_main_main_fn,
     cfl_disable_main_fn,
@@ -35,7 +35,7 @@ const main_function_t ct_k6oenybg_main_functions[] = {
     cfl_wait_main_fn,
 };
 
-const one_shot_function_t ct_k6oenybg_one_shot_functions[] = {
+const one_shot_function_t ct_m6s5rj6o_one_shot_functions[] = {
     cfl_null_one_shot_fn,
     adc_read_one_shot_fn,
     cfl_column_init_one_shot_fn,
@@ -49,14 +49,14 @@ const one_shot_function_t ct_k6oenybg_one_shot_functions[] = {
     mon_cmd_timeout_one_shot_fn,
 };
 
-const boolean_function_t ct_k6oenybg_boolean_functions[] = {
+const boolean_function_t ct_m6s5rj6o_boolean_functions[] = {
     cfl_null_boolean_fn,
     cfl_column_null_boolean_fn,
     cfl_gate_node_null_boolean_fn,
     cfl_wait_for_event_boolean_fn,
 };
 
-const uint16_t ct_k6oenybg_main_function_usage_count[6] = {
+const uint16_t ct_m6s5rj6o_main_function_usage_count[6] = {
     0,  /* CFL_NULL */
     3,  /* CFL_COLUMN_MAIN */
     3,  /* CFL_DISABLE */
@@ -65,7 +65,7 @@ const uint16_t ct_k6oenybg_main_function_usage_count[6] = {
     3,  /* CFL_WAIT */
 };
 
-const char *ct_k6oenybg_main_function_names[6] = {
+const char *ct_m6s5rj6o_main_function_names[6] = {
     "CFL_NULL",
     "CFL_COLUMN_MAIN",
     "CFL_DISABLE",
@@ -74,7 +74,7 @@ const char *ct_k6oenybg_main_function_names[6] = {
     "CFL_WAIT",
 };
 
-const char *ct_k6oenybg_one_shot_function_names[11] = {
+const char *ct_m6s5rj6o_one_shot_function_names[11] = {
     "CFL_NULL",
     "ADC_READ",
     "CFL_COLUMN_INIT",
@@ -88,7 +88,7 @@ const char *ct_k6oenybg_one_shot_function_names[11] = {
     "MON_CMD_TIMEOUT",
 };
 
-const char *ct_k6oenybg_boolean_function_names[4] = {
+const char *ct_m6s5rj6o_boolean_function_names[4] = {
     "CFL_NULL",
     "CFL_COLUMN_NULL",
     "CFL_GATE_NODE_NULL",
