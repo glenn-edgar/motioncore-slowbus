@@ -1,0 +1,13 @@
+; servo_bank.pio — one PIO state machine drives up to 8 RC servos on a
+; contiguous GPIO block (GP2..GP9). The host feeds 32-bit words of the form
+; [delay:24][pin-levels:8]: set the pins, hold for `delay` ticks (clkdiv = 1
+; us/tick), repeat. One dumb program serves any N from 1..8 — only the mapped
+; out-pin count changes. `out pins, 8` always consumes 8 bits so the [delay:24]
+; field stays aligned regardless of N.
+.program servo_bank
+.wrap_target
+    out pins, 8        ; bits[7:0]  -> up to 8 servo pins
+    out x,    24       ; bits[31:8] -> delay (ticks, 1 us each)
+hold:
+    jmp x-- hold
+.wrap

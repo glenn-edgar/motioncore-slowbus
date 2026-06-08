@@ -34,6 +34,9 @@
 #include "hardware/irq.h"
 #include "hardware/structs/adc.h"   // adc_hw, ADC_FCS_OVER_BITS (overflow resync)
 #include "hardware/structs/sio.h"   // sio_hw->gpio_in (1 kHz pulse sampling)
+#include "hardware/pio.h"           // servo bank PIO
+#include "hardware/clocks.h"        // clock_get_hz (servo 1 us/tick)
+#include "servo_bank.pio.h"         // generated: servo_bank_program
 #include <string.h>   // strcmp for KB lookup by name
 #include "FreeRTOS.h"
 #include "task.h"
@@ -764,6 +767,89 @@ static void adc_publish_10hz(void) {
     }
 }
 
+// ---- servo bank: one PIO SM drives up to 8 RC servos (GP2..GP9, 50 Hz) ------
+// The SM consumes 32-bit words [delay:24][pin-levels:8]: set pins, hold delay
+// (1 us/tick), repeat. The frame raises all active servos together at t0 and
+// drops each at its width (common-rising-edge). One program serves any N.
+#define CMD_SERVO_SET_ALL  0x0106u   // [width_us u16 LE] x up to 8 (GP2..GP9)
+#define SERVO_FRAME_US     20000u    // 50 Hz
+#define SERVO_MIN_US       500u
+#define SERVO_MAX_US       2500u
+#define SERVO_MAX          HIL_GPIO_COUNT      // 8
+
+static PIO      g_servo_pio = pio1;            // pio0 = RS-485 bus; pio1 = HIL
+static uint     g_servo_sm;
+static int      g_servo_off = -1;              // program offset; <0 = not loaded
+static uint8_t  g_servo_n;                     // contiguous servos GP(base)..GP(base+n-1)
+static uint16_t g_servo_us[SERVO_MAX] = { 1500,1500,1500,1500,1500,1500,1500,1500 };
+static volatile uint32_t g_servo_frame[SERVO_MAX + 1];
+static volatile uint8_t  g_servo_frame_len;
+static volatile bool     g_servo_ready;
+
+// Build the frame from g_servo_us[0..n) (common-rising-edge). TODO: a staggered
+// variant bounds peak inrush (all N servos pulling at once) — same SM/words,
+// different schedule; switch here if the supply can't take simultaneous starts.
+static void servo_build(void) {
+    uint8_t n = g_servo_n;
+    if (n == 0) { g_servo_frame_len = 0; return; }
+    uint8_t idx[SERVO_MAX];
+    for (uint8_t i = 0; i < n; i++) idx[i] = i;
+    for (uint8_t i = 1; i < n; i++)                 // insertion sort by width asc (n<=8)
+        for (uint8_t j = i; j > 0 && g_servo_us[idx[j]] < g_servo_us[idx[j-1]]; j--) {
+            uint8_t t = idx[j]; idx[j] = idx[j-1]; idx[j-1] = t;
+        }
+    uint32_t tmp[SERVO_MAX + 1];
+    uint32_t mask = (1u << n) - 1u;                 // all active servos high at t0
+    uint32_t prev = 0; uint8_t len = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        uint32_t w = g_servo_us[idx[i]];
+        if (w > prev) { tmp[len++] = (mask & 0xFFu) | ((w - prev) << 8); prev = w; }
+        mask &= ~(1u << idx[i]);                     // this channel drops low
+    }
+    tmp[len++] = ((SERVO_FRAME_US - prev) << 8);     // tail: all low for the rest of the frame
+    for (uint8_t i = 0; i < len; i++) g_servo_frame[i] = tmp[i];
+    g_servo_frame_len = len;                          // publish length last
+}
+
+// (Re)configure the SM for n contiguous servos from GP(base). Rare (setup-time).
+static void servo_set_n(uint8_t n) {
+    if (n == 0 || n > SERVO_MAX) return;
+    g_servo_ready = false;
+    if (g_servo_off < 0) {                            // first servo: claim SM + load program
+        g_servo_sm  = (uint)pio_claim_unused_sm(g_servo_pio, true);
+        g_servo_off = (int)pio_add_program(g_servo_pio, &servo_bank_program);
+    } else {
+        pio_sm_set_enabled(g_servo_pio, g_servo_sm, false);
+    }
+    for (uint8_t i = 0; i < n; i++) pio_gpio_init(g_servo_pio, HIL_GPIO_BASE + i);
+    pio_sm_set_consecutive_pindirs(g_servo_pio, g_servo_sm, HIL_GPIO_BASE, n, true);
+    pio_sm_config cfg = servo_bank_program_get_default_config((uint)g_servo_off);
+    sm_config_set_out_pins(&cfg, HIL_GPIO_BASE, n);
+    sm_config_set_out_shift(&cfg, true, true, 32);    // shift right, autopull @ 32 bits
+    sm_config_set_clkdiv(&cfg, (float)clock_get_hz(clk_sys) / 1000000.0f);  // 1 us/tick
+    pio_sm_init(g_servo_pio, g_servo_sm, (uint)g_servo_off, &cfg);
+    pio_sm_set_enabled(g_servo_pio, g_servo_sm, true);
+    g_servo_n = n;
+    servo_build();
+    g_servo_ready = true;
+}
+
+// 20 ms feeder: push one frame per period. The blocking puts are paced by the SM
+// (it plays the long all-low tail while we sleep), so the busy-wait is only
+// ~max-width ms per 20 ms, and only once servos are configured. TODO: DMA
+// self-restart would free the CPU entirely for production.
+static void servo_feeder_task(void *arg) {
+    (void)arg;
+    TickType_t next = xTaskGetTickCount();
+    for (;;) {
+        vTaskDelayUntil(&next, pdMS_TO_TICKS(20));
+        if (!g_servo_ready) continue;
+        uint8_t len = g_servo_frame_len;
+        for (uint8_t i = 0; i < len; i++)
+            pio_sm_put_blocking(g_servo_pio, g_servo_sm, g_servo_frame[i]);
+    }
+}
+
 // ---- GPIO + pulse-count command surface (handled inline on core1) -----------
 // true if (port,pin) is a HIL-touchable GPIO: port must be 0 (RP2040 is flat),
 // pin in range, and not a reserved bus/strap/ADC pin.
@@ -790,6 +876,11 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
         uint8_t port = c->args[0], pin = c->args[1], mode = c->args[2];
         if (!gpio_pin_ok(port, pin)) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
         bool in_block = (pin >= HIL_GPIO_BASE && pin < HIL_GPIO_BASE + HIL_GPIO_COUNT);
+        uint8_t blk_i = in_block ? (uint8_t)(pin - HIL_GPIO_BASE) : 0xFF;
+        // A configured servo pin can't be reassigned in v1 (would orphan the bank).
+        if (in_block && blk_i < g_servo_n && mode != GPIO_MODE_SERVO) {
+            hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true;
+        }
         // Re-configuring a counter pin to anything else drops it from the sample mask.
         if (in_block && mode != GPIO_MODE_PULSE_COUNT) {
             uint8_t bit = (uint8_t)(1u << (pin - HIL_GPIO_BASE));
@@ -821,7 +912,17 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
             irq_set_enabled(ADC_IRQ_FIFO, true);
             break;
         }
-        default:  // GPIO_MODE_SERVO (next slice) + unknown modes
+        case GPIO_MODE_SERVO: {
+            if (!in_block) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+            uint8_t want = (uint8_t)(blk_i + 1);          // servos = GP(base)..this pin (contiguous)
+            if (want > g_servo_n) {
+                uint8_t span = (uint8_t)((1u << want) - 1u);
+                if (g_pulse_mask & span) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; } // no counter under the bank
+                servo_set_n(want);
+            }
+            break;
+        }
+        default:  // unknown mode
             hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true;
         }
         hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
@@ -856,6 +957,19 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
         for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
             if (mask & (1u << i)) g_pulse_count[i] = 0;
         irq_set_enabled(ADC_IRQ_FIFO, true);
+        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
+    }
+    case CMD_SERVO_SET_ALL: {
+        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        uint8_t cnt = (uint8_t)(c->alen / 2);
+        if (cnt > SERVO_MAX) cnt = SERVO_MAX;
+        for (uint8_t i = 0; i < cnt; i++) {              // clamp each to the RC servo range
+            uint16_t us = (uint16_t)c->args[i*2] | ((uint16_t)c->args[i*2 + 1] << 8);
+            if (us < SERVO_MIN_US) us = SERVO_MIN_US;
+            if (us > SERVO_MAX_US) us = SERVO_MAX_US;
+            g_servo_us[i] = us;
+        }
+        servo_build();                                   // feeder picks up the new frame next cycle
         hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
     }
     default: return false;
@@ -1036,6 +1150,7 @@ int main(void) {
     xTaskCreate(uplink_task,      "uplink", configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_up);
     xTaskCreate(app_engine_task,  "app",    configMINIMAL_STACK_SIZE * 8, NULL, 3, &t_app);
     xTaskCreate(watchdog_task,    "wd",     configMINIMAL_STACK_SIZE * 2, NULL, 1, &t_wd);
+    xTaskCreate(servo_feeder_task,"servo",  configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL); // float; idle until a servo is configured
     vTaskCoreAffinitySet(t_bus, 1u << 0);
     vTaskCoreAffinitySet(t_up,  1u << 0);
     vTaskCoreAffinitySet(t_app, 1u << 1);   // core1 = application engine

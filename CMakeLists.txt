@@ -87,6 +87,7 @@ add_executable(bus_controller
     ${KB0_INCR_SRCS}
     ${BC_DIR}/kb0/user_functions.c)
 pico_generate_pio_header(bus_controller ${PORT_DIR}/rs485.pio)
+pico_generate_pio_header(bus_controller ${PORT_DIR}/servo_bank.pio)  # 8-servo bank
 target_include_directories(bus_controller PRIVATE
     ${COMMON_INC} ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
     ${BC_DIR}/engine/include ${BC_DIR}/kb0/incr)
