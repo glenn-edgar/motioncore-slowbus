@@ -168,26 +168,33 @@ Mirror the SAMD21 `ROLE` pattern (clean build required on role switch).
 
 ---
 
-## Pin map — Pico W (RP2040)
+## Pin map — Pico W (RP2040), "pico1"
 
-The Pico W is **both BC and slave** (single tree), so it carries the full HIL
-peripheral set: SPI, I2C, 2× quadrature, 2× PWM, ADC, and as much GPIO as
-possible. Header exposes **GP0–GP22 + GP26/27/28** (26 usable). GP23/24/25/29 are
-CYW43-internal.
+The "pico1" role is a **GPIO interface + I2C manager**. The reduced HIL set: **no
+SPI**, **1 I2C**, **1 HIL UART**, **1 PWM**, **1 quadrature decoder**, plus an
+8-pin contiguous GPIO block and the 3-channel ADC analog spine. Two boot straps
+(GP0/GP1) select bus speed and BC master/slave. Header exposes **GP0–GP22 +
+GP26/27/28** (26 usable); GP23/24/25/29 are CYW43-internal.
+
+> The RP2040 pin mux ties **I2C0-SDA / UART1-TX to the same pins (GP4/GP8/GP20)**
+> and I2C0-SCL / UART1-RX to GP5/GP9/GP21. A contiguous GP2–GP9 GPIO block is
+> only possible because we settled on **1 I2C + 1 UART** — placed on i2c1
+> (GP10/11) and uart0 (GP12/13), clear of the GPIO block.
 
 ### Function summary
 
 | Function | Pins (GPIO) | Notes |
 |----------|-------------|-------|
-| RS-485 bus | GP20 DI/TX, GP21 RO/RX (PIO) | adjacent pair; no DE (auto-direction); PIO maps any GPIO |
-| I2C0 | GP4 SDA, GP5 SCL | |
-| SPI0 (3 devices) | GP16 MISO, GP18 SCK, GP19 MOSI + GP14 CS0, GP15 CS1, GP17 CS2 | one contiguous block GP14–GP19; signals mux-locked, CS are software GPIO |
-| QUAD0 | GP10 A, GP11 B (PIO) | RP2040 has no HW QEI |
-| QUAD1 | GP12 A, GP13 B (PIO) | |
-| PWM0 | GP0 (slice 0A) | 20 kHz, armed at boot @ 0 % |
-| PWM1 | GP1 (slice 0B) | same slice as PWM0 (all 20 kHz), independent duty |
+| Strap: bus speed | GP0 (pin 1) | read once at boot; worst-case jumper |
+| Strap: BC master/slave | GP1 (pin 2) | read once at boot; worst-case jumper |
+| GPIO (8) | GP2–GP9 (pins 4–12) | contiguous block |
+| I2C | GP10 SDA, GP11 SCL (i2c1) | single bus — the "I2C manager" |
+| UART | GP12 TX, GP13 RX (uart0) | single HIL serial; bus is separate (PIO) |
+| PWM | GP14 (slice 7A) | 20 kHz, armed at boot @ 0 % |
+| RS-485 bus | GP15 DI/TX, GP16 RO/RX (PIO) | adjacent pair; no DE (auto-direction) |
+| QUAD | GP17 A, GP18 B (PIO) | RP2040 has no HW QEI |
 | ADC | GP26 ADC0, GP27 ADC1, GP28 ADC2 | analog inputs, kept free |
-| GPIO (7) | GP2, GP3, GP6, GP7, GP8, GP9, GP22 | |
+| Spare GPIO | GP19, GP20, GP21, GP22 | expansion |
 
 ### Physical layout (USB at top, component side up)
 
@@ -195,44 +202,44 @@ CYW43-internal.
 
 | Pin | GPIO | Function | | Pin | GPIO | Function |
 |----|------|----------|--|----|------|----------|
-| 1 | GP0 | PWM0 (slice 0A) | | 11 | GP8 | GPIO |
-| 2 | GP1 | PWM1 (slice 0B) | | 12 | GP9 | GPIO |
+| 1 | GP0 | **STRAP: bus speed** | | 11 | GP8 | GPIO6 |
+| 2 | GP1 | **STRAP: master/slave** | | 12 | GP9 | GPIO7 |
 | 3 | — | GND | | 13 | — | GND |
-| 4 | GP2 | GPIO | | 14 | GP10 | QUAD0 A |
-| 5 | GP3 | GPIO | | 15 | GP11 | QUAD0 B |
-| 6 | GP4 | I2C0 SDA | | 16 | GP12 | QUAD1 A |
-| 7 | GP5 | I2C0 SCL | | 17 | GP13 | QUAD1 B |
+| 4 | GP2 | GPIO0 | | 14 | GP10 | I2C SDA |
+| 5 | GP3 | GPIO1 | | 15 | GP11 | I2C SCL |
+| 6 | GP4 | GPIO2 | | 16 | GP12 | UART TX |
+| 7 | GP5 | GPIO3 | | 17 | GP13 | UART RX |
 | 8 | — | GND | | 18 | — | GND |
-| 9 | GP6 | GPIO | | 19 | GP14 | SPI CS0 |
-| 10 | GP7 | GPIO | | 20 | GP15 | SPI CS1 |
+| 9 | GP6 | GPIO4 | | 19 | GP14 | PWM (slice 7A) |
+| 10 | GP7 | GPIO5 | | 20 | GP15 | **RS-485 TX (DI)** |
 
 **Right side (pins 21–40)**
 
 | Pin | GPIO | Function | | Pin | GPIO | Function |
 |----|------|----------|--|----|------|----------|
-| 21 | GP16 | SPI MISO | | 31 | GP26 | ADC0 |
-| 22 | GP17 | SPI CS2 | | 32 | GP27 | ADC1 |
+| 21 | GP16 | **RS-485 RX (RO)** | | 31 | GP26 | ADC0 |
+| 22 | GP17 | QUAD A | | 32 | GP27 | ADC1 |
 | 23 | — | GND | | 33 | — | AGND |
-| 24 | GP18 | SPI SCK | | 34 | GP28 | ADC2 |
-| 25 | GP19 | SPI MOSI | | 35 | — | ADC_VREF |
-| 26 | GP20 | **RS-485 TX (DI)** | | 36 | — | 3V3 (OUT) |
-| 27 | GP21 | **RS-485 RX (RO)** | | 37 | — | 3V3_EN |
+| 24 | GP18 | QUAD B | | 34 | GP28 | ADC2 |
+| 25 | GP19 | spare GPIO | | 35 | — | ADC_VREF |
+| 26 | GP20 | spare GPIO | | 36 | — | 3V3 (OUT) |
+| 27 | GP21 | spare GPIO | | 37 | — | 3V3_EN |
 | 28 | — | GND | | 38 | — | GND |
-| 29 | GP22 | GPIO | | 39 | — | VSYS |
+| 29 | GP22 | spare GPIO | | 39 | — | VSYS |
 | 30 | — | RUN | | 40 | — | VBUS |
 
-Why it lays out well: **SPI is one contiguous block (GP14–GP19 = pins 19–25)** —
-3 signals + 3 chip-selects together for the three SPI devices; **RS-485 sits right
-below it on GP20/GP21 (pins 26/27), an adjacent pair** for the transceiver
-pigtail; quadrature is a contiguous 4-pin block (14–17); PWM pair at the top-left
-(pins 1–2); ADC beside AGND + ADC_VREF in the bottom-right analog corner.
+Why it lays out well: **straps at the top-left (pins 1–2)** are the two jumper
+inputs; the **8-pin GPIO block is contiguous (GP2–GP9 = pins 4–12)**; I2C + UART
+sit just below it (GP10–GP13); **RS-485 is an adjacent pair on GP15/GP16 (pins
+20/21)** for the transceiver pigtail, with QUAD right after it; ADC sits beside
+AGND + ADC_VREF in the bottom-right analog corner; spare GPIO fills the gap.
 
 ---
 
 ## PWM
 
-- All PWMs run at **20 kHz**. Armed at boot, **compare = 0 → 0 % duty (pin held
-  low)** until commanded — known-safe state.
+- The PWM runs at **20 kHz** (GP14, slice 7A). Armed at boot, **compare = 0 → 0 %
+  duty (pin held low)** until commanded — known-safe state.
 - **11-bit resolution (2048 steps, TOP = 2047)** to match the SAMD21/RA4M1 HIL
   command surface (duty 0–2047), so the host-side command is portable across all
   chips. At 125 MHz sys_clk a 2048-count period needs clock ≈ 40.96 MHz → PWM
@@ -250,8 +257,8 @@ pigtail; quadrature is a contiguous 4-pin block (14–17); PWM pair at the top-l
 3. **Only 3 ADC channels** on the header — GP29/ADC3 is VSYS-sense via CYW43.
 4. **Quadrature is PIO** (no HW encoder) — costs 2 of the 8 PIO state machines.
 
-**PIO SM budget:** RS-485 TX+RX (2) + QUAD0 + QUAD1 (2) = 4, plus CYW43 (1, only
-in `UPLINK=wifi`) = 5 of 8. **3 spare.**
+**PIO SM budget:** RS-485 TX+RX (2) + QUAD (1) = 3, plus CYW43 (1, only in
+`UPLINK=wifi`) = 4 of 8. **4 spare.**
 
 ---
 

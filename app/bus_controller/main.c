@@ -33,6 +33,7 @@
 #include "hardware/adc.h"
 #include "hardware/irq.h"
 #include "hardware/structs/adc.h"   // adc_hw, ADC_FCS_OVER_BITS (overflow resync)
+#include "hardware/structs/sio.h"   // sio_hw->gpio_in (1 kHz pulse sampling)
 #include <string.h>   // strcmp for KB lookup by name
 #include "FreeRTOS.h"
 #include "task.h"
@@ -88,6 +89,23 @@
 #define ADC_FIFO_THRESH          4       // FIFO IRQ trigger level
 #define ADC_WIN_SAMPLES          100     // 1 kHz samples per 10 Hz window (100 ms)
 #define CMD_ADC_STATS            0x0105u // KB1/firmware: read the 10 Hz mean/max/rms streams
+
+// ---- GPIO + pulse-count HIL (KB1 api; pin map per board.h) ------------------
+#define CMD_GPIO_CONFIG          0x0100u // [port u8][pin u8][mode u8][mode-args...]
+#define CMD_GPIO_WRITE           0x0101u // [port u8][pin u8][level u8]
+#define CMD_GPIO_READ            0x0102u // [port u8][pin u8] -> [level u8]
+#define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
+#define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
+#define SHELL_BAD_ARGS           2u      // matches the SAMD21 BAD_ARGS status
+// CMD_GPIO_CONFIG mode byte (arg[2]); SERVO is the next slice.
+#define GPIO_MODE_INPUT          0u
+#define GPIO_MODE_OUTPUT         1u
+#define GPIO_MODE_INPUT_PULLUP   2u
+#define GPIO_MODE_INPUT_PULLDOWN 3u
+#define GPIO_MODE_SERVO          4u
+#define GPIO_MODE_PULSE_COUNT    5u      // 1 kHz-sampled edge counter, GP2..GP9 only
+// Pins the HIL must never touch: straps GP0/1, RS-485 GP15/16, ADC GP26/27/28.
+#define GPIO_RESERVED_MASK ((1u<<0)|(1u<<1)|(1u<<15)|(1u<<16)|(1u<<26)|(1u<<27)|(1u<<28))
 #define KB0_VER                  1u
 // KB0 report opcodes (s2m, src=0xFB). Common header: [batch u16][seq u8][total u8][ver u8].
 #define OP_MON_SYS               0x0030u
@@ -601,6 +619,44 @@ static int32_t *g_bb_mean[ADC_NCH], *g_bb_max[ADC_NCH], *g_bb_rms[ADC_NCH];
 typedef struct { uint16_t mean, max, rms; } adc_stat_t;
 static adc_stat_t g_adc_stats[ADC_NCH];
 
+// ---- pulse-count service (1 kHz software edge counter, GP2..GP9, zero PIO) --
+// Counts are running totals exposed as globals (like g_adc_latest), cleared only
+// by CMD_PULSE_CLEAR. The 1 kHz decimation ISR is the SOLE writer. A u32 is NOT a
+// single-cycle read on the M0+ (two 16-bit halves), so readers/clearers briefly
+// mask ADC_IRQ for a coherent snapshot. Sampling at 1 kHz -> reliable to ~400 Hz.
+static volatile uint32_t g_pulse_count[HIL_GPIO_COUNT]; // [i] = edges on GP(HIL_GPIO_BASE+i)
+static uint8_t  g_pulse_mask;                           // bit i set -> GP(base+i) counts
+static uint8_t  g_pulse_edge[HIL_GPIO_COUNT];           // 0=rising 1=falling 2=both
+static uint8_t  g_pulse_last;                           // last sampled levels, bit i = GP(base+i)
+
+// Called at the 1 kHz decimation anchor (ISR context). Bounded loop of 8.
+static void pulse_sample_1khz(void) {
+    if (!g_pulse_mask) return;
+    uint32_t in = sio_hw->gpio_in;
+    uint8_t now = 0;
+    for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
+        if (in & (1u << (HIL_GPIO_BASE + i))) now |= (uint8_t)(1u << i);
+    uint8_t changed = now ^ g_pulse_last;
+    uint8_t rose = changed & now;            // 0 -> 1
+    uint8_t fell = changed & (uint8_t)~now;  // 1 -> 0
+    for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
+        uint8_t bit = (uint8_t)(1u << i);
+        if (!(g_pulse_mask & bit)) continue;
+        if ((g_pulse_edge[i] == 0 && (rose    & bit)) ||
+            (g_pulse_edge[i] == 1 && (fell    & bit)) ||
+            (g_pulse_edge[i] == 2 && (changed & bit)))
+            g_pulse_count[i]++;
+    }
+    g_pulse_last = now;
+}
+
+// Per-KB 1 kHz fast-tick hooks (ISR context, bounded, pure C — NOT the chain
+// engine, which runs at 10 Hz on core1). Weak no-ops by default; a KB overrides
+// its own to ride the fast tier (KB2/KB3 interlock veto+latch will live here).
+__attribute__((weak)) void kb0_on_fast_tick(void) {}
+__attribute__((weak)) void kb1_on_fast_tick(void) {}
+__attribute__((weak)) void kb2_on_fast_tick(void) {}
+
 static void adc_fifo_isr(void) {
     // Overflow desyncs the round-robin phase (dropped samples). Rare in this
     // system (FIFO 8 deep, drained every IRQ), but if it ever happens, restart
@@ -622,7 +678,13 @@ static void adc_fifo_isr(void) {
             uint16_t s = (uint16_t)(adc_acc[ch] / ADC_BOXCAR);
             g_adc_latest[ch] = s;                        // 1 kHz tier (interlock callbacks)
             adc_acc[ch] = 0; adc_acc_n[ch] = 0;
-            if (ch == ADC_NCH - 1) g_adc_decim_count++;
+            if (ch == ADC_NCH - 1) {     // 1 kHz anchor: all channels fresh this cycle
+                g_adc_decim_count++;
+                pulse_sample_1khz();     // software pulse edge counting (zero PIO)
+                kb0_on_fast_tick();      // per-KB 1 kHz fast tier (monitors / interlock veto)
+                kb1_on_fast_tick();
+                kb2_on_fast_tick();
+            }
 
             // 10 Hz tier: accumulate this 1 kHz sample into the window stats.
             g_win_acc[ch].sum   += s;
@@ -702,6 +764,104 @@ static void adc_publish_10hz(void) {
     }
 }
 
+// ---- GPIO + pulse-count command surface (handled inline on core1) -----------
+// true if (port,pin) is a HIL-touchable GPIO: port must be 0 (RP2040 is flat),
+// pin in range, and not a reserved bus/strap/ADC pin.
+static bool gpio_pin_ok(uint8_t port, uint8_t pin) {
+    if (port != 0 || pin > 28) return false;
+    if (GPIO_RESERVED_MASK & (1u << pin)) return false;
+    return true;
+}
+
+static void hil_reply(uint16_t req_id, uint8_t status, const uint8_t *res, uint8_t rlen) {
+    appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+    uint8_t n = 0;
+    r.payload[n++] = (uint8_t)req_id; r.payload[n++] = (uint8_t)(req_id >> 8);
+    r.payload[n++] = status;
+    for (uint8_t i = 0; i < rlen && n < APPCORE_PAY_MAX; i++) r.payload[n++] = res[i];
+    r.len = n; (void)xQueueSend(g_up_q, &r, 0);
+}
+
+// Returns true if cmd was a GPIO/pulse command (reply already sent), false otherwise.
+static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
+    switch (c->cmd) {
+    case CMD_GPIO_CONFIG: {
+        if (c->alen < 3) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        uint8_t port = c->args[0], pin = c->args[1], mode = c->args[2];
+        if (!gpio_pin_ok(port, pin)) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        bool in_block = (pin >= HIL_GPIO_BASE && pin < HIL_GPIO_BASE + HIL_GPIO_COUNT);
+        // Re-configuring a counter pin to anything else drops it from the sample mask.
+        if (in_block && mode != GPIO_MODE_PULSE_COUNT) {
+            uint8_t bit = (uint8_t)(1u << (pin - HIL_GPIO_BASE));
+            if (g_pulse_mask & bit) {
+                irq_set_enabled(ADC_IRQ_FIFO, false);
+                g_pulse_mask &= (uint8_t)~bit;
+                irq_set_enabled(ADC_IRQ_FIFO, true);
+            }
+        }
+        switch (mode) {
+        case GPIO_MODE_INPUT:
+            gpio_init(pin); gpio_set_dir(pin, false); gpio_disable_pulls(pin); break;
+        case GPIO_MODE_OUTPUT:
+            gpio_init(pin); gpio_put(pin, 0); gpio_set_dir(pin, true); break;
+        case GPIO_MODE_INPUT_PULLUP:
+            gpio_init(pin); gpio_set_dir(pin, false); gpio_pull_up(pin); break;
+        case GPIO_MODE_INPUT_PULLDOWN:
+            gpio_init(pin); gpio_set_dir(pin, false); gpio_pull_down(pin); break;
+        case GPIO_MODE_PULSE_COUNT: {
+            if (!in_block) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; } // GP2..GP9 only
+            uint8_t edge = (c->alen >= 4) ? c->args[3] : 0;
+            if (edge > 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+            uint8_t i = (uint8_t)(pin - HIL_GPIO_BASE), bit = (uint8_t)(1u << i);
+            gpio_init(pin); gpio_set_dir(pin, false); gpio_disable_pulls(pin);
+            irq_set_enabled(ADC_IRQ_FIFO, false);
+            g_pulse_edge[i] = edge;                                // seed last-level: no phantom edge
+            g_pulse_last = (uint8_t)((g_pulse_last & ~bit) | (gpio_get(pin) ? bit : 0));
+            g_pulse_mask |= bit;                                   // count persists (explicit clear only)
+            irq_set_enabled(ADC_IRQ_FIFO, true);
+            break;
+        }
+        default:  // GPIO_MODE_SERVO (next slice) + unknown modes
+            hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true;
+        }
+        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
+    }
+    case CMD_GPIO_WRITE: {
+        if (c->alen < 3) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        uint8_t port = c->args[0], pin = c->args[1], level = c->args[2];
+        if (!gpio_pin_ok(port, pin) || level > 1) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        gpio_put(pin, level); hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
+    }
+    case CMD_GPIO_READ: {
+        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        uint8_t port = c->args[0], pin = c->args[1];
+        if (!gpio_pin_ok(port, pin)) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        uint8_t lvl = gpio_get(pin) ? 1u : 0u;
+        hil_reply(c->req_id, SHELL_OK, &lvl, 1); return true;
+    }
+    case CMD_PULSE_READ: {
+        uint8_t res[HIL_GPIO_COUNT * 4]; uint8_t n = 0;
+        irq_set_enabled(ADC_IRQ_FIFO, false);                     // coherent 32-bit snapshot
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
+            uint32_t v = g_pulse_count[i];
+            res[n++] = (uint8_t)v;         res[n++] = (uint8_t)(v >> 8);
+            res[n++] = (uint8_t)(v >> 16); res[n++] = (uint8_t)(v >> 24);
+        }
+        irq_set_enabled(ADC_IRQ_FIFO, true);
+        hil_reply(c->req_id, SHELL_OK, res, n); return true;
+    }
+    case CMD_PULSE_CLEAR: {
+        uint8_t mask = (c->alen >= 1) ? c->args[0] : 0xFFu;
+        irq_set_enabled(ADC_IRQ_FIFO, false);
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
+            if (mask & (1u << i)) g_pulse_count[i] = 0;
+        irq_set_enabled(ADC_IRQ_FIFO, true);
+        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
+    }
+    default: return false;
+    }
+}
+
 void cfl_embed_pre_tick(void) {
     g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
     appcore_cmd_t c;
@@ -739,6 +899,8 @@ void cfl_embed_pre_tick(void) {
             r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
             r.payload[2] = SHELL_OK; r.len = 3;
             (void)xQueueSend(g_up_q, &r, 0);
+        } else if (hil_gpio_dispatch(&c)) {
+            // GPIO + pulse-count HIL handled inline (reply sent within)
         } else {   // unknown command -> direct UNKNOWN_CMD reply (no chain handler)
             appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
             r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
