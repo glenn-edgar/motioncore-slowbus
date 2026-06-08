@@ -87,7 +87,8 @@ add_executable(bus_controller
     ${KB0_INCR_SRCS}
     ${BC_DIR}/kb0/user_functions.c)
 pico_generate_pio_header(bus_controller ${PORT_DIR}/rs485.pio)
-pico_generate_pio_header(bus_controller ${PORT_DIR}/servo_bank.pio)  # 8-servo bank
+pico_generate_pio_header(bus_controller ${PORT_DIR}/servo_bank.pio)          # 8-servo bank
+pico_generate_pio_header(bus_controller ${PORT_DIR}/quadrature_encoder.pio)  # quad decoder
 target_include_directories(bus_controller PRIVATE
     ${COMMON_INC} ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
     ${BC_DIR}/engine/include ${BC_DIR}/kb0/incr)
@@ -101,7 +102,7 @@ target_compile_options(bus_controller PRIVATE -Wall -Wextra -Wno-unused-paramete
 target_link_options(bus_controller PRIVATE -Wl,--gc-sections)
 target_link_libraries(bus_controller
     pico_stdlib pico_multicore hardware_watchdog hardware_flash pico_unique_id
-    hardware_pio hardware_clocks hardware_adc pico_async_context_freertos
+    hardware_pio hardware_clocks hardware_adc hardware_pwm pico_async_context_freertos
     FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
 pico_enable_stdio_usb(bus_controller 1)
 pico_enable_stdio_uart(bus_controller 0)
