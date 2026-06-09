@@ -102,11 +102,17 @@ target_compile_options(bus_controller PRIVATE -Wall -Wextra -Wno-unused-paramete
 target_link_options(bus_controller PRIVATE -Wl,--gc-sections)
 target_link_libraries(bus_controller
     pico_stdlib pico_multicore hardware_watchdog hardware_flash pico_unique_id
-    hardware_pio hardware_clocks hardware_adc hardware_pwm hardware_i2c pico_async_context_freertos
+    hardware_pio hardware_clocks hardware_adc hardware_pwm hardware_i2c pico_i2c_slave pico_async_context_freertos
     FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
 pico_enable_stdio_usb(bus_controller 1)
 pico_enable_stdio_uart(bus_controller 0)
 pico_add_extra_outputs(bus_controller)
+# Opt-in i2c0->i2c1 loopback self-test (claims GP20/21 as i2c0 slave 0x42).
+# Configure with -DI2C_SELFTEST=ON to build it in.
+option(I2C_SELFTEST "i2c0->i2c1 loopback self-test fixture" OFF)
+if(I2C_SELFTEST)
+    target_compile_definitions(bus_controller PRIVATE I2C_SELFTEST)
+endif()
 
 # Slave node: null uplink, node role, WiFi off.
 slow_bus_image(slave

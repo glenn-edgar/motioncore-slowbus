@@ -38,6 +38,9 @@
 #include "hardware/clocks.h"        // clock_get_hz (servo 1 us/tick)
 #include "hardware/pwm.h"           // HIL PWM on GP14
 #include "hardware/i2c.h"           // HIL I2C manager on GP10/11
+#ifdef I2C_SELFTEST
+#include "pico/i2c_slave.h"         // i2c0 loopback self-test fixture (opt-in)
+#endif
 #include "servo_bank.pio.h"         // generated: servo_bank_program
 #include "quadrature_encoder.pio.h" // generated: quad decoder (GP17/18)
 #include <string.h>   // strcmp for KB lookup by name
@@ -158,7 +161,7 @@ static void chassis_panic(uint32_t cause, uint32_t code);   // defined below
 // ---- monitored-thread heartbeats -------------------------------------------
 enum { HB_BUS = 0, HB_UPLINK, HB_APP, HB_COUNT };
 static volatile uint32_t g_hb[HB_COUNT], g_hb_us[HB_COUNT];
-static TaskHandle_t t_bus, t_up, t_app, t_wd;
+static TaskHandle_t t_bus, t_up, t_app, t_wd, t_i2c;
 
 #define WD_PERIOD_MS      100
 #define WD_HW_TIMEOUT_MS 4000
@@ -921,6 +924,59 @@ static void i2c_init_hw(void) {
 // per-transfer timeout: ~one byte at 100 kHz is ~90 us; pad generously.
 static uint i2c_to_us(uint len) { return 2000u + len * 200u; }
 
+// ---- centralized I2C service (Stage 1: async request queue) -----------------
+// The chain_tree engine must NEVER block on I2C. All bus work runs on a dedicated
+// service task (its own FreeRTOS task, so the engine just enqueues and continues):
+// callers enqueue a request; the task does the transfer (blocking for now) and
+// posts the OP_SHELL_REPLY. Stage 2 swaps the transport to DMA and adds the device
+// registry + class drivers + blackboard above this same queue — the engine-facing
+// interface (enqueue / read blackboard) is fixed.
+typedef enum { I2C_OP_SCAN = 0, I2C_OP_WRITE, I2C_OP_READ, I2C_OP_WRITE_READ } i2c_op_t;
+typedef struct {
+    uint16_t req_id;                  // OP_SHELL_REPLY correlation
+    uint8_t  op;                      // i2c_op_t
+    uint8_t  addr;                    // 7-bit device address
+    uint8_t  wlen, rlen;              // write / read byte counts
+    uint8_t  data[HIL_I2C_MAX_LEN];   // write bytes (wlen)
+} i2c_req_t;
+static QueueHandle_t g_i2c_req_q;     // engine pre_tick -> i2c_service_task
+
+#ifdef I2C_SELFTEST
+// ---- I2C loopback self-test fixture (opt-in: -DI2C_SELFTEST) -----------------
+// Stands up i2c0 as a slave (addr 0x42) on the spare pins GP20(SDA)/GP21(SCL)
+// with a 16-byte register file preset to 0xA0|index. Jumper GP10->GP20 and
+// GP11->GP21 and the i2c1 HIL master can scan/read it WITHOUT any external chip
+// -> proves the master + bus are good, isolating firmware from MCP23017 wiring.
+// The i2c0 ISR services the slave even while the master blocks (same core).
+#define I2C0_SELFTEST_ADDR  0x42u
+#define I2C0_SDA            20u
+#define I2C0_SCL            21u
+static struct { uint8_t mem[16]; uint8_t addr; bool addr_set; } g_i2c_slv;
+static void i2c0_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
+    switch (event) {
+    case I2C_SLAVE_RECEIVE:
+        if (!g_i2c_slv.addr_set) { g_i2c_slv.addr = i2c_read_byte_raw(i2c) & 0x0Fu; g_i2c_slv.addr_set = true; }
+        else { g_i2c_slv.mem[g_i2c_slv.addr++ & 0x0Fu] = i2c_read_byte_raw(i2c); }
+        break;
+    case I2C_SLAVE_REQUEST:
+        i2c_write_byte_raw(i2c, g_i2c_slv.mem[g_i2c_slv.addr++ & 0x0Fu]);
+        break;
+    case I2C_SLAVE_FINISH:
+        g_i2c_slv.addr_set = false;
+        break;
+    }
+}
+static void i2c_loopback_init(void) {
+    for (uint8_t i = 0; i < 16; i++) g_i2c_slv.mem[i] = (uint8_t)(0xA0u | i);
+    i2c_init(i2c0, HIL_I2C_BAUD);
+    gpio_set_function(I2C0_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(I2C0_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C0_SDA);
+    gpio_pull_up(I2C0_SCL);
+    i2c_slave_init(i2c0, I2C0_SELFTEST_ADDR, i2c0_slave_handler);
+}
+#endif // I2C_SELFTEST
+
 // ---- GPIO + pulse-count command surface (handled inline on core1) -----------
 // true if (port,pin) is a HIL-touchable GPIO: port must be 0 (RP2040 is flat),
 // pin in range, and not a reserved bus/strap/ADC pin.
@@ -1063,44 +1119,78 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
         g_quad_zero = quadrature_encoder_get_count(g_quad_pio, g_quad_sm);
         hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
     }
-    case CMD_I2C_SCAN: {
-        uint8_t found[112]; uint8_t n = 0;            // 7-bit addrs 0x08..0x77
+    case CMD_I2C_SCAN: {                              // -> i2c_service_task (async, off the engine)
+        i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_SCAN };
+        (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
+    }
+    case CMD_I2C_WRITE: {
+        if (c->alen < 1) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_WRITE, .addr = c->args[0],
+                        .wlen = (uint8_t)(c->alen - 1) };
+        if (q.wlen > HIL_I2C_MAX_LEN) q.wlen = HIL_I2C_MAX_LEN;
+        memcpy(q.data, &c->args[1], q.wlen);
+        (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
+    }
+    case CMD_I2C_READ: {
+        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_READ, .addr = c->args[0], .rlen = c->args[1] };
+        if (q.rlen > HIL_I2C_MAX_LEN) q.rlen = HIL_I2C_MAX_LEN;
+        (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
+    }
+    case CMD_I2C_WRITE_READ: {
+        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
+        i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_WRITE_READ, .addr = c->args[0],
+                        .rlen = c->args[1], .wlen = (uint8_t)(c->alen - 2) };
+        if (q.rlen > HIL_I2C_MAX_LEN) q.rlen = HIL_I2C_MAX_LEN;
+        if (q.wlen > HIL_I2C_MAX_LEN) q.wlen = HIL_I2C_MAX_LEN;
+        memcpy(q.data, &c->args[2], q.wlen);
+        (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
+    }
+    default: return false;
+    }
+}
+
+// Execute one queued request on the bus (blocking) + post its reply. Runs on the
+// i2c_service_task — the only context that touches i2c1, so no locking needed.
+static void i2c_exec(const i2c_req_t *q) {
+    uint8_t buf[HIL_I2C_MAX_LEN];
+    switch (q->op) {
+    case I2C_OP_SCAN: {
+        uint8_t found[112]; uint8_t n = 0;
         for (uint8_t a = 0x08; a <= 0x77; a++) {
             uint8_t d;
             if (i2c_read_timeout_us(HIL_I2C_INST, a, &d, 1, false, i2c_to_us(1)) >= 0) found[n++] = a;
         }
-        hil_reply(c->req_id, SHELL_OK, found, n); return true;
+        hil_reply(q->req_id, SHELL_OK, found, n); return;
     }
-    case CMD_I2C_WRITE: {
-        if (c->alen < 1) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        uint8_t addr = c->args[0], wlen = (uint8_t)(c->alen - 1);
-        int ret = i2c_write_timeout_us(HIL_I2C_INST, addr, &c->args[1], wlen, false, i2c_to_us(wlen));
-        hil_reply(c->req_id, (ret == (int)wlen || (wlen == 0 && ret == 0)) ? SHELL_OK : SHELL_IO_ERROR, NULL, 0);
-        return true;
+    case I2C_OP_WRITE: {
+        int ret = i2c_write_timeout_us(HIL_I2C_INST, q->addr, q->data, q->wlen, false, i2c_to_us(q->wlen));
+        hil_reply(q->req_id, (ret == (int)q->wlen || (q->wlen == 0 && ret == 0)) ? SHELL_OK : SHELL_IO_ERROR, NULL, 0);
+        return;
     }
-    case CMD_I2C_READ: {
-        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        uint8_t addr = c->args[0], len = c->args[1];
-        if (len > HIL_I2C_MAX_LEN) len = HIL_I2C_MAX_LEN;
-        uint8_t buf[HIL_I2C_MAX_LEN];
-        int ret = i2c_read_timeout_us(HIL_I2C_INST, addr, buf, len, false, i2c_to_us(len));
-        if (ret == (int)len) hil_reply(c->req_id, SHELL_OK, buf, len);
-        else                 hil_reply(c->req_id, SHELL_IO_ERROR, NULL, 0);
-        return true;
+    case I2C_OP_READ: {
+        int ret = i2c_read_timeout_us(HIL_I2C_INST, q->addr, buf, q->rlen, false, i2c_to_us(q->rlen));
+        if (ret == (int)q->rlen) hil_reply(q->req_id, SHELL_OK, buf, q->rlen);
+        else                     hil_reply(q->req_id, SHELL_IO_ERROR, NULL, 0);
+        return;
     }
-    case CMD_I2C_WRITE_READ: {
-        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        uint8_t addr = c->args[0], rlen = c->args[1], wlen = (uint8_t)(c->alen - 2);
-        if (rlen > HIL_I2C_MAX_LEN) rlen = HIL_I2C_MAX_LEN;
-        uint8_t buf[HIL_I2C_MAX_LEN];
-        int wret = i2c_write_timeout_us(HIL_I2C_INST, addr, &c->args[2], wlen, true /*repeated start*/, i2c_to_us(wlen));
-        if (wret != (int)wlen) { hil_reply(c->req_id, SHELL_IO_ERROR, NULL, 0); return true; }
-        int rret = i2c_read_timeout_us(HIL_I2C_INST, addr, buf, rlen, false, i2c_to_us(rlen));
-        if (rret == (int)rlen) hil_reply(c->req_id, SHELL_OK, buf, rlen);
-        else                   hil_reply(c->req_id, SHELL_IO_ERROR, NULL, 0);
-        return true;
+    case I2C_OP_WRITE_READ: {
+        int w = i2c_write_timeout_us(HIL_I2C_INST, q->addr, q->data, q->wlen, true, i2c_to_us(q->wlen));
+        if (w != (int)q->wlen) { hil_reply(q->req_id, SHELL_IO_ERROR, NULL, 0); return; }
+        int r = i2c_read_timeout_us(HIL_I2C_INST, q->addr, buf, q->rlen, false, i2c_to_us(q->rlen));
+        if (r == (int)q->rlen) hil_reply(q->req_id, SHELL_OK, buf, q->rlen);
+        else                   hil_reply(q->req_id, SHELL_IO_ERROR, NULL, 0);
+        return;
     }
-    default: return false;
+    default: hil_reply(q->req_id, SHELL_BAD_ARGS, NULL, 0); return;
+    }
+}
+
+static void i2c_service_task(void *arg) {
+    (void)arg;
+    i2c_req_t q;
+    for (;;) {
+        if (xQueueReceive(g_i2c_req_q, &q, portMAX_DELAY) == pdTRUE) i2c_exec(&q);
     }
 }
 
@@ -1178,7 +1268,10 @@ static void app_engine_task(void *arg) {
     adc_service_init();
     pwm_init_hw();      // GP14 PWM armed at 0% duty
     quad_init_hw();     // GP17/18 quad decoder (pio1 offset 0, before any servo)
-    i2c_init_hw();      // GP10/11 I2C manager (master, 100 kHz)
+    i2c_init_hw();      // GP10/11 I2C manager (master, 100 kHz) — inited here; serviced on core1 task
+#ifdef I2C_SELFTEST
+    i2c_loopback_init(); // opt-in self-test: i2c0 slave 0x42 on GP20/21
+#endif
 
     g_rt = cfl_runtime_create(&g_perm, &p, h);
     if (!g_rt) chassis_panic(RST_PANIC, 3);
@@ -1269,7 +1362,8 @@ int main(void) {
     if (!g_lock) chassis_panic(RST_PANIC, 1);
     g_down_q = xQueueCreate(8, sizeof(appcore_cmd_t));
     g_up_q   = xQueueCreate(16, sizeof(appcore_rep_t));   // headroom for a snapshot burst (7 frames)
-    if (!g_down_q || !g_up_q) chassis_panic(RST_PANIC, 2);
+    g_i2c_req_q = xQueueCreate(8, sizeof(i2c_req_t));     // engine -> i2c service
+    if (!g_down_q || !g_up_q || !g_i2c_req_q) chassis_panic(RST_PANIC, 2);
 
     uint32_t t0 = time_us_32();
     for (int i = 0; i < HB_COUNT; i++) g_hb_us[i] = t0;
@@ -1282,9 +1376,11 @@ int main(void) {
     xTaskCreate(app_engine_task,  "app",    configMINIMAL_STACK_SIZE * 8, NULL, 3, &t_app);
     xTaskCreate(watchdog_task,    "wd",     configMINIMAL_STACK_SIZE * 2, NULL, 1, &t_wd);
     xTaskCreate(servo_feeder_task,"servo",  configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL); // float; idle until a servo is configured
+    xTaskCreate(i2c_service_task, "i2c",    configMINIMAL_STACK_SIZE * 4, NULL, 1, &t_i2c); // async I2C, off the engine
     vTaskCoreAffinitySet(t_bus, 1u << 0);
     vTaskCoreAffinitySet(t_up,  1u << 0);
     vTaskCoreAffinitySet(t_app, 1u << 1);   // core1 = application engine
+    vTaskCoreAffinitySet(t_i2c, 1u << 1);   // core1 with the engine task; engine (prio 3) preempts it, so it never delays a tick
     // watchdog floats.
 
     vTaskStartScheduler();
