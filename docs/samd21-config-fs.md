@@ -24,6 +24,22 @@ Pico powers up → reads SAMD21 FS over I2C → gets RS-485 addr + site/GPIO con
               → THEN does RS-485 bus negotiation
 ```
 
+## Configuration ownership (invariant)
+**Commissioning is the *sole* writer of the chip's configuration; the Pico is
+read-only.** Config is **static after commissioning** because the dongle's
+hardware environment is fixed (a unit is physically wired to specific I/O at a
+site — it changes only by physical rework = re-commission). So:
+- **Pi (commission, USB, rare/deliberate)** = the only writer — I2C profile,
+  RS-485 addr, power-on mode + pin config, site.
+- **Pico (I2C, runtime)** = pure reader — reads config **once at boot, caches it**;
+  polls only *live data* (ADC/GPIO/counters), never config changes, never writes.
+- **Changing anything = re-commission** (unlock → rewrite → relock). There is no
+  runtime reconfiguration path in deployment.
+
+Consequence for the modes: runtime `g_mode` switching is a **bring-up/commission
+affordance only**. In a locked (deployed) unit the mode is the commissioned
+power-on value and **`MODE` writes are refused** — the chip is deterministic.
+
 ## Goal
 Open-ended, **named** config blobs that:
 - the **Pi (Python)** writes to the SAMD21 over **USB-CDC (ttyACM)** at commission time,
@@ -145,16 +161,17 @@ Commissioning (Pi over USB-CDC) writes the unit's **I2C address** and its
   channels; COUNTER: edges/pins) define this schema → **finishing the modes first
   fixes what commissioning must store.**
 - **Lock flag (new — nothing like it exists yet).** A flag gating whether
-  commissioning can be changed. Open semantics to decide:
-  - **One-way or reversible?** Lean **reversible via a magic-guarded unlock**
-    (mirror the existing `REG_SET_ADDR` / `g_setaddr_armed` pattern) so a field
-    unit is recoverable but not accidentally rewritten.
-  - **Scope:** lock **identity** (I2C addr, instance) hard, but keep **power-on
-    config** (mode/site) tunable? Or one lock for everything? (Lean: separate —
-    identity is set-once, config may be re-tuned.)
-  - **Stored** in the config store, itself magic-guarded; when locked, `OP_FILE_*`
-    writes to protected names + `REG_SET_ADDR` are **refused with a LOCKED status**
-    the Pi sees.
+  commissioning can be changed. Per the ownership invariant above, it's a
+  **single lock covering ALL commissioned config** (identity + power-on config) —
+  not a per-scope lock:
+  - **Reversible via a magic-guarded unlock** (mirror `REG_SET_ADDR` /
+    `g_setaddr_armed`) so a field unit is recoverable but not accidentally
+    rewritten. **Re-commission = unlock → rewrite → relock** is the only change path.
+  - When **locked**, every config write is **refused with a `LOCKED` status** the Pi
+    sees — `OP_FILE_*`, `REG_SET_ADDR`, **and the `MODE` register** (mode is frozen
+    to the commissioned power-on value).
+  - **Stored** in the config store, itself magic-guarded.
+  - Unlocked units (dev/bring-up) allow runtime `MODE` switching + writes.
 
 ## Commission tool (Python) — WSL needs a venv first
 `pyserial` + `cbor2`. WSL/modern Debian system Python is externally-managed
