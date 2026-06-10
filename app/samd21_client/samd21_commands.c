@@ -1683,12 +1683,277 @@ static void mixed_reg_write(uint8_t reg, uint8_t val) {
     }
 }
 
+// ============================================================================
+// SERVO mode — 9 RC servos on a SOFTWARE common-rising-edge frame.
+//
+// The 9 servo pins do NOT map to TCC waveform outputs, so we can't use hardware
+// PWM. Instead a free hardware timer (TC4) generates a 50 Hz frame: at the frame
+// boundary we raise ALL enabled servo pins together (one OUTSET per port group),
+// then drop each pin individually at its programmed pulse width. Pure output —
+// no interlock, no INT (D6/PB08 is the 9th servo channel here, not the INT pin).
+//
+// Timebase: TC4 off GCLK0 (48 MHz) with PRESCALER_DIV64 -> 750 kHz tick clock =
+// 1.333 µs/tick. No standard divider gives exactly 1 MHz, so we run at 750 kHz
+// and convert microseconds to ticks as ticks = us * 3 / 4 (exact for the 4/3
+// ratio). Resolution is therefore 1.333 µs/tick — finer than an RC servo's
+// effective resolution, so harmless. Frame top = 20000 µs -> 15000 ticks.
+//
+// CC0 is the MFRQ period (counter auto-resets at frame top -> 50 Hz); the MC0
+// interrupt is the frame boundary (raise). CC1 is reprogrammed to the next drop
+// time; the MC1 interrupt fires on each drop and reschedules itself to the next
+// (strictly larger) event time, or disables MC1 until the next frame.
+//
+// Mode-bank registers (0x10-0x14), dispatched only while MODE_SERVO. Unlike the
+// other modes SERVO needs NO i2c_store_service tick — it is purely ISR-driven.
+//   0x10 CH_SEL   (w)   channel 0..8 selected for the WIDTH window
+//   0x11 WIDTH_L  (rw)  pulse width µs lo byte (staged)
+//   0x12 WIDTH_H  (rw)  pulse width µs hi byte; WRITE latches+clamps+servo_build()
+//   0x13 ENABLE_L (rw)  enable mask bits 0..7 (CH0..CH7)
+//   0x14 ENABLE_H (rw)  enable mask bit 0 = CH8; write -> servo_build()
+// ============================================================================
+#define SERVO_CH_COUNT      9u
+#define SERVO_FRAME_US      20000u           // 50 Hz frame
+#define SERVO_US_MIN        500u             // pulse clamp lo
+#define SERVO_US_MAX        2500u            // pulse clamp hi
+#define SERVO_US_DEFAULT    1500u            // center
+#define SERVO_ENABLE_MASK   0x1FFu           // 9 valid channel bits
+
+#define REG_SERVO_CH_SEL    0x10u
+#define REG_SERVO_WIDTH_L   0x11u
+#define REG_SERVO_WIDTH_H   0x12u
+#define REG_SERVO_ENABLE_L  0x13u
+#define REG_SERVO_ENABLE_H  0x14u
+
+// us -> TC4 ticks at 750 kHz (1.333 µs/tick). Exact for the 3/4 ratio.
+#define SERVO_US_TO_TICKS(us)  ((uint16_t)((uint32_t)(us) * 3u / 4u))
+
+// Channel index -> (port group, pin). 7 on PORT A (group 0), 2 on PORT B (group 1).
+// CH0 D0 PA02  CH1 D1 PA04  CH2 D2 PA10  CH3 D3 PA11  CH4 D7 PB09
+// CH5 D8 PA07  CH6 D9 PA05  CH7 D10 PA06  CH8 D6 PB08
+typedef struct { uint8_t group; uint8_t pin; } servo_pad_t;
+static const servo_pad_t g_servo_pad[SERVO_CH_COUNT] = {
+    {0,  2}, {0,  4}, {0, 10}, {0, 11}, {1,  9},
+    {0,  7}, {0,  5}, {0,  6}, {1,  8},
+};
+
+static uint16_t g_servo_us[SERVO_CH_COUNT] = {
+    SERVO_US_DEFAULT, SERVO_US_DEFAULT, SERVO_US_DEFAULT,
+    SERVO_US_DEFAULT, SERVO_US_DEFAULT, SERVO_US_DEFAULT,
+    SERVO_US_DEFAULT, SERVO_US_DEFAULT, SERVO_US_DEFAULT,
+};
+static uint16_t g_servo_enable;              // 9-bit enable mask (default 0 -> silent)
+static uint8_t  g_servo_ch_sel;              // selected channel for the WIDTH window
+static uint16_t g_servo_width_stage;         // WIDTH_L/H accumulator (latched on WIDTH_H write)
+
+// Built schedule (recomputed by servo_build()). The ISR consumes raise masks at
+// the frame boundary and walks the sorted/merged drop events.
+static uint32_t g_servo_raise_a;             // PORT A bits of all enabled servos
+static uint32_t g_servo_raise_b;             // PORT B bits of all enabled servos
+static struct { uint16_t t; uint32_t clr_a, clr_b; } g_servo_evt[SERVO_CH_COUNT];
+static uint8_t  g_servo_evt_n;               // number of drop events (distinct widths)
+static volatile uint8_t g_servo_evt_idx;     // ISR walk cursor
+
+static bool g_servo_tc_initialized;          // TC4 GCLK/APBC wired once
+
+// ---- TC4 timebase (mirrors the TC3 DAC engine: MFRQ CC0=TOP, SYNCBUSY spins) --
+static void servo_tc_init_once(void) {
+    if (g_servo_tc_initialized) return;
+    PM->APBCMASK.reg |= PM_APBCMASK_TC4;
+    GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(TC4_GCLK_ID)   // TC4_GCLK_ID == TC5_GCLK_ID (28)
+                                 | GCLK_CLKCTRL_GEN_GCLK0
+                                 | GCLK_CLKCTRL_CLKEN);
+    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    g_servo_tc_initialized = true;
+}
+
+static void servo_tc_stop(void) {
+    NVIC_DisableIRQ(TC4_IRQn);
+    TC4->COUNT16.INTENCLR.reg = TC_INTENCLR_MC0 | TC_INTENCLR_MC1;
+    TC4->COUNT16.CTRLA.bit.ENABLE = 0;
+    while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+}
+
+static void servo_tc_start(void) {
+    // Reset.
+    TC4->COUNT16.CTRLA.bit.SWRST = 1;
+    while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    while (TC4->COUNT16.CTRLA.bit.SWRST)     { /* spin */ }
+
+    // 16-bit count, MFRQ wavegen (CC0=TOP and resets the counter), /64 prescaler.
+    TC4->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16
+                           | TC_CTRLA_WAVEGEN_MFRQ
+                           | TC_CTRLA_PRESCALER_DIV64;
+    TC4->COUNT16.CC[0].reg = SERVO_US_TO_TICKS(SERVO_FRAME_US);   // 15000 ticks = 20 ms
+    TC4->COUNT16.CC[1].reg = 0;
+    while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+
+    TC4->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0 | TC_INTFLAG_MC1;   // clear stale
+    TC4->COUNT16.INTENSET.reg = TC_INTENSET_MC0;                  // frame boundary; MC1 armed per-frame
+    NVIC_EnableIRQ(TC4_IRQn);
+
+    TC4->COUNT16.CTRLA.bit.ENABLE = 1;
+    while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+}
+
+// Recompute the raise masks + sorted/merged drop events from the current
+// enable mask + per-channel widths. Servos with EQUAL width merge into one drop
+// event (their port bits OR'd into clr_a/clr_b). Updates are made coherent vs the
+// ISR by masking the TC4 IRQ around the swap (like the DAC engine masks TC3).
+static void servo_build(void) {
+    uint32_t raise_a = 0u, raise_b = 0u;
+    struct { uint16_t t; uint32_t clr_a, clr_b; } evt[SERVO_CH_COUNT];
+    uint8_t n = 0u;
+
+    for (uint8_t ch = 0; ch < SERVO_CH_COUNT; ch++) {
+        if (!(g_servo_enable & (1u << ch))) continue;
+        uint16_t us = g_servo_us[ch];
+        if (us < SERVO_US_MIN) us = SERVO_US_MIN;
+        if (us > SERVO_US_MAX) us = SERVO_US_MAX;
+        uint16_t t = SERVO_US_TO_TICKS(us);
+        uint32_t bit = (1u << g_servo_pad[ch].pin);
+        if (g_servo_pad[ch].group == 0u) raise_a |= bit; else raise_b |= bit;
+
+        // Insertion-sort by tick-time, merging equal times into one event.
+        uint8_t i = 0;
+        while (i < n && evt[i].t < t) i++;
+        if (i < n && evt[i].t == t) {
+            if (g_servo_pad[ch].group == 0u) evt[i].clr_a |= bit; else evt[i].clr_b |= bit;
+        } else {
+            for (uint8_t j = n; j > i; j--) evt[j] = evt[j - 1u];
+            evt[i].t = t;
+            evt[i].clr_a = (g_servo_pad[ch].group == 0u) ? bit : 0u;
+            evt[i].clr_b = (g_servo_pad[ch].group == 0u) ? 0u : bit;
+            n++;
+        }
+    }
+
+    // Install atomically vs the ISR: mask TC4, swap, restore.
+    NVIC_DisableIRQ(TC4_IRQn);
+    g_servo_raise_a = raise_a;
+    g_servo_raise_b = raise_b;
+    for (uint8_t i = 0; i < n; i++) {
+        g_servo_evt[i].t     = evt[i].t;
+        g_servo_evt[i].clr_a = evt[i].clr_a;
+        g_servo_evt[i].clr_b = evt[i].clr_b;
+    }
+    g_servo_evt_n   = n;
+    g_servo_evt_idx = 0u;
+    if (g_servo_tc_initialized) NVIC_EnableIRQ(TC4_IRQn);
+}
+
+// Configure all 9 servo pins as GPIO outputs driven low. Mirrors cmd_gpio_config's
+// output path (clear PMUXEN, clear INEN/PULLEN, OUTCLR, DIRSET).
+static void servo_pins_output_low(void) {
+    for (uint8_t ch = 0; ch < SERVO_CH_COUNT; ch++) {
+        uint8_t g = g_servo_pad[ch].group, p = g_servo_pad[ch].pin;
+        uint32_t m = (1u << p);
+        PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+        PORT->Group[g].PINCFG[p].bit.INEN   = 0;
+        PORT->Group[g].PINCFG[p].bit.PULLEN = 0;
+        PORT->Group[g].OUTCLR.reg = m;
+        PORT->Group[g].DIRSET.reg = m;
+    }
+}
+
+// Entering MODE_SERVO: pins -> GPIO outputs low, build the schedule, start TC4.
+static void servo_enter(void) {
+    servo_tc_init_once();
+    servo_pins_output_low();
+    servo_build();
+    servo_tc_start();
+}
+
+// Leaving MODE_SERVO: stop TC4 (masks IRQ), drive all 9 pins low (safe).
+static void servo_exit(void) {
+    servo_tc_stop();
+    for (uint8_t ch = 0; ch < SERVO_CH_COUNT; ch++)
+        PORT->Group[g_servo_pad[ch].group].OUTCLR.reg = (1u << g_servo_pad[ch].pin);
+}
+
+// TC4 ISR. MC0 = frame boundary (raise all enabled, schedule first drop);
+// MC1 = drop (clear this event's pins, reschedule to the next larger time).
+// Bounded + fast: only OUTSET/OUTCLR writes + a short CC1 SYNCBUSY spin.
+void TC4_Handler(void) {
+    if (TC4->COUNT16.INTFLAG.bit.MC0) {                  // frame boundary (CC0 wrap)
+        TC4->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
+        PORT->Group[0].OUTSET.reg = g_servo_raise_a;     // raise all enabled servos together
+        PORT->Group[1].OUTSET.reg = g_servo_raise_b;
+        g_servo_evt_idx = 0u;
+        if (g_servo_evt_n > 0u) {
+            TC4->COUNT16.CC[1].reg = g_servo_evt[0].t;
+            while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+            TC4->COUNT16.INTENSET.reg = TC_INTENSET_MC1;
+        } else {
+            TC4->COUNT16.INTENCLR.reg = TC_INTENCLR_MC1;
+        }
+        return;
+    }
+    if (TC4->COUNT16.INTFLAG.bit.MC1) {                  // a drop time was reached
+        TC4->COUNT16.INTFLAG.reg = TC_INTFLAG_MC1;
+        uint8_t idx = g_servo_evt_idx;
+        PORT->Group[0].OUTCLR.reg = g_servo_evt[idx].clr_a;
+        PORT->Group[1].OUTCLR.reg = g_servo_evt[idx].clr_b;
+        idx++;
+        g_servo_evt_idx = idx;
+        if (idx < g_servo_evt_n) {                       // next time is strictly larger -> safe
+            TC4->COUNT16.CC[1].reg = g_servo_evt[idx].t;
+            while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+        } else {
+            TC4->COUNT16.INTENCLR.reg = TC_INTENCLR_MC1; // done this frame
+        }
+        return;
+    }
+}
+
+// SERVO mode-bank register access (0x10-0x14), dispatched only while MODE_SERVO.
+static uint8_t servo_reg_read(uint8_t reg) {
+    uint8_t sel = (g_servo_ch_sel < SERVO_CH_COUNT) ? g_servo_ch_sel : 0u;
+    switch (reg) {
+    case REG_SERVO_CH_SEL:   return g_servo_ch_sel;
+    case REG_SERVO_WIDTH_L:  return (uint8_t)g_servo_us[sel];
+    case REG_SERVO_WIDTH_H:  return (uint8_t)(g_servo_us[sel] >> 8);
+    case REG_SERVO_ENABLE_L: return (uint8_t)g_servo_enable;
+    case REG_SERVO_ENABLE_H: return (uint8_t)(g_servo_enable >> 8);
+    default:                 return 0xFFu;
+    }
+}
+static void servo_reg_write(uint8_t reg, uint8_t val) {
+    switch (reg) {
+    case REG_SERVO_CH_SEL:
+        if (val < SERVO_CH_COUNT) g_servo_ch_sel = val;  // out-of-range clamped (ignored)
+        break;
+    case REG_SERVO_WIDTH_L:                              // stage lo byte; WIDTH_H write latches
+        g_servo_width_stage = (uint16_t)((g_servo_width_stage & 0xFF00u) | val);
+        break;
+    case REG_SERVO_WIDTH_H: {                            // latch: clamp + store + rebuild
+        uint16_t us = (uint16_t)(((uint16_t)val << 8) | (g_servo_width_stage & 0x00FFu));
+        if (us < SERVO_US_MIN) us = SERVO_US_MIN;
+        if (us > SERVO_US_MAX) us = SERVO_US_MAX;
+        uint8_t sel = (g_servo_ch_sel < SERVO_CH_COUNT) ? g_servo_ch_sel : 0u;
+        g_servo_us[sel] = us;
+        g_servo_width_stage = us;                        // reflect the clamped value back
+        servo_build();
+        break;
+    }
+    case REG_SERVO_ENABLE_L:
+        g_servo_enable = (uint16_t)((g_servo_enable & 0x0100u) | val) & SERVO_ENABLE_MASK;
+        servo_build();
+        break;
+    case REG_SERVO_ENABLE_H:
+        g_servo_enable = (uint16_t)((g_servo_enable & 0x00FFu) | ((uint16_t)val << 8)) & SERVO_ENABLE_MASK;
+        servo_build();
+        break;
+    default: break;                                     // unimplemented regs ignored
+    }
+}
+
 // Register read dispatch (control bank). Out-of-range -> 0xFF.
 static uint8_t i2c_reg_read(uint8_t reg) {
     if (reg >= 0x10u && reg <= 0x3Fu) {                  // mode bank — interpreted per active mode
         if (g_mode == MODE_PIO) return pio_reg_read(reg);
         if (g_mode == MODE_ADC) return adc_reg_read(reg);
         if (g_mode == MODE_MIXED) return mixed_reg_read(reg);
+        if (g_mode == MODE_SERVO) return servo_reg_read(reg);
         return 0xFFu;
     }
     switch (reg) {
@@ -1723,6 +1988,7 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
         if (g_mode == MODE_PIO) pio_reg_write(reg, val);
         else if (g_mode == MODE_ADC) adc_reg_write(reg, val);
         else if (g_mode == MODE_MIXED) mixed_reg_write(reg, val);
+        else if (g_mode == MODE_SERVO) servo_reg_write(reg, val);
         return;
     }
     switch (reg) {
@@ -1739,6 +2005,10 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
                 tc3_stop();
             } else if (g_mode == MODE_MIXED) {             // leaving MIXED
                 mixed_il_disarm();                         // deassert INT, drop latch, release pins (safe)
+            } else if (g_mode == MODE_SERVO) {             // leaving SERVO
+                servo_exit();                              // stop TC4, drive all servo pins low
+                DAC->CTRLB.bit.EOEN = 1;                   // restore DAC output buffer on PA02 (CH0)
+                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
             }
             g_mode = val;
             if (val == MODE_PIO) {                         // entering PIO
@@ -1750,6 +2020,10 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
                 adc_mode_setup();                          // DIV16 sampler + window stats + DAC const
             } else if (val == MODE_MIXED) {                // entering MIXED
                 mixed_il_arm();                            // parse interlock_cfg, claim pins, set up INT
+            } else if (val == MODE_SERVO) {                // entering SERVO
+                DAC->CTRLB.bit.EOEN = 0;                   // free CH0=PA02 from the DAC (else it pins CH0 low)
+                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+                servo_enter();                             // pins->GPIO low, build schedule, start TC4
             }
         }
         break;
