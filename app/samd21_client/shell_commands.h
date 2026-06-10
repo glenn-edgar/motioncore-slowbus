@@ -130,6 +130,14 @@ const shell_cmd_entry_t* shell_find_cmd(uint16_t command_id);
 #define CMD_FILE_DATA         ((uint16_t)0x0124)
 #define CMD_FILE_COMMIT       ((uint16_t)0x0125)
 #define CMD_FILE_LIST         ((uint16_t)0x0126)
+// USB->I2C-register bridge (test harness): proxy i2c_reg_read/write so a Python
+// host on ttyACM drives every mode bank + FILE/store windows over USB.
+//   CMD_REG_READ   [reg:u8]          -> [val:u8]
+//   CMD_REG_WRITE  [reg:u8][val:u8]  -> ()
+//   CMD_REG_READN  [reg:u8][n:u8]    -> [val:u8 x n]  (data-port streams, else reg auto-advances)
+#define CMD_REG_READ          ((uint16_t)0x0127)
+#define CMD_REG_WRITE         ((uint16_t)0x0128)
+#define CMD_REG_READN         ((uint16_t)0x0129)
 
 // 0x0140..0x014F: interlock framework foundation (slice 1).
 // CMD_INTERLOCK_STATUS args: (empty)

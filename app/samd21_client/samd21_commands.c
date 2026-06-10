@@ -2576,6 +2576,37 @@ static uint8_t cmd_file_list(shell_reader_t* args, shell_writer_t* result) {
     }
     return result->overflow ? SHELL_STATUS_RESULT_TOO_BIG : SHELL_STATUS_OK;
 }
+
+// ---------- CMD_REG_READ / CMD_REG_WRITE / CMD_REG_READN -----------------
+// USB->I2C-register bridge: proxy the SAME i2c_reg_read/i2c_reg_write the I2C
+// slave ISR uses, so a Python host on ttyACM can drive every mode bank + the
+// FILE/store windows over USB and exercise the identical register code the Pico
+// runs over I2C. READN mirrors an I2C burst read: a data-port reg streams (its
+// cursor advances internally, register held), any other reg auto-advances the
+// address. Intended for a USB-only test harness — do not drive concurrently with
+// live I2C-master traffic on the same registers.
+static uint8_t cmd_reg_read(shell_reader_t* args, shell_writer_t* result) {
+    if (sr_remaining(args) < 1u) return SHELL_STATUS_BAD_ARGS;
+    sw_u8(result, i2c_reg_read(sr_u8(args)));
+    return SHELL_STATUS_OK;
+}
+static uint8_t cmd_reg_write(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    if (sr_remaining(args) < 2u) return SHELL_STATUS_BAD_ARGS;
+    uint8_t reg = sr_u8(args);
+    i2c_reg_write(reg, sr_u8(args));
+    return SHELL_STATUS_OK;
+}
+static uint8_t cmd_reg_readn(shell_reader_t* args, shell_writer_t* result) {
+    if (sr_remaining(args) < 2u) return SHELL_STATUS_BAD_ARGS;
+    uint8_t reg = sr_u8(args);
+    uint8_t n   = sr_u8(args);
+    for (uint8_t i = 0; i < n; i++) {
+        sw_u8(result, i2c_reg_read(reg));
+        if (!IS_DATA_PORT(reg)) reg++;          // mirror the I2C register-pointer auto-advance
+    }
+    return result->overflow ? SHELL_STATUS_RESULT_TOO_BIG : SHELL_STATUS_OK;
+}
 #endif // I2C_CLIENT
 
 // --- low-level helpers --------------------------------------------------
@@ -2840,6 +2871,9 @@ static const shell_cmd_entry_t g_chip_commands[] = {
     { CMD_FILE_DATA,           "file_data",          cmd_file_data          },
     { CMD_FILE_COMMIT,         "file_commit",        cmd_file_commit        },
     { CMD_FILE_LIST,           "file_list",          cmd_file_list          },
+    { CMD_REG_READ,            "reg_read",           cmd_reg_read           },
+    { CMD_REG_WRITE,           "reg_write",          cmd_reg_write          },
+    { CMD_REG_READN,           "reg_readn",          cmd_reg_readn          },
 #endif
 #endif
 #if !defined(ROLE_BUS_CONTROLLER)
