@@ -25,6 +25,7 @@
 #include "samd21_adc.h"              // samd21_adc_read_oneshot public API
 #include "samd21_pin_table.h"        // board-label -> AIN + reserved-pin guard (dac_follow)
 #include "samd21_interlocks.h"       // il_parse + il_inst_t (reused by PIO-b gpio interlock)
+#include "samd21_hal_pin.h"          // hal_pin_claim*/read* (reused by MIXED interlock)
 
 // ---------- pin validation -------------------------------------------------
 
@@ -1052,6 +1053,7 @@ static bool store_commit(uint8_t id) {
 // a deferred soft reset (so the master's RESET write is ACKed before we drop).
 static void pio_il_tick(void);             // PIO-b gpio interlock eval (defined below)
 static void adc_sample_tick(void);         // ADC-a sampler (defined below)
+static void mixed_tick(void);              // MIXED-a interlock eval (defined below)
 
 void i2c_store_service(void) {
     if (g_commit_pending >= 0) {
@@ -1064,6 +1066,7 @@ void i2c_store_service(void) {
     if (g_reset_pending) NVIC_SystemReset();
     pio_il_tick();                         // evaluate the gpio interlock (no-op unless armed in PIO)
     adc_sample_tick();                     // 1 kHz ADC sweep + window stats (no-op unless MODE_ADC)
+    mixed_tick();                          // ~100 Hz mixed ADC+GPIO interlock (no-op unless MODE_MIXED)
 }
 
 // ---- PIO mode (PIO-a): 8-bit GPIO expander, CH0..CH7 = D0-D3, D6-D9 ---------
@@ -1434,11 +1437,258 @@ static void adc_reg_write(uint8_t reg, uint8_t val) {
     }
 }
 
+// ---- MIXED mode (MIXED-a): mixed ADC+GPIO interlock at ~100 Hz ----------------
+// Like PIO-b, the interlock_cfg record holds a DSL string parsed by il_parse —
+// SAME record + parser the PIO interlock uses. The declared inputs ARE the active
+// channels: ADC inputs are single-shot 16x-oversampled (hal_pin_read_adc), GPIO
+// inputs are debounced via a shift register (mirrors eval_slot in samd21_interlocks.c).
+// A tick run from i2c_store_service (superloop, gated to ~100 Hz) reads the inputs,
+// evaluates every watch against the latest (ADC) / debounced (GPIO) value, and on
+// trip LATCHES: drives the out_err pins safe + asserts INT on D6 (PB08, the same
+// pin the PIO interlock uses). The master sees the trip in INT_FLAGS (0x04, the
+// MIXED bit) and clears it with a write-1 — that write IS the manual reset.
+//
+// Pins are claimed/released through the HAL pin API exactly like the framework's
+// claim_inst_pins(), but under a DEDICATED slot (MIXED_IL_SLOT) so MIXED's claims
+// never collide with the RS-485 interlock framework's slots 0..INTERLOCK_MAX_SLOTS-1.
+#define REG_MIXED_CH_SEL    0x10u   // w: input index 0..input_count-1 to inspect
+#define REG_MIXED_CH_ROLE   0x11u   // r: selected input role 0=unused 1=GPIO 2=ADC
+#define REG_MIXED_ADC_VAL   0x12u   // r: u16 latest 16x value of selected input (0x12 lo, 0x13 hi)
+#define REG_MIXED_GPIO_RAW  0x14u   // r: u8 raw-level bitmap (bit i = input i if GPIO)
+#define REG_MIXED_GPIO_DEB  0x15u   // r: u8 debounced bitmap
+#define REG_MIXED_ILSTATE   0x16u   // r: bit0 tripped, bit1 cond-ok, bit2 valid/armed
+#define REG_MIXED_ILSTAT    0x17u   // r: last il_parse status (0=OK/armed, 0xFF=no record)
+#define MIXED_IL_INT_BIT    0x02u   // INT_FLAGS bit owned by the MIXED interlock
+
+// HAL pin slot owned by MIXED. The RS-485 interlock framework uses slots
+// 0..INTERLOCK_MAX_SLOTS-1 (currently 0,1); the HAL slot_mask is an 8-bit field,
+// so slot 7 (bit 0x80) is the highest addressable and is guaranteed disjoint from
+// any framework slot. MIXED drives its own outputs directly (pio_phys_drive) and
+// never calls hal_pin_drive_outputs(), so there is no cross-slot drive interaction
+// either — the claim is purely for single-owner reservation + auto-release on exit.
+#define MIXED_IL_SLOT       7u
+_Static_assert(MIXED_IL_SLOT >= INTERLOCK_MAX_SLOTS, "MIXED_IL_SLOT collides with framework slots");
+
+static il_inst_t g_mixed_il;
+static bool      g_mixed_il_valid;          // a DSL parsed OK and has >=1 watch
+static bool      g_mixed_il_tripped;        // latched trip state
+static uint8_t   g_mixed_il_pstat = 0xFFu;  // il_parse_status_t (0xFF = no record yet)
+static volatile uint8_t g_mixed_il_state;   // tick snapshot: bit0 tripped, bit1 cond-ok, bit2 valid
+static uint8_t   g_mixed_ch_sel;            // input index selected for the reg-read window
+
+// Per-input debounce shift register + debounced level (GPIO inputs only). Mirrors
+// g_input_shift_reg / g_input_debounced in samd21_interlocks.c, sized IL_MAX_INPUTS.
+static uint16_t  g_mixed_sr[IL_MAX_INPUTS];
+static uint8_t   g_mixed_deb[IL_MAX_INPUTS];
+// Cached latest readings for the reg window (no re-reading hardware on I2C reads).
+static uint16_t  g_mixed_adc_val[IL_MAX_INPUTS];   // latest 16x value per ADC input
+static uint8_t   g_mixed_gpio_raw;                 // raw-level bitmap (bit i = input i)
+static uint8_t   g_mixed_gpio_deb;                 // debounced bitmap (bit i = input i)
+static uint32_t  g_mixed_next_ms;                  // ~100 Hz tick gate
+
+// Compare one watch against a freshly-read input value. Same op switch as
+// eval_slot()/pio_watch_pass(); `v` is the debounced level (GPIO) or 16x ADC
+// value (ADC), already selected by the caller.
+static bool mixed_watch_pass(const il_watch_t* w, uint16_t v) {
+    switch ((il_compare_op_t)w->op) {
+    case IL_OP_EQ: return v == w->threshold;
+    case IL_OP_NE: return v != w->threshold;
+    case IL_OP_LT: return v <  w->threshold;
+    case IL_OP_GT: return v >  w->threshold;
+    case IL_OP_LE: return v <= w->threshold;
+    case IL_OP_GE: return v >= w->threshold;
+    default:       return true;
+    }
+}
+
+// Force out_err pins to their safe value (override whatever drove them before).
+static void mixed_il_drive_safe(void) {
+    for (uint8_t i = 0; i < g_mixed_il.output_count; i++)
+        pio_phys_drive(g_mixed_il.outputs[i].phys_id, g_mixed_il.outputs[i].err_value);
+}
+
+// Claim each declared input/output pin under MIXED_IL_SLOT, following
+// claim_inst_pins() in samd21_interlocks.c (ADC via hal_pin_claim_adc, GPIO via
+// hal_pin_claim, outputs via hal_pin_claim_output). On any failure releases the
+// whole slot and reports the claim status. VIRTUAL inputs (no physical pin) are
+// skipped, matching the framework.
+static hal_pin_claim_status_t mixed_claim_pins(void) {
+    hal_pin_claim_status_t cs = HAL_PIN_CLAIM_OK;
+    for (uint8_t i = 0; i < g_mixed_il.input_count; i++) {
+        il_pin_mode_t m = (il_pin_mode_t)g_mixed_il.inputs[i].mode;
+        if (m == IL_PIN_MODE_VIRTUAL) continue;            // no pin to claim
+        if (m == IL_PIN_MODE_ADC) {
+            cs = hal_pin_claim_adc(g_mixed_il.inputs[i].phys_id, MIXED_IL_SLOT,
+                                   g_mixed_il.inputs[i].oversample_exp,
+                                   g_mixed_il.inputs[i].sh_cyc);
+        } else {
+            hal_pin_mode_t hm;
+            switch (m) {
+            case IL_PIN_MODE_IN:    hm = HAL_PIN_MODE_GPIO_IN;    break;
+            case IL_PIN_MODE_IN_PU: hm = HAL_PIN_MODE_GPIO_IN_PU; break;
+            case IL_PIN_MODE_IN_PD: hm = HAL_PIN_MODE_GPIO_IN_PD; break;
+            default: cs = HAL_PIN_CLAIM_BAD_MODE; goto fail;
+            }
+            cs = hal_pin_claim(g_mixed_il.inputs[i].phys_id, MIXED_IL_SLOT, hm);
+        }
+        if (cs != HAL_PIN_CLAIM_OK) goto fail;
+    }
+    for (uint8_t i = 0; i < g_mixed_il.output_count; i++) {
+        cs = hal_pin_claim_output(g_mixed_il.outputs[i].phys_id, MIXED_IL_SLOT,
+                                  g_mixed_il.outputs[i].ok_value,
+                                  g_mixed_il.outputs[i].err_value);
+        if (cs != HAL_PIN_CLAIM_OK) goto fail;
+    }
+    return HAL_PIN_CLAIM_OK;
+fail:
+    hal_pin_release_slot(MIXED_IL_SLOT);
+    return cs;
+}
+
+// Arm from the interlock_cfg record; set up the D6/PB08 INT pin (output, deasserted)
+// and claim the declared pins. Mirrors pio_il_arm().
+static void mixed_il_arm(void) {
+    g_mixed_il_valid = false; g_mixed_il_tripped = false;
+    // INT pin = D6 = PB08 (same as PIO): drive low (deasserted), keep INEN for read-back.
+    PORT->Group[PIO_INT_GROUP].OUTCLR.reg = (1u << PIO_INT_PIN);
+    PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN;
+    PORT->Group[PIO_INT_GROUP].DIRSET.reg = (1u << PIO_INT_PIN);
+    g_mixed_il_state = 0u;
+    // Fresh arm: clear debounce + cached readings so no stale edges/values leak in.
+    memset(g_mixed_sr,  0, sizeof g_mixed_sr);
+    memset(g_mixed_deb, 0, sizeof g_mixed_deb);
+    memset(g_mixed_adc_val, 0, sizeof g_mixed_adc_val);
+    g_mixed_gpio_raw = 0u; g_mixed_gpio_deb = 0u;
+    if (g_rec_len[REC_INTERLOCK_CFG] > 0u) {
+        g_mixed_il_pstat = (uint8_t)il_parse((const char*)g_rec_data[REC_INTERLOCK_CFG],
+                                             g_rec_len[REC_INTERLOCK_CFG], &g_mixed_il, NULL);
+        if (g_mixed_il_pstat == (uint8_t)IL_PARSE_OK && g_mixed_il.watch_count > 0u) {
+            // Claim the declared pins; only mark valid if every claim succeeds.
+            if (mixed_claim_pins() == HAL_PIN_CLAIM_OK)
+                g_mixed_il_valid = true;
+        }
+    } else {
+        g_mixed_il_pstat = 0xFFu;            // no interlock_cfg record present
+    }
+    g_mixed_next_ms = board_millis();
+}
+
+// Leaving MIXED mode: drop the latch, deassert INT, release the HAL claims.
+static void mixed_il_disarm(void) {
+    g_mixed_il_valid = false; g_mixed_il_tripped = false;
+    pio_int_assert(false);                  // deassert INT on D6 (shared helper)
+    hal_pin_release_slot(MIXED_IL_SLOT);    // free every pin MIXED claimed -> safe
+}
+
+// Master cleared the MIXED trip bit in INT_FLAGS -> manual reset. Re-arm; if the
+// fault persists the next tick re-trips, otherwise the outputs resume their ok value.
+static void mixed_il_manual_reset(void) {
+    if (!g_mixed_il_tripped) return;
+    g_mixed_il_tripped = false;
+    pio_int_assert(false);
+    // Restore each output to its ok value (drop the safe override).
+    for (uint8_t i = 0; i < g_mixed_il.output_count; i++)
+        pio_phys_drive(g_mixed_il.outputs[i].phys_id, g_mixed_il.outputs[i].ok_value);
+}
+
+// Run from i2c_store_service (superloop), gated to ~100 Hz (10 ms) like adc_sample_tick.
+// Reads every input (ADC = single-shot 16x; GPIO = raw + debounce shift register),
+// caches the values for the reg window, evaluates all watches, and latches on trip.
+static void mixed_tick(void) {
+    if (g_mode != MODE_MIXED || !g_mixed_il_valid) return;
+    uint32_t now = board_millis();
+    if ((int32_t)(now - g_mixed_next_ms) < 0) return;        // ~100 Hz gate (10 ms)
+    g_mixed_next_ms = now + 10u;
+
+    // Snapshot each input. ADC values feed the watch directly; GPIO levels are
+    // debounced through a per-input shift register (Schmitt-on-time), mirroring
+    // eval_slot() in samd21_interlocks.c.
+    uint16_t vals[IL_MAX_INPUTS] = {0};
+    uint8_t  raw_bm = 0u, deb_bm = 0u;
+    for (uint8_t i = 0; i < g_mixed_il.input_count; i++) {
+        il_pin_mode_t m = (il_pin_mode_t)g_mixed_il.inputs[i].mode;
+        if (m == IL_PIN_MODE_ADC) {
+            uint16_t v = hal_pin_read_adc(g_mixed_il.inputs[i].phys_id);
+            g_mixed_adc_val[i] = v;
+            vals[i] = v;
+        } else {
+            uint16_t raw = (uint16_t)(hal_pin_read(g_mixed_il.inputs[i].phys_id) & 1u);
+            uint8_t depth = g_mixed_il.inputs[i].debounce_depth;
+            uint16_t level = raw;
+            if (depth >= 2u) {
+                uint16_t mask = (uint16_t)((1u << depth) - 1u);
+                g_mixed_sr[i] = (uint16_t)(((g_mixed_sr[i] << 1) | (raw & 1u)) & mask);
+                if      (g_mixed_sr[i] == mask) g_mixed_deb[i] = 1u;
+                else if (g_mixed_sr[i] == 0u)   g_mixed_deb[i] = 0u;
+                level = g_mixed_deb[i];
+            } else {
+                g_mixed_deb[i] = (uint8_t)raw;               // depth<2 -> pass-through
+            }
+            if (raw)   raw_bm |= (uint8_t)(1u << i);
+            if (level) deb_bm |= (uint8_t)(1u << i);
+            vals[i] = level;
+        }
+    }
+    g_mixed_gpio_raw = raw_bm;
+    g_mixed_gpio_deb = deb_bm;
+
+    // Evaluate every watch against the (debounced/latest) input values.
+    bool all_pass = true;
+    for (uint8_t i = 0; i < g_mixed_il.watch_count; i++) {
+        const il_watch_t* w = &g_mixed_il.watches[i];
+        if (!mixed_watch_pass(w, vals[w->input_idx])) { all_pass = false; break; }
+    }
+    g_mixed_il_state = (uint8_t)((g_mixed_il_tripped ? 1u : 0u) | (all_pass ? 2u : 0u) | 4u);
+
+    if (!g_mixed_il_tripped) {
+        if (!all_pass) {                                     // a watch failed -> TRIP (latched)
+            g_mixed_il_tripped = true;
+            g_int_flags |= MIXED_IL_INT_BIT;
+            mixed_il_drive_safe();
+            pio_int_assert(true);
+        }
+    } else {
+        mixed_il_drive_safe();              // hold the safe outputs each tick
+    }
+}
+
+// MIXED mode-bank register access (0x10-0x17), dispatched only while MODE_MIXED.
+static uint8_t mixed_reg_read(uint8_t reg) {
+    bool sel_ok = g_mixed_il_valid && (g_mixed_ch_sel < g_mixed_il.input_count);
+    il_pin_mode_t selm = sel_ok ? (il_pin_mode_t)g_mixed_il.inputs[g_mixed_ch_sel].mode
+                                : IL_PIN_MODE_VIRTUAL;
+    switch (reg) {
+    case REG_MIXED_CH_SEL:  return g_mixed_ch_sel;
+    case REG_MIXED_CH_ROLE:
+        if (!sel_ok) return 0u;
+        if (selm == IL_PIN_MODE_ADC) return 2u;
+        if (selm == IL_PIN_MODE_IN || selm == IL_PIN_MODE_IN_PU || selm == IL_PIN_MODE_IN_PD)
+            return 1u;
+        return 0u;                                           // VIRTUAL / out-of-range
+    case REG_MIXED_ADC_VAL:                                   // lo byte
+        return (sel_ok && selm == IL_PIN_MODE_ADC) ? (uint8_t)g_mixed_adc_val[g_mixed_ch_sel] : 0u;
+    case REG_MIXED_ADC_VAL + 1u:                              // hi byte
+        return (sel_ok && selm == IL_PIN_MODE_ADC) ? (uint8_t)(g_mixed_adc_val[g_mixed_ch_sel] >> 8) : 0u;
+    case REG_MIXED_GPIO_RAW: return g_mixed_gpio_raw;
+    case REG_MIXED_GPIO_DEB: return g_mixed_gpio_deb;
+    case REG_MIXED_ILSTATE:  return g_mixed_il_state;
+    case REG_MIXED_ILSTAT:   return g_mixed_il_pstat;
+    default:                 return 0xFFu;
+    }
+}
+static void mixed_reg_write(uint8_t reg, uint8_t val) {
+    switch (reg) {
+    case REG_MIXED_CH_SEL: if (val < IL_MAX_INPUTS) g_mixed_ch_sel = val; break;
+    default: break;                                          // all other regs are read-only
+    }
+}
+
 // Register read dispatch (control bank). Out-of-range -> 0xFF.
 static uint8_t i2c_reg_read(uint8_t reg) {
     if (reg >= 0x10u && reg <= 0x3Fu) {                  // mode bank — interpreted per active mode
         if (g_mode == MODE_PIO) return pio_reg_read(reg);
         if (g_mode == MODE_ADC) return adc_reg_read(reg);
+        if (g_mode == MODE_MIXED) return mixed_reg_read(reg);
         return 0xFFu;
     }
     switch (reg) {
@@ -1472,6 +1722,7 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
     if (reg >= 0x10u && reg <= 0x3Fu) {                  // mode bank — interpreted per active mode
         if (g_mode == MODE_PIO) pio_reg_write(reg, val);
         else if (g_mode == MODE_ADC) adc_reg_write(reg, val);
+        else if (g_mode == MODE_MIXED) mixed_reg_write(reg, val);
         return;
     }
     switch (reg) {
@@ -1486,6 +1737,8 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
                 NVIC_DisableIRQ(TC3_IRQn);                 // stop the DAC waveform generator
                 g_dac_wf.active = false;
                 tc3_stop();
+            } else if (g_mode == MODE_MIXED) {             // leaving MIXED
+                mixed_il_disarm();                         // deassert INT, drop latch, release pins (safe)
             }
             g_mode = val;
             if (val == MODE_PIO) {                         // entering PIO
@@ -1495,12 +1748,15 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
                 pio_il_arm();                              // parse interlock_cfg, set up INT pin
             } else if (val == MODE_ADC) {                  // entering ADC
                 adc_mode_setup();                          // DIV16 sampler + window stats + DAC const
+            } else if (val == MODE_MIXED) {                // entering MIXED
+                mixed_il_arm();                            // parse interlock_cfg, claim pins, set up INT
             }
         }
         break;
     case 0x04:                                            // INT_FLAGS: write-1-to-clear
         g_int_flags &= (uint8_t)~val;
         if (val & 0x01u) pio_il_manual_reset();           // acking the trip bit == manual reset
+        if ((val & MIXED_IL_INT_BIT) && g_mode == MODE_MIXED) mixed_il_manual_reset();
         break;
     case 0x0E: if (val == 0xA5u) g_reset_pending = true; break;  // RESET (magic 0xA5; deferred)
     case REG_REC_SEL: if (val < REC_COUNT) { g_store_rec_sel = val; g_store_rec_off = 0u; } break;
