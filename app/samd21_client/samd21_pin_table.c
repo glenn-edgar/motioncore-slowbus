@@ -25,33 +25,38 @@
 #include "samd21_pin_table.h"
 #include <string.h>
 
+// Only the I2C pins (D4/D5) are STATICALLY reserved. A0/DAC and D6/INT are
+// mode-assigned roles, not static reservations: A0 is the DAC only in ADC mode
+// (a channel otherwise); D6 is the interrupt only in GPIO/MIXED (a channel in
+// ADC mode). So A0 stays DAC-capable but claimable, and D6/D7 (ex-UART, now that
+// RS-485 is gone) are free.
 #define CAP_FREE_GPIO    (BOARD_PIN_CAP_GPIO | BOARD_PIN_CAP_ADC)
-#define CAP_RESV_DAC     (BOARD_PIN_CAP_GPIO | BOARD_PIN_CAP_ADC | BOARD_PIN_CAP_DAC | BOARD_PIN_RESERVED)
+#define CAP_FREE_DAC     (BOARD_PIN_CAP_GPIO | BOARD_PIN_CAP_ADC | BOARD_PIN_CAP_DAC)
 #define CAP_RESV_PERI    (BOARD_PIN_CAP_GPIO | BOARD_PIN_CAP_ADC | BOARD_PIN_RESERVED)
 
 const board_pin_t g_board_pins[] = {
     // D-labels (digital intent)
-    { "D0",  0,  2, 0u,                CAP_RESV_DAC  },
+    { "D0",  0,  2, 0u,                CAP_FREE_DAC  },
     { "D1",  0,  4, 4u,                CAP_FREE_GPIO },
     { "D2",  0, 10, 18u,               CAP_FREE_GPIO },
     { "D3",  0, 11, 19u,               CAP_FREE_GPIO },
     { "D4",  0,  8, 16u,               CAP_RESV_PERI },
     { "D5",  0,  9, 17u,               CAP_RESV_PERI },
-    { "D6",  1,  8, 2u,                CAP_RESV_PERI },
-    { "D7",  1,  9, 3u,                CAP_RESV_PERI },
+    { "D6",  1,  8, 2u,                CAP_FREE_GPIO },
+    { "D7",  1,  9, 3u,                CAP_FREE_GPIO },
     { "D8",  0,  7, 7u,                CAP_FREE_GPIO },
     { "D9",  0,  5, 5u,                CAP_FREE_GPIO },
     { "D10", 0,  6, 6u,                CAP_FREE_GPIO },
 
     // A-labels (analog intent) — same physical pin as the D counterpart
-    { "A0",  0,  2, 0u,                CAP_RESV_DAC  },
+    { "A0",  0,  2, 0u,                CAP_FREE_DAC  },
     { "A1",  0,  4, 4u,                CAP_FREE_GPIO },
     { "A2",  0, 10, 18u,               CAP_FREE_GPIO },
     { "A3",  0, 11, 19u,               CAP_FREE_GPIO },
     { "A4",  0,  8, 16u,               CAP_RESV_PERI },
     { "A5",  0,  9, 17u,               CAP_RESV_PERI },
-    { "A6",  1,  8, 2u,                CAP_RESV_PERI },
-    { "A7",  1,  9, 3u,                CAP_RESV_PERI },
+    { "A6",  1,  8, 2u,                CAP_FREE_GPIO },
+    { "A7",  1,  9, 3u,                CAP_FREE_GPIO },
     { "A8",  0,  7, 7u,                CAP_FREE_GPIO },
     { "A9",  0,  5, 5u,                CAP_FREE_GPIO },
     { "A10", 0,  6, 6u,                CAP_FREE_GPIO },

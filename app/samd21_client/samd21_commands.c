@@ -39,11 +39,10 @@ static bool validate_pin(uint8_t port, uint8_t pin) {
 // D6 = PB08 (RS-485 TX, SERCOM4) — reserved even pre-RS-485-init
 // D7 = PB09 (RS-485 RX, SERCOM4) — reserved even pre-RS-485-init
 static bool pin_is_reserved(uint8_t port, uint8_t pin) {
-    if (port == 0u && pin ==  2u) return true;  // D0 / DAC
+    // Only I2C (D4/D5) is STATICALLY reserved. A0/DAC and D6/INT are mode-assigned
+    // roles (see samd21_pin_table.c) owned by the active mode, not by this guard.
     if (port == 0u && pin ==  8u) return true;  // D4 / SDA
     if (port == 0u && pin ==  9u) return true;  // D5 / SCL
-    if (port == 1u && pin ==  8u) return true;  // D6 / UART TX
-    if (port == 1u && pin ==  9u) return true;  // D7 / UART RX
     return false;
 }
 
@@ -1080,7 +1079,7 @@ void i2c_store_service(void) {
 
 static const struct { uint8_t group, pin; } g_pio_ch[8] = {
     {0, 2}, {0, 4}, {0, 10}, {0, 11},   // CH0..3 = D0 D1 D2 D3
-    {1, 8}, {1, 9}, {0,  7}, {0,  5},   // CH4..7 = D6 D7 D8 D9
+    {1, 9}, {0,  7}, {0,  5}, {0,  6},   // CH4..7 = D7 D8 D9 D10  (D6 is now INT)
 };
 static uint8_t g_pio_iodir = 0xFFu;   // power-on default: all inputs (safe)
 static uint8_t g_pio_gppu;
@@ -1140,8 +1139,8 @@ static uint8_t pio_read_gpio(void) {
 // cleared the interlock re-arms, otherwise the next tick re-trips.
 #define REG_PIO_ILSTAT  0x15u           // RO: last il_parse status (0 = OK/armed, 0xFF = no record)
 #define REG_PIO_ILSTATE 0x16u           // RO: bit0=tripped bit1=condition-ok bit2=valid/armed
-#define PIO_INT_GROUP  0u
-#define PIO_INT_PIN    6u               // INT = D10 = PA06 (not one of the 8 channels)
+#define PIO_INT_GROUP  1u
+#define PIO_INT_PIN    8u               // INT = D6 = PB08 (not one of the 8 channels; D10 is now CH7)
 
 static il_inst_t g_pio_il;
 static bool      g_pio_il_valid;        // a DSL parsed OK and has >=1 watch
