@@ -139,12 +139,6 @@ bool register_dongle_is_uncommissioned(void) {
     return g_commissioning_state == COMMISSIONING_UNCOMMISSIONED;
 }
 
-// RS-485 slave address = low byte of the commissioned instance_id (single
-// source of truth per phase plan decision #2). 0 when uncommissioned.
-uint8_t register_dongle_rs485_addr(void) {
-    return (uint8_t)(g_instance_id & 0xFFu);
-}
-
 // Public accessor for the 16-byte chip UID (used by the slave PING responder).
 void register_dongle_chip_uid(uint8_t out[16]) {
     samd21_read_uid(out);

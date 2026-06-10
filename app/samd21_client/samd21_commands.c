@@ -23,7 +23,6 @@
 #include "samd21.h"
 #include "bsp/board_api.h"           // board_millis()
 #include "samd21_adc.h"              // samd21_adc_read_oneshot public API
-#include "samd21_rs485.h"            // SERCOM4 9-bit MPCM UART driver
 #include "samd21_pin_table.h"        // board-label -> AIN + reserved-pin guard (dac_follow)
 #include "samd21_interlocks.h"       // il_parse + il_inst_t (reused by PIO-b gpio interlock)
 
@@ -1784,57 +1783,6 @@ static uint8_t cmd_i2c_scan(shell_reader_t* args, shell_writer_t* result) {
     return SHELL_STATUS_OK;
 }
 
-// ---------- CMD_RS485_CONFIG / CMD_RS485_SEND_FRAME -----------------------
-// RS-485 passthrough (SERCOM4 9-bit MPCM, D6=TX / D7=RX). Received frames are
-// pushed asynchronously from the main loop as OP_RS485_FRAME_RX, not returned
-// here. See samd21_rs485.c for the wire format + half-duplex RX rationale.
-
-// args: baud:u32, my_addr:u8, flags:u8   reply: empty
-static uint8_t cmd_rs485_config(shell_reader_t* args, shell_writer_t* result) {
-    (void)result;
-    uint32_t baud    = sr_u32(args);
-    uint8_t  my_addr = sr_u8(args);
-    uint8_t  flags   = sr_u8(args);
-    if (args->overflow)          return SHELL_STATUS_BAD_ARGS;
-    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-    rs485_config(baud, my_addr, flags);
-    return SHELL_STATUS_OK;
-}
-
-// args: dest:u8, src:u8, type:u8, seq:u8, payload:u8[0..RS485_PAYLOAD_MAX]
-// reply: empty.  Raw frame injector for bench diagnostics — full control over
-// the structured header. The driver appends the CRC.
-static uint8_t cmd_rs485_send_frame(shell_reader_t* args, shell_writer_t* result) {
-    (void)result;
-    uint8_t dest = sr_u8(args);
-    uint8_t src  = sr_u8(args);
-    uint8_t type = sr_u8(args);
-    uint8_t seq  = sr_u8(args);
-    if (args->overflow)          return SHELL_STATUS_BAD_ARGS;
-    uint16_t n = sr_remaining(args);
-    if (n > RS485_PAYLOAD_MAX)   return SHELL_STATUS_BAD_ARGS;
-    uint8_t payload[RS485_PAYLOAD_MAX];
-    if (n > 0) sr_bytes(args, payload, n);
-    if (args->overflow)          return SHELL_STATUS_BAD_ARGS;
-    rs485_send(dest, src, type, seq, payload, (uint8_t)n);
-    return SHELL_STATUS_OK;
-}
-
-// args: none
-// reply: rx_words:u32, frames_ok:u32, crc_fail:u32, overrun:u32, tx_frames:u32,
-//        last_tx_len:u8
-static uint8_t cmd_rs485_stats(shell_reader_t* args, shell_writer_t* result) {
-    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-    sw_u32(result, rs485_rx_word_count());
-    sw_u32(result, rs485_frames_ok_count());
-    sw_u32(result, rs485_crc_fail_count());
-    sw_u32(result, rs485_rx_overrun_count());
-    sw_u32(result, rs485_tx_frame_count());
-    sw_u8(result, rs485_last_tx_len());
-    if (result->overflow) return SHELL_STATUS_RESULT_TOO_BIG;
-    return SHELL_STATUS_OK;
-}
-
 // ---------- CMD_TEST_HANG -------------------------------------------------
 // Layer-2 WDT bench probe. Disables IRQs and spins; the layer-2 WDT bites
 // after ~4 s and the chip resets. Never returns a reply frame.
@@ -1921,114 +1869,6 @@ static uint8_t cmd_stack_hwm(shell_reader_t* args, shell_writer_t* result) {
     return SHELL_STATUS_OK;
 }
 
-// ---------- bus management (bus_controller only, Stage 2) ----------------
-#if defined(ROLE_BUS_CONTROLLER)
-#include "bus_roster.h"
-
-// args: addr:u8, class_id:u32, flags:u8
-// reply OK:        reason:u8 (=BUS_REG_OK), roster_count:u8
-// reply CMD_FAILED: reason:u8 (BUS_REG_FULL/DUP/BADADDR)
-static uint8_t cmd_bus_register_slave(shell_reader_t* args, shell_writer_t* result) {
-    uint8_t  addr     = sr_u8(args);
-    uint32_t class_id = sr_u32(args);
-    uint8_t  flags    = sr_u8(args);
-    if (args->overflow)          return SHELL_STATUS_BAD_ARGS;
-    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-
-    uint8_t count = 0;
-    uint8_t reason = bus_roster_register(addr, class_id, flags, &count);
-    sw_u8(result, reason);
-    if (reason != BUS_REG_OK) {
-        if (result->overflow) return SHELL_STATUS_RESULT_TOO_BIG;
-        return SHELL_STATUS_CMD_FAILED;
-    }
-    sw_u8(result, count);
-    if (result->overflow) return SHELL_STATUS_RESULT_TOO_BIG;
-    return SHELL_STATUS_OK;
-}
-
-// args: addr:u8   reply OK: roster_count:u8   (CMD_FAILED if addr absent)
-static uint8_t cmd_bus_unregister_slave(shell_reader_t* args, shell_writer_t* result) {
-    uint8_t addr = sr_u8(args);
-    if (args->overflow)          return SHELL_STATUS_BAD_ARGS;
-    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-
-    uint8_t count = 0;
-    bool removed = bus_roster_unregister(addr, &count);
-    sw_u8(result, count);
-    if (result->overflow) return SHELL_STATUS_RESULT_TOO_BIG;
-    return removed ? SHELL_STATUS_OK : SHELL_STATUS_CMD_FAILED;
-}
-
-// args: none
-// reply: total:u8, shown:u8, then `shown` rows of {addr:u8, class_id:u32,
-//        flags:u8, state:u8, misses:u8, last_seen_ms_ago:u16} (10 B each).
-// A full 16-slave roster (161 B) exceeds COMM_PAYLOAD_MAX, so we emit only as
-// many rows as fit and report `total` separately. The decoder iterates `shown`.
-#define BUS_LIST_ROW_BYTES 10u
-static uint8_t cmd_bus_list_slaves(shell_reader_t* args, shell_writer_t* result) {
-    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-    uint32_t now   = (uint32_t)board_millis();
-    uint8_t  total = bus_roster_count();
-    sw_u8(result, total);
-    // Reserve the shown-count byte, then fill rows until one more won't fit.
-    uint8_t shown = 0;
-    sw_u8(result, 0);                 // placeholder; patched after the loop
-    uint8_t* shown_slot = result->p - 1;
-    for (uint8_t i = 0; i < total; i++) {
-        if ((uint16_t)(result->end - result->p) < BUS_LIST_ROW_BYTES) break;
-        const bus_slave_t* s = bus_roster_at(i);
-        if (s == 0) break;
-        uint32_t ago32 = (s->last_seen_ms == 0) ? 0xFFFFu : (now - s->last_seen_ms);
-        uint16_t ago   = (ago32 > 0xFFFFu) ? 0xFFFFu : (uint16_t)ago32;
-        sw_u8 (result, s->addr);
-        sw_u32(result, s->class_id);
-        sw_u8 (result, s->flags);
-        sw_u8 (result, s->state);
-        sw_u8 (result, s->consecutive_misses);
-        sw_u16(result, ago);
-        shown++;
-    }
-    if (result->overflow) return SHELL_STATUS_RESULT_TOO_BIG;
-    *shown_slot = shown;              // overflow-checked: writer didn't trip
-    return SHELL_STATUS_OK;
-}
-
-// args: poll_period_ms:u16, max_misses:u8, tcp_retries:u8   reply: empty
-static uint8_t cmd_bus_set_poll(shell_reader_t* args, shell_writer_t* result) {
-    (void)result;
-    uint16_t period  = sr_u16(args);
-    uint8_t  misses  = sr_u8(args);
-    uint8_t  retries = sr_u8(args);
-    if (args->overflow)          return SHELL_STATUS_BAD_ARGS;
-    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-    if (period == 0 || misses == 0) return SHELL_STATUS_BAD_ARGS;
-    bus_poll_cfg_t* cfg = bus_poll_cfg();
-    cfg->poll_period_ms = period;
-    cfg->max_misses     = misses;
-    cfg->tcp_retries    = retries;
-    return SHELL_STATUS_OK;
-}
-
-// args: enable:u8   reply: empty
-static uint8_t cmd_bus_poll_enable(shell_reader_t* args, shell_writer_t* result) {
-    (void)result;
-    uint8_t enable = sr_u8(args);
-    if (args->overflow)          return SHELL_STATUS_BAD_ARGS;
-    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-    bus_poll_cfg()->enabled = enable ? 1u : 0u;
-    return SHELL_STATUS_OK;
-}
-
-// args: none   reply: empty
-static uint8_t cmd_bus_clear_roster(shell_reader_t* args, shell_writer_t* result) {
-    (void)result;
-    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-    bus_roster_clear();
-    return SHELL_STATUS_OK;
-}
-#endif // ROLE_BUS_CONTROLLER
-
 // ---------- chip-specific dispatch table ---------------------------------
 
 // Chip-specific command surface. The bus_controller is "nothing but a bus
@@ -2054,17 +1894,6 @@ static const shell_cmd_entry_t g_chip_commands[] = {
     { CMD_I2C_READ,            "i2c_read",           cmd_i2c_read           },
     { CMD_I2C_WRITE_READ,      "i2c_write_read",     cmd_i2c_write_read     },
     { CMD_I2C_SCAN,            "i2c_scan",           cmd_i2c_scan           },
-#endif
-    { CMD_RS485_CONFIG,        "rs485_config",       cmd_rs485_config       },
-    { CMD_RS485_SEND_FRAME,    "rs485_send_frame",   cmd_rs485_send_frame   },
-    { CMD_RS485_STATS,         "rs485_stats",        cmd_rs485_stats        },
-#if defined(ROLE_BUS_CONTROLLER)
-    { CMD_BUS_REGISTER_SLAVE,   "bus_register_slave",   cmd_bus_register_slave   },
-    { CMD_BUS_UNREGISTER_SLAVE, "bus_unregister_slave", cmd_bus_unregister_slave },
-    { CMD_BUS_LIST_SLAVES,      "bus_list_slaves",      cmd_bus_list_slaves      },
-    { CMD_BUS_SET_POLL,         "bus_set_poll",         cmd_bus_set_poll         },
-    { CMD_BUS_POLL_ENABLE,      "bus_poll_enable",      cmd_bus_poll_enable      },
-    { CMD_BUS_CLEAR_ROSTER,     "bus_clear_roster",     cmd_bus_clear_roster     },
 #endif
 #if !defined(ROLE_BUS_CONTROLLER)
     { CMD_TEST_HANG,           "test_hang",          cmd_test_hang          },
@@ -2098,9 +1927,5 @@ void samd21_peripherals_init(void) {
     i2c_slave_init();   // SERCOM2 = I2C slave to the Pico master (D4/D5)
 #else
     i2c_init();         // SERCOM2 = I2C master for the dongle's own devices
-#endif
-    rs485_init();
-#if defined(ROLE_BUS_CONTROLLER)
-    bus_roster_init();   // RAM roster starts empty; the Pi registers slaves
 #endif
 }
