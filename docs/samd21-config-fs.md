@@ -132,6 +132,30 @@ Extends the existing framed protocol (the `OP_COMMISSION_*` path):
 wins) and stay on the **USB/main-loop path only** — never during an I2C/RS-485
 transaction (SAMD21 stalls the CPU on NVM write/erase; no RWW).
 
+## Commissioning, power-on config & the lock flag
+Commissioning (Pi over USB-CDC) writes the unit's **I2C address** and its
+**power-on configuration**, then optionally **locks** it.
+
+- **Power-on configuration.** Today `register_dongle_load_commissioning()` runs at
+  boot, but the **mode is not persisted** (`g_mode` starts `MODE_IDLE`,
+  `g_pio_iodir` = all-inputs safe default). Commissioning adds a stored
+  **power-on config** — the boot mode (PIO/ADC/MIXED/SERVO/COUNTER) + its pin
+  setup — which the SAMD21 **applies at boot** instead of idling. Each mode's
+  config params (e.g. MIXED: which pins ADC + oversample + interlock rules; SERVO:
+  channels; COUNTER: edges/pins) define this schema → **finishing the modes first
+  fixes what commissioning must store.**
+- **Lock flag (new — nothing like it exists yet).** A flag gating whether
+  commissioning can be changed. Open semantics to decide:
+  - **One-way or reversible?** Lean **reversible via a magic-guarded unlock**
+    (mirror the existing `REG_SET_ADDR` / `g_setaddr_armed` pattern) so a field
+    unit is recoverable but not accidentally rewritten.
+  - **Scope:** lock **identity** (I2C addr, instance) hard, but keep **power-on
+    config** (mode/site) tunable? Or one lock for everything? (Lean: separate —
+    identity is set-once, config may be re-tuned.)
+  - **Stored** in the config store, itself magic-guarded; when locked, `OP_FILE_*`
+    writes to protected names + `REG_SET_ADDR` are **refused with a LOCKED status**
+    the Pi sees.
+
 ## Commission tool (Python) — WSL needs a venv first
 `pyserial` + `cbor2`. WSL/modern Debian system Python is externally-managed
 (PEP 668) — `pip install` is refused. Use a venv; never `--break-system-packages`:
@@ -152,10 +176,16 @@ box, pass the device through with `usbipd-win` (see docs/toolchain-wsl.md).
    are ≤ tens of B → 244 B is ample; lean 1-row.)
 6. Retire the old 6-record store + commission A/B slots once these migrate in.
 
-## Phasing
-1. Generalize the store: name-keyed slots, 64 KB partition, linker carve-out.
-2. USB `OP_FILE_*` (Pi can store files).
-3. I2C FILE register bank (Pico reads by name).
-4. Python commission tool (venv, JSON→canonical CBOR).
-5. Firmware identity init: `class_id` from chip, `inst`/`addr` from FS.
-6. Pico-side: read named CBOR config at boot.
+## Program sequencing (set 2026-06-10)
+**A. Finish the SAMD21 modes first** — MIXED → SERVO → COUNTER. This also fixes the
+power-on config schema commissioning must store. (Modes switch at runtime via
+`g_mode` during dev; persistence comes in B.)
+**B. Commissioning** — the FS work below, plus power-on config + the lock flag:
+  1. Generalize the store: name-keyed slots, 64 KB partition, linker carve-out.
+  2. USB `OP_FILE_*` write path + the commission **lock flag** (refuse writes when locked).
+  3. I2C FILE register bank (Pico reads by name).
+  4. Firmware: store + **apply power-on config at boot**; `class_id` compile-time, `inst`/`addr`/`i2c` from FS.
+  5. Python commission tool (venv, JSON→canonical CBOR).
+**C. Pico changes + dongle changes** — Pico reads named CBOR config over I2C before
+bus negotiation; dongle hardware (class strap, the 2 GPIO site straps) to match the
+identity model. Keep firmware/hardware in sync.
