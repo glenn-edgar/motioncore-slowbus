@@ -117,6 +117,20 @@ const shell_cmd_entry_t* shell_find_cmd(uint16_t command_id);
 // only; no reply frame is ever produced (the command never returns).
 #define CMD_TEST_HANG         ((uint16_t)0x0120)
 
+// 0x0120 is already taken by CMD_TEST_HANG above, so the chunked-file write
+// commands take the next free 0x012x block (0x0123..0x0126). These let the Pi
+// (USB-CDC host) WRITE named config files into the name-keyed config store,
+// staged in the per-slot RAM shadow and flushed to flash by i2c_store_service.
+//   CMD_FILE_BEGIN  args: name[4]        -> open a write to that slot
+//   CMD_FILE_DATA   args: chunk bytes    -> append to the staged file
+//   CMD_FILE_COMMIT args: (none)         -> finalize + queue flash commit
+//   CMD_FILE_LIST   args: (none) -> result: count:u8 then per file {name[4], len:u8}
+// Files >~120 B must be sent in multiple CMD_FILE_DATA chunks (COMM_PAYLOAD_MAX).
+#define CMD_FILE_BEGIN        ((uint16_t)0x0123)
+#define CMD_FILE_DATA         ((uint16_t)0x0124)
+#define CMD_FILE_COMMIT       ((uint16_t)0x0125)
+#define CMD_FILE_LIST         ((uint16_t)0x0126)
+
 // 0x0140..0x014F: interlock framework foundation (slice 1).
 // CMD_INTERLOCK_STATUS args: (empty)
 //   reply: num_slots:u8 then per-slot {state:u8, id:u8, boot_counter:u8},

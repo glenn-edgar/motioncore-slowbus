@@ -2498,6 +2498,84 @@ void SERCOM2_Handler(void) {
         return;
     }
 }
+
+// ============================================================================
+// USB-CDC chunked config-file write — the Pi host stages a named config file
+// into the name-keyed store over the shell, then commits it to flash.
+//
+// A file larger than ~120 B can't fit one COMM_PAYLOAD_MAX (128 B) shell frame,
+// so the host streams it: BEGIN (open a slot by name) -> one or more DATA chunks
+// (appended into the per-slot RAM shadow g_rec_data[slot]) -> COMMIT (publish
+// g_rec_len + dirty, then hand the slot to the async i2c_store_service via
+// g_commit_pending, which does the deferred flash write). The command returns
+// immediately; nothing persists without COMMIT. Re-writing a name updates it
+// (store_alloc returns the existing slot; commit appends a higher-seq entry).
+// DELETE is intentionally out of scope.
+// ============================================================================
+static int      g_file_wr_slot = -1;   // slot being staged, -1 = no open BEGIN
+static uint16_t g_file_wr_len;          // bytes appended into the shadow so far
+
+// ---------- CMD_FILE_BEGIN -----------------------------------------------
+// args:   name[4]   result: empty   status: OK / BAD_ARGS (store full / short)
+static uint8_t cmd_file_begin(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    if (sr_remaining(args) < STORE_NAME_LEN) return SHELL_STATUS_BAD_ARGS;
+    uint8_t name[STORE_NAME_LEN];
+    sr_bytes(args, name, STORE_NAME_LEN);
+    if (args->overflow || sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
+
+    int s = store_alloc(name);
+    if (s < 0) return SHELL_STATUS_CMD_FAILED;   // store full (16 slots used)
+    g_file_wr_slot = s;
+    g_file_wr_len  = 0;
+    return SHELL_STATUS_OK;
+}
+
+// ---------- CMD_FILE_DATA ------------------------------------------------
+// args:   chunk bytes   result: empty   status: OK / BAD_ARGS
+// Appends the chunk into the open slot's shadow; rejects if it would overflow
+// STORE_DATA_MAX (240) or if no BEGIN is open.
+static uint8_t cmd_file_data(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    if (g_file_wr_slot < 0) return SHELL_STATUS_BAD_ARGS;   // no BEGIN
+    uint16_t n = sr_remaining(args);
+    if ((uint32_t)g_file_wr_len + n > STORE_DATA_MAX) return SHELL_STATUS_BAD_ARGS;
+    sr_bytes(args, &g_rec_data[g_file_wr_slot][g_file_wr_len], n);
+    if (args->overflow) return SHELL_STATUS_BAD_ARGS;
+    g_file_wr_len = (uint16_t)(g_file_wr_len + n);
+    return SHELL_STATUS_OK;
+}
+
+// ---------- CMD_FILE_COMMIT ----------------------------------------------
+// args:   (none)   result: empty   status: OK / BAD_ARGS
+// Publishes the staged length, marks dirty, and queues the flash commit for
+// i2c_store_service (main loop). Returns immediately; the write is deferred.
+static uint8_t cmd_file_commit(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
+    if (g_file_wr_slot < 0)      return SHELL_STATUS_BAD_ARGS;   // no BEGIN
+    g_rec_len[g_file_wr_slot]   = (uint8_t)g_file_wr_len;
+    g_rec_dirty[g_file_wr_slot] = true;
+    g_commit_pending            = (int8_t)g_file_wr_slot;
+    g_file_wr_slot = -1;
+    return SHELL_STATUS_OK;
+}
+
+// ---------- CMD_FILE_LIST ------------------------------------------------
+// args:   (none)
+// result: count:u8 then per used slot {name[4], len:u8}  (<=16*5 = 80 B)
+static uint8_t cmd_file_list(shell_reader_t* args, shell_writer_t* result) {
+    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < STORE_SLOTS; i++) if (g_rec_used[i]) count++;
+    sw_u8(result, count);
+    for (uint8_t i = 0; i < STORE_SLOTS; i++) {
+        if (!g_rec_used[i]) continue;
+        sw_bytes(result, g_rec_name[i], STORE_NAME_LEN);
+        sw_u8(result, g_rec_len[i]);
+    }
+    return result->overflow ? SHELL_STATUS_RESULT_TOO_BIG : SHELL_STATUS_OK;
+}
 #endif // I2C_CLIENT
 
 // --- low-level helpers --------------------------------------------------
@@ -2757,6 +2835,12 @@ static const shell_cmd_entry_t g_chip_commands[] = {
     { CMD_I2C_READ,            "i2c_read",           cmd_i2c_read           },
     { CMD_I2C_WRITE_READ,      "i2c_write_read",     cmd_i2c_write_read     },
     { CMD_I2C_SCAN,            "i2c_scan",           cmd_i2c_scan           },
+#ifdef I2C_CLIENT
+    { CMD_FILE_BEGIN,          "file_begin",         cmd_file_begin         },
+    { CMD_FILE_DATA,           "file_data",          cmd_file_data          },
+    { CMD_FILE_COMMIT,         "file_commit",        cmd_file_commit        },
+    { CMD_FILE_LIST,           "file_list",          cmd_file_list          },
+#endif
 #endif
 #if !defined(ROLE_BUS_CONTROLLER)
     { CMD_TEST_HANG,           "test_hang",          cmd_test_hang          },
