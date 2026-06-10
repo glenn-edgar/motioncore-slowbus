@@ -10,7 +10,8 @@ per class); everything per-unit lives in the SAMD21 FS.
 
 The SAMD21 flash holds (named CBOR files):
 - **the Pico's RS-485 address** (the Pico reads this — it's the bus node),
-- the **SAMD21's own I2C address** (stored, but defaults to the class well-known value),
+- the **I2C profile** (bus params — *not* the address; the I2C address is **fixed
+  per class at compile time**, never commissioned, so the Pico always finds it),
 - `instance_id`, **site config**, other hardware-specific data.
 
 The **2 GPIO are input straps**, *not* stored config: the SAMD21 **samples** them at
@@ -92,10 +93,11 @@ stores it; the Pico consumes it to configure its RS-485 node).
 
 ## Bootstrapping & failure modes (new — boot order is load-bearing)
 1. **I2C address — fixed well-known per class (resolved).** One SAMD21 per Pico, so
-   the Pico talks to it at the **class well-known I2C address** (compile-time
-   default) — **no scan**. The address is still stored in flash for completeness/
-   override, but the Pico never has to discover it. (The SAMD21 reads its own FS at
-   boot before serving I2C — it owns the flash, no race.)
+   the Pico talks to it at the **class well-known I2C address** (compile-time) —
+   **no scan**. The address is **fixed per class, never commissioned away**, so the
+   Pico always finds it. Commissioning's **I2C profile** covers *other* params (e.g.
+   bus speed), never the address. (The SAMD21 reads its own FS at boot before serving
+   I2C — it owns the flash, no race.)
 2. **Blank / uncommissioned FS** (fresh unit, no `addr` file) → the Pico gets no
    RS-485 address → it must **stay off the bus** (no negotiation) and signal
    "uncommissioned", never default to an address that could collide.
@@ -149,8 +151,9 @@ wins) and stay on the **USB/main-loop path only** — never during an I2C/RS-485
 transaction (SAMD21 stalls the CPU on NVM write/erase; no RWW).
 
 ## Commissioning, power-on config & the lock flag
-Commissioning (Pi over USB-CDC) writes the unit's **I2C address** and its
-**power-on configuration**, then optionally **locks** it.
+Commissioning (Pi over USB-CDC) writes the unit's **I2C profile** (bus params —
+*not* the address, which is fixed per class) and its **power-on configuration**,
+then optionally **locks** it.
 
 - **Power-on configuration.** Today `register_dongle_load_commissioning()` runs at
   boot, but the **mode is not persisted** (`g_mode` starts `MODE_IDLE`,
