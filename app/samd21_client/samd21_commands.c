@@ -876,7 +876,7 @@ static void i2c_init(void) {
 #define I2C_CLIENT_VERSION      0x01u
 #define I2C_CLIENT_ADDR_DEFAULT 0x55u   // 7-bit; M2c makes this come from the store
 
-enum { MODE_IDLE = 0, MODE_PIO, MODE_ADC, MODE_MIXED, MODE_SERVO, MODE_MAX = MODE_SERVO };
+enum { MODE_IDLE = 0, MODE_PIO, MODE_ADC, MODE_MIXED, MODE_SERVO, MODE_COUNTER, MODE_MAX = MODE_COUNTER };
 
 static volatile uint8_t i2c_reg_ptr;        // register address pointer
 static volatile bool    i2c_reg_ptr_known;  // first write byte after addr = the pointer
@@ -1947,6 +1947,207 @@ static void servo_reg_write(uint8_t reg, uint8_t val) {
     }
 }
 
+// ============================================================================
+// COUNTER mode — 9 software edge counters sampled by a 1 kHz timer ISR (TC5).
+//
+// Each TC5 tick (1 ms) reads all 9 channel pins, detects edges vs the previous
+// sample, and increments per-channel u32 counters on the configured edge. Max
+// reliable input is 500 Hz (Nyquist of the 1 kHz sampler). Pure input mode —
+// no interlock, no INT (D6/CH8 is just a 9th counter). Mirrors the Pico's
+// pulse_sample_1khz (a 1 kHz-sampled software edge counter; zero PIO/EIC).
+//
+// TC5 shares GCLK_ID 28 with TC4 (servo), but is a separate peripheral; TC4 is
+// idle in counter mode. Same 750 kHz tick as servo (DIV64 off the 48 MHz GCLK0),
+// so 1 ms = 750 ticks -> CC0=750 with MFRQ wavegen (CC0=TOP, auto-reset). Only
+// the MC0 interrupt is used (no CC1).
+//
+// Mode-bank registers (0x10-0x1A), dispatched only while MODE_COUNTER:
+//   0x10 CH_SEL       (rw)  channel 0..8 selected for the COUNT window
+//   0x11-0x14 COUNT   (r)   u32 of selected channel (coherent snapshot on 0x11)
+//   0x15-0x18 COUNT_RDCLR (r) same, but 0x15 also atomically zeroes the channel
+//   0x19 EDGE         (rw)  0=rising 1=falling 2=both for the selected channel
+//   0x1A CLEAR        (w)   0xFF -> zero all 9; else zero the selected channel
+// ============================================================================
+#define COUNTER_CH_COUNT    9u
+
+#define REG_COUNTER_CH_SEL      0x10u
+#define REG_COUNTER_COUNT0      0x11u   // 0x11..0x14 -> u32 bytes 0..3 (snapshot on 0x11)
+#define REG_COUNTER_COUNT3      0x14u
+#define REG_COUNTER_RDCLR0      0x15u   // 0x15..0x18 -> u32 bytes 0..3 (snapshot+clear on 0x15)
+#define REG_COUNTER_RDCLR3      0x18u
+#define REG_COUNTER_EDGE        0x19u
+#define REG_COUNTER_CLEAR       0x1Au
+
+// Channel index -> (port group, pin). SAME pins as the servo bank.
+// CH0 D0 PA02  CH1 D1 PA04  CH2 D2 PA10  CH3 D3 PA11  CH4 D7 PB09
+// CH5 D8 PA07  CH6 D9 PA05  CH7 D10 PA06  CH8 D6 PB08
+static const struct { uint8_t group; uint8_t pin; } g_counter_pad[COUNTER_CH_COUNT] = {
+    {0,  2}, {0,  4}, {0, 10}, {0, 11}, {1,  9},
+    {0,  7}, {0,  5}, {0,  6}, {1,  8},
+};
+
+static volatile uint32_t g_counter[COUNTER_CH_COUNT];   // running totals (ISR is sole writer)
+static uint16_t g_counter_last;                         // last sampled 9-bit level bitmap (bit ch)
+static uint8_t  g_counter_edge[COUNTER_CH_COUNT];       // 0=rising 1=falling 2=both (default rising)
+static uint32_t g_counter_shadow[COUNTER_CH_COUNT];     // coherent read snapshot (taken on byte 0)
+static uint8_t  g_counter_ch_sel;                       // selected channel for the COUNT window
+
+static bool g_counter_tc_initialized;                   // TC5 GCLK/APBC wired once
+
+// Read the live 9-bit level bitmap: bit ch = current level of channel ch's pin.
+static inline uint16_t counter_sample_now(void) {
+    uint16_t now = 0u;
+    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++)
+        if (PORT->Group[g_counter_pad[ch].group].IN.reg & (1u << g_counter_pad[ch].pin))
+            now |= (uint16_t)(1u << ch);
+    return now;
+}
+
+// ---- TC5 timebase (mirrors the TC4 servo engine: MFRQ CC0=TOP, SYNCBUSY spins) --
+static void counter_tc_init_once(void) {
+    if (g_counter_tc_initialized) return;
+    PM->APBCMASK.reg |= PM_APBCMASK_TC5;
+    GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(TC5_GCLK_ID)   // TC5_GCLK_ID == TC4_GCLK_ID (28)
+                                 | GCLK_CLKCTRL_GEN_GCLK0
+                                 | GCLK_CLKCTRL_CLKEN);
+    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    g_counter_tc_initialized = true;
+}
+
+static void counter_tc_stop(void) {
+    NVIC_DisableIRQ(TC5_IRQn);
+    TC5->COUNT16.INTENCLR.reg = TC_INTENCLR_MC0;
+    TC5->COUNT16.CTRLA.bit.ENABLE = 0;
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+}
+
+static void counter_tc_start(void) {
+    // Reset.
+    TC5->COUNT16.CTRLA.bit.SWRST = 1;
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    while (TC5->COUNT16.CTRLA.bit.SWRST)     { /* spin */ }
+
+    // 16-bit count, MFRQ wavegen (CC0=TOP and resets the counter), /64 prescaler.
+    // 48 MHz / 64 = 750 kHz tick; 1 ms (1 kHz) = 750 ticks -> CC0=750.
+    TC5->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16
+                           | TC_CTRLA_WAVEGEN_MFRQ
+                           | TC_CTRLA_PRESCALER_DIV64;
+    TC5->COUNT16.CC[0].reg = 750u;                                // 1 ms tick
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+
+    TC5->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;                    // clear stale
+    TC5->COUNT16.INTENSET.reg = TC_INTENSET_MC0;                  // 1 kHz sampler tick
+    NVIC_EnableIRQ(TC5_IRQn);
+
+    TC5->COUNT16.CTRLA.bit.ENABLE = 1;
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+}
+
+// Configure all 9 counter pins as GPIO inputs (no pull). Mirrors cmd_gpio_config's
+// input path (clear PMUXEN, DIRCLR, set INEN; clear PULLEN -> floating input).
+static void counter_pins_input(void) {
+    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
+        uint8_t g = g_counter_pad[ch].group, p = g_counter_pad[ch].pin;
+        PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+        PORT->Group[g].DIRCLR.reg = (1u << p);
+        PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;          // input, no pull
+    }
+}
+
+// Entering MODE_COUNTER: pins -> GPIO inputs, seed last-level (no phantom first
+// edge), zero counters + shadow, start TC5.
+static void counter_enter(void) {
+    counter_tc_init_once();
+    counter_pins_input();
+    g_counter_last = counter_sample_now();                       // seed: no edge on first tick
+    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
+        g_counter[ch]        = 0u;
+        g_counter_shadow[ch] = 0u;
+    }
+    counter_tc_start();
+}
+
+// Leaving MODE_COUNTER: stop TC5 (masks IRQ); pins stay inputs (safe).
+static void counter_exit(void) {
+    counter_tc_stop();
+}
+
+// TC5 ISR — the 1 kHz sampler. Reads all 9 pins, detects edges vs the previous
+// sample, and increments the per-channel counter on the configured edge. Bounded
+// + fast: one IN read + a 9-iteration loop, no blocking. Mirrors pulse_sample_1khz.
+void TC5_Handler(void) {
+    if (!TC5->COUNT16.INTFLAG.bit.MC0) return;
+    TC5->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
+
+    uint16_t now     = counter_sample_now();
+    uint16_t changed = now ^ g_counter_last;
+    uint16_t rose    = changed & now;             // 0 -> 1
+    uint16_t fell    = changed & (uint16_t)~now;  // 1 -> 0
+    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
+        uint16_t bit = (uint16_t)(1u << ch);
+        if ((g_counter_edge[ch] == 0u && (rose    & bit)) ||
+            (g_counter_edge[ch] == 1u && (fell    & bit)) ||
+            (g_counter_edge[ch] == 2u && (changed & bit)))
+            g_counter[ch]++;
+    }
+    g_counter_last = now;
+}
+
+// COUNTER mode-bank register access (0x10-0x1A), dispatched only while MODE_COUNTER.
+// The u32 COUNT / COUNT_RDCLR windows are read as 4 consecutive byte addresses.
+// To avoid a torn u32 mid-read, byte 0 (0x11 / 0x15) takes a coherent snapshot of
+// the live counter into g_counter_shadow[sel] under a brief TC5-IRQ mask; bytes
+// 1..3 just return shadow bytes 1..3. RDCLR additionally zeroes the live counter
+// inside the same masked region (read-and-clear, no edges lost — edges between the
+// snapshot and the next ISR tick count toward the next read).
+static uint8_t counter_reg_read(uint8_t reg) {
+    uint8_t sel = (g_counter_ch_sel < COUNTER_CH_COUNT) ? g_counter_ch_sel : 0u;
+    switch (reg) {
+    case REG_COUNTER_CH_SEL: return g_counter_ch_sel;
+    case REG_COUNTER_COUNT0:                                      // snapshot live -> shadow
+        NVIC_DisableIRQ(TC5_IRQn);
+        g_counter_shadow[sel] = g_counter[sel];
+        if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
+        return (uint8_t)g_counter_shadow[sel];
+    case 0x12u:              return (uint8_t)(g_counter_shadow[sel] >> 8);
+    case 0x13u:              return (uint8_t)(g_counter_shadow[sel] >> 16);
+    case REG_COUNTER_COUNT3: return (uint8_t)(g_counter_shadow[sel] >> 24);
+    case REG_COUNTER_RDCLR0:                                      // snapshot + atomic clear
+        NVIC_DisableIRQ(TC5_IRQn);
+        g_counter_shadow[sel] = g_counter[sel];
+        g_counter[sel]        = 0u;
+        if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
+        return (uint8_t)g_counter_shadow[sel];
+    case 0x16u:             return (uint8_t)(g_counter_shadow[sel] >> 8);
+    case 0x17u:             return (uint8_t)(g_counter_shadow[sel] >> 16);
+    case REG_COUNTER_RDCLR3:return (uint8_t)(g_counter_shadow[sel] >> 24);
+    case REG_COUNTER_EDGE:  return g_counter_edge[sel];
+    default:                return 0xFFu;                         // CLEAR is write-only
+    }
+}
+static void counter_reg_write(uint8_t reg, uint8_t val) {
+    uint8_t sel = (g_counter_ch_sel < COUNTER_CH_COUNT) ? g_counter_ch_sel : 0u;
+    switch (reg) {
+    case REG_COUNTER_CH_SEL:
+        if (val < COUNTER_CH_COUNT) g_counter_ch_sel = val;      // out-of-range clamped (ignored)
+        break;
+    case REG_COUNTER_EDGE:
+        if (val > 2u) val = 2u;                                  // clamp to 0..2
+        g_counter_edge[sel] = val;
+        break;
+    case REG_COUNTER_CLEAR:                                      // 0xFF -> all; else selected
+        NVIC_DisableIRQ(TC5_IRQn);
+        if (val == 0xFFu) {
+            for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) g_counter[ch] = 0u;
+        } else {
+            g_counter[sel] = 0u;
+        }
+        if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
+        break;
+    default: break;                                             // read-only / unimplemented ignored
+    }
+}
+
 // Register read dispatch (control bank). Out-of-range -> 0xFF.
 static uint8_t i2c_reg_read(uint8_t reg) {
     if (reg >= 0x10u && reg <= 0x3Fu) {                  // mode bank — interpreted per active mode
@@ -1954,6 +2155,7 @@ static uint8_t i2c_reg_read(uint8_t reg) {
         if (g_mode == MODE_ADC) return adc_reg_read(reg);
         if (g_mode == MODE_MIXED) return mixed_reg_read(reg);
         if (g_mode == MODE_SERVO) return servo_reg_read(reg);
+        if (g_mode == MODE_COUNTER) return counter_reg_read(reg);
         return 0xFFu;
     }
     switch (reg) {
@@ -1989,6 +2191,7 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
         else if (g_mode == MODE_ADC) adc_reg_write(reg, val);
         else if (g_mode == MODE_MIXED) mixed_reg_write(reg, val);
         else if (g_mode == MODE_SERVO) servo_reg_write(reg, val);
+        else if (g_mode == MODE_COUNTER) counter_reg_write(reg, val);
         return;
     }
     switch (reg) {
@@ -2009,6 +2212,10 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
                 servo_exit();                              // stop TC4, drive all servo pins low
                 DAC->CTRLB.bit.EOEN = 1;                   // restore DAC output buffer on PA02 (CH0)
                 while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+            } else if (g_mode == MODE_COUNTER) {           // leaving COUNTER
+                counter_exit();                            // stop TC5 (pins stay inputs, safe)
+                DAC->CTRLB.bit.EOEN = 1;                   // restore DAC output buffer on PA02 (CH0)
+                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
             }
             g_mode = val;
             if (val == MODE_PIO) {                         // entering PIO
@@ -2024,6 +2231,10 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
                 DAC->CTRLB.bit.EOEN = 0;                   // free CH0=PA02 from the DAC (else it pins CH0 low)
                 while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
                 servo_enter();                             // pins->GPIO low, build schedule, start TC4
+            } else if (val == MODE_COUNTER) {              // entering COUNTER
+                DAC->CTRLB.bit.EOEN = 0;                   // free CH0=PA02 from the DAC so it reads as input
+                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+                counter_enter();                           // pins->GPIO inputs, seed last, zero, start TC5
             }
         }
         break;
