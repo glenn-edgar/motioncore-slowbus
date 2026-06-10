@@ -923,8 +923,21 @@ extern uint8_t crc8_autosar_update(uint8_t crc, uint8_t byte);   // libcomm
 #define REG_REC_CTRL   0x44u
 #define REG_STORE_STAT 0x45u
 #define REG_SET_ADDR   0x0Fu   // control-bank: magic-guarded address commissioning (data-port)
+
+// FILE bank (0x50..0x55) — name-keyed, read-only-for-master config-file access.
+// Lives in the MAIN switch so it's available in every mode (the Pico reads
+// config regardless of the active HIL mode). LIST enumerates; OPEN+SIZE+DATA
+// reads a known file by name. File writing is the USB path (a later step).
+#define REG_FILE_NAME  0x50u   // rw, data-port: burst the 4-byte name in/out
+#define REG_FILE_CTRL  0x51u   // w: 1=OPEN 2=CLOSE 3=LIST_FIRST 4=LIST_NEXT
+#define REG_FILE_STAT  0x52u   // r: 0=OK (open) 1=NOT_FOUND (closed)
+#define REG_FILE_SIZE  0x53u   // r: open file length (≤240, u8)
+#define REG_FILE_SEEK  0x54u   // w: set read cursor
+#define REG_FILE_DATA  0x55u   // r, data-port: next file byte (0xFF past EOF)
+
 // Registers the master bursts -> the ISR must NOT advance the register pointer.
-#define IS_DATA_PORT(r) ((r) == REG_REC_DATA || (r) == REG_SET_ADDR)
+#define IS_DATA_PORT(r) ((r) == REG_REC_DATA || (r) == REG_SET_ADDR \
+                      || (r) == REG_FILE_NAME || (r) == REG_FILE_DATA)
 
 typedef struct {
     uint32_t magic;                  // STORE_ENTRY_MAGIC
@@ -951,6 +964,13 @@ static volatile bool   g_reset_pending;                  // soft-reset request (
 static bool            g_setaddr_armed;                  // SET_ADDR magic seen, awaiting the new addr
 static uint8_t  g_store_rec_sel;                         // selected SLOT index (0..STORE_SLOTS-1)
 static uint8_t  g_store_rec_off;
+
+// FILE bank state — name-keyed read-only access for the I2C master (Pico).
+static uint8_t  g_file_name[STORE_NAME_LEN];             // burst-built name key
+static uint8_t  g_file_name_idx;                         // 0..3, name burst cursor
+static int      g_file_slot = -1;                        // open slot, -1 = closed/not-found
+static uint8_t  g_file_off;                              // read cursor into the open file
+static uint8_t  g_file_list_i;                           // LIST iterator cursor over slots
 
 // NVM primitives (PAGE=64, ROW=256, ADDR = byte/2). Mirrors flash_storage.c.
 static void cs_nvm_wait(void) { while (NVMCTRL->INTFLAG.bit.READY == 0) { /* spin */ } }
@@ -2226,8 +2246,40 @@ static uint8_t i2c_reg_read(uint8_t reg) {
     }
     case REG_STORE_STAT: return g_status;
     case REG_SET_ADDR:   return 0u;
+    // FILE bank (name-keyed, read-only). FILE_NAME/FILE_DATA are data-ports:
+    // they advance their own cursor, not the register pointer (see IS_DATA_PORT).
+    case REG_FILE_NAME: {                             // data port: read back the name byte, advance
+        uint8_t v = g_file_name[g_file_name_idx];
+        g_file_name_idx = (uint8_t)((g_file_name_idx + 1u) & 3u);
+        return v;
+    }
+    case REG_FILE_STAT: return (g_file_slot >= 0) ? 0u : 1u;
+    case REG_FILE_SIZE: return (g_file_slot >= 0) ? g_rec_len[g_file_slot] : 0u;
+    case REG_FILE_DATA:                               // data port: next file byte, advance cursor
+        if (g_file_slot >= 0 && g_file_off < g_rec_len[g_file_slot])
+            return g_rec_data[g_file_slot][g_file_off++];
+        return 0xFFu;
     default:   return 0xFFu;
     }
+}
+
+// LIST helper: advance g_file_list_i to the next USED slot from its current
+// value, then publish that slot (or -1 when exhausted) + its name into the
+// FILE bank state. `from_start` resets the cursor to slot 0 first.
+static void file_list_advance(bool from_start) {
+    uint8_t i = from_start ? 0u : (uint8_t)(g_file_list_i + 1u);
+    for (; i < STORE_SLOTS; i++) {
+        if (g_rec_used[i]) break;
+    }
+    g_file_list_i = i;
+    if (i < STORE_SLOTS) {
+        g_file_slot = (int)i;
+        memcpy(g_file_name, g_rec_name[i], STORE_NAME_LEN);
+    } else {
+        g_file_slot = -1;
+    }
+    g_file_name_idx = 0u;
+    g_file_off = 0u;
 }
 
 // Register write dispatch. Read-only / unimplemented regs are ignored.
@@ -2325,6 +2377,24 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
             }
         }
         break;
+    // FILE bank (name-keyed, read-only for the master).
+    case REG_FILE_NAME:                                   // data port: burst the 4-byte name in
+        g_file_name[g_file_name_idx] = val;
+        g_file_name_idx = (uint8_t)((g_file_name_idx + 1u) & 3u);
+        break;
+    case REG_FILE_CTRL:
+        if (val == 0x01u) {                               // OPEN by name
+            g_file_slot = store_find(g_file_name);
+            g_file_off = 0u; g_file_name_idx = 0u;
+        } else if (val == 0x02u) {                        // CLOSE
+            g_file_slot = -1;
+        } else if (val == 0x03u) {                        // LIST_FIRST
+            file_list_advance(true);
+        } else if (val == 0x04u) {                        // LIST_NEXT
+            file_list_advance(false);
+        }
+        break;
+    case REG_FILE_SEEK: if (val <= STORE_DATA_MAX) g_file_off = val; break;
     default:   break;
     }
 }
