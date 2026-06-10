@@ -1,0 +1,2 @@
+pyserial>=3.5      # USB-CDC (ttyACM) link to the SAMD21
+cbor2>=5.6         # JSON -> canonical CBOR for the config files
