@@ -26,3 +26,7 @@ reference/
 # Static/shared lib artifacts
 *.a
 *.so
+
+# Python bytecode
+__pycache__/
+*.pyc
