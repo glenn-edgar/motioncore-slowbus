@@ -896,25 +896,24 @@ static void i2c_read_unique_id(void) {
     g_unique_id[6] = (uint8_t)(w1 >> 16); g_unique_id[7] = (uint8_t)(w1 >> 24);
 }
 
-// ---- M2b: log-structured, wear-leveled config store ------------------------
-// 32 rows (8 KB) just below the commission A/B slots (0x3FE00). Each commit
-// appends a 256-B entry to a round-robin NON-LIVE row; latest seq per record
-// wins on read; CRC-8 guards torn writes (power-safe). RAM-shadowed; the flash
-// write (~ms) is deferred to the main loop (i2c_store_service) so the I2C ISR
-// stays fast. Write-coalescing skips a commit whose bytes are unchanged.
+// ---- M2b: log-structured, wear-leveled NAME-KEYED config store -------------
+// 256 rows (64 KB) just below the commission A/B slots (0x3FE00). Each commit
+// appends a 256-B entry to a round-robin NON-LIVE row; latest seq per NAME
+// wins on read; CRC-8 guards torn writes (power-safe). RAM-shadowed into a
+// fixed bank of slots (each slot = one 4-char name); the flash write (~ms) is
+// deferred to the main loop (i2c_store_service) so the I2C ISR stays fast.
+// Write-coalescing skips a commit whose bytes are unchanged. This is the
+// foundation for a named-file config filesystem (4-char names).
 extern uint8_t crc8_autosar_update(uint8_t crc, uint8_t byte);   // libcomm
 
-#define STORE_ROWS        32u
+#define STORE_ROWS        256u
 #define STORE_ROW_SIZE    256u
 #define STORE_PAGE_SIZE   64u
-#define STORE_BASE        (0x3FE00u - STORE_ROWS * STORE_ROW_SIZE)  // 0x3DE00
+#define STORE_BASE        (0x3FE00u - STORE_ROWS * STORE_ROW_SIZE)  // 0x2FE00
 #define STORE_ENTRY_MAGIC 0x10C0FFEEu
-#define REC_COUNT         6u
-#define REC_DATA_MAX      244u
-
-// record ids (REG_REC_SEL)
-enum { REC_IDENTITY = 0, REC_CLASS_INSTANCE, REC_BUS_ROSTER,
-       REC_HW_CONFIG, REC_INTERLOCK_CFG, REC_CALIBRATION };
+#define STORE_NAME_LEN    4u
+#define STORE_DATA_MAX    240u
+#define STORE_SLOTS       16u    // RAM-shadow cap: at most 16 distinct names live
 
 // store-window register addresses
 #define REG_REC_SEL    0x40u
@@ -928,25 +927,29 @@ enum { REC_IDENTITY = 0, REC_CLASS_INSTANCE, REC_BUS_ROSTER,
 #define IS_DATA_PORT(r) ((r) == REG_REC_DATA || (r) == REG_SET_ADDR)
 
 typedef struct {
-    uint32_t magic;      // STORE_ENTRY_MAGIC
-    uint32_t seq;        // monotonic; highest per rec_id wins
-    uint8_t  rec_id;
+    uint32_t magic;                  // STORE_ENTRY_MAGIC
+    uint32_t seq;                    // monotonic; highest per name wins
+    uint8_t  name[STORE_NAME_LEN];   // 4-char key (space/zero padded)
     uint8_t  len;
-    uint8_t  crc;        // crc8_autosar(rec_id, len, data[len])
-    uint8_t  pad;
-    uint8_t  data[REC_DATA_MAX];
-} store_entry_t;         // 256 B = 1 flash row
+    uint8_t  crc;                    // crc8_autosar(name[4], len, data[len])
+    uint8_t  pad[2];
+    uint8_t  data[STORE_DATA_MAX];
+} store_entry_t;                     // 256 B = 1 flash row
+_Static_assert(sizeof(store_entry_t) == 256, "store_entry_t must be exactly one 256-B flash row");
 
-static uint8_t  g_rec_data[REC_COUNT][REC_DATA_MAX];  // working / shadow copies
-static uint8_t  g_rec_len[REC_COUNT];
-static uint32_t g_rec_seq[REC_COUNT];                  // 0 = none committed
-static int16_t  g_rec_row[REC_COUNT];                  // flash row of current entry, -1 none
-static bool     g_rec_dirty[REC_COUNT];
-static uint16_t g_store_wr_cursor;                     // round-robin write cursor
-static volatile int8_t g_commit_pending = -1;          // rec id to commit (ISR -> main loop)
-static volatile bool   g_reset_pending;                // soft-reset request (ISR -> main loop)
-static bool            g_setaddr_armed;                // SET_ADDR magic seen, awaiting the new addr
-static uint8_t  g_store_rec_sel;
+// Per-slot RAM shadow. A slot is in use once a name has been bound to it.
+static uint8_t  g_rec_name[STORE_SLOTS][STORE_NAME_LEN]; // 4-char key
+static bool     g_rec_used[STORE_SLOTS];                 // slot bound to a name
+static uint8_t  g_rec_data[STORE_SLOTS][STORE_DATA_MAX]; // working / shadow copies
+static uint8_t  g_rec_len[STORE_SLOTS];
+static uint32_t g_rec_seq[STORE_SLOTS];                  // 0 = none committed
+static int16_t  g_rec_row[STORE_SLOTS];                  // flash row of current entry, -1 none
+static bool     g_rec_dirty[STORE_SLOTS];
+static uint16_t g_store_wr_cursor;                       // round-robin write cursor
+static volatile int8_t g_commit_pending = -1;            // slot index to commit (ISR -> main loop)
+static volatile bool   g_reset_pending;                  // soft-reset request (ISR -> main loop)
+static bool            g_setaddr_armed;                  // SET_ADDR magic seen, awaiting the new addr
+static uint8_t  g_store_rec_sel;                         // selected SLOT index (0..STORE_SLOTS-1)
 static uint8_t  g_store_rec_off;
 
 // NVM primitives (PAGE=64, ROW=256, ADDR = byte/2). Mirrors flash_storage.c.
@@ -975,48 +978,85 @@ static void cs_nvm_write_page(uint32_t addr, const void *data, uint32_t bytes) {
 static const store_entry_t *store_row(uint16_t row) {
     return (const store_entry_t *)(uintptr_t)(STORE_BASE + (uint32_t)row * STORE_ROW_SIZE);
 }
-static uint8_t store_crc(uint8_t rec_id, uint8_t len, const uint8_t *data) {
-    uint8_t c = crc8_autosar_update(0xFFu, rec_id);
+static uint8_t store_crc(const uint8_t name[STORE_NAME_LEN], uint8_t len, const uint8_t *data) {
+    uint8_t c = 0xFFu;
+    for (uint8_t i = 0; i < STORE_NAME_LEN; i++) c = crc8_autosar_update(c, name[i]);
     c = crc8_autosar_update(c, len);
     for (uint8_t i = 0; i < len; i++) c = crc8_autosar_update(c, data[i]);
     return (uint8_t)(c ^ 0xFFu);
 }
 static bool store_entry_valid(const store_entry_t *e) {
-    return e->magic == STORE_ENTRY_MAGIC && e->rec_id < REC_COUNT && e->len <= REC_DATA_MAX
-        && store_crc(e->rec_id, e->len, e->data) == e->crc;
+    return e->magic == STORE_ENTRY_MAGIC && e->name[0] != 0xFFu && e->len <= STORE_DATA_MAX
+        && store_crc(e->name, e->len, e->data) == e->crc;
 }
 
-// Boot scan: load the latest valid entry per record into RAM.
+// Slot lookup: index of a USED slot whose name matches, else -1.
+static int store_find(const uint8_t name[STORE_NAME_LEN]) {
+    for (uint8_t i = 0; i < STORE_SLOTS; i++)
+        if (g_rec_used[i] && memcmp(g_rec_name[i], name, STORE_NAME_LEN) == 0) return (int)i;
+    return -1;
+}
+// Get the slot for `name`, allocating a free one if needed. -1 if the bank is full.
+static int store_alloc(const uint8_t name[STORE_NAME_LEN]) {
+    int s = store_find(name);
+    if (s >= 0) return s;
+    for (uint8_t i = 0; i < STORE_SLOTS; i++) {
+        if (!g_rec_used[i]) {
+            g_rec_used[i] = true;
+            memcpy(g_rec_name[i], name, STORE_NAME_LEN);
+            g_rec_len[i] = 0; g_rec_seq[i] = 0; g_rec_row[i] = -1; g_rec_dirty[i] = false;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+// Convenience: build a 4-byte name from a C string (space-pad / truncate to 4).
+static int store_find_str(const char *s4) {
+    uint8_t name[STORE_NAME_LEN];
+    for (uint8_t i = 0; i < STORE_NAME_LEN; i++) name[i] = (s4[i] != '\0') ? (uint8_t)s4[i] : (uint8_t)' ';
+    return store_find(name);
+}
+static int store_alloc_str(const char *s4) {
+    uint8_t name[STORE_NAME_LEN];
+    for (uint8_t i = 0; i < STORE_NAME_LEN; i++) name[i] = (s4[i] != '\0') ? (uint8_t)s4[i] : (uint8_t)' ';
+    return store_alloc(name);
+}
+
+// Boot scan: load the latest valid entry per name into a RAM slot.
 static void store_load(void) {
-    for (uint8_t i = 0; i < REC_COUNT; i++) {
+    for (uint8_t i = 0; i < STORE_SLOTS; i++) {
+        g_rec_used[i] = false;
         g_rec_seq[i] = 0; g_rec_len[i] = 0; g_rec_row[i] = -1; g_rec_dirty[i] = false;
     }
     for (uint16_t r = 0; r < STORE_ROWS; r++) {
         const store_entry_t *e = store_row(r);
         if (!store_entry_valid(e)) continue;
-        if (e->seq > g_rec_seq[e->rec_id]) {
-            g_rec_seq[e->rec_id] = e->seq;
-            g_rec_len[e->rec_id] = e->len;
-            g_rec_row[e->rec_id] = (int16_t)r;
-            memcpy(g_rec_data[e->rec_id], e->data, e->len);
+        int slot = store_alloc(e->name);
+        if (slot < 0) continue;                 // RAM-shadow cap: >STORE_SLOTS distinct names on flash
+        if (e->seq > g_rec_seq[slot]) {
+            g_rec_seq[slot] = e->seq;
+            g_rec_len[slot] = e->len;
+            g_rec_row[slot] = (int16_t)r;
+            memcpy(g_rec_data[slot], e->data, e->len);
         }
     }
     g_store_wr_cursor = 0;
 }
 
 static bool store_row_live(uint16_t r) {
-    for (uint8_t i = 0; i < REC_COUNT; i++) if (g_rec_row[i] == (int16_t)r) return true;
+    for (uint8_t i = 0; i < STORE_SLOTS; i++)
+        if (g_rec_used[i] && g_rec_row[i] == (int16_t)r) return true;
     return false;
 }
 
-// Append record `id`'s working copy to flash (round-robin non-live row).
-static bool store_commit(uint8_t id) {
-    if (id >= REC_COUNT) return false;
+// Append slot `slot`'s working copy to flash (round-robin non-live row).
+static bool store_commit(uint8_t slot) {
+    if (slot >= STORE_SLOTS || !g_rec_used[slot]) return false;
     // coalesce: identical to the live entry -> skip the flash write.
-    if (g_rec_row[id] >= 0) {
-        const store_entry_t *cur = store_row((uint16_t)g_rec_row[id]);
-        if (cur->len == g_rec_len[id] && memcmp(cur->data, g_rec_data[id], g_rec_len[id]) == 0) {
-            g_rec_dirty[id] = false; return true;
+    if (g_rec_row[slot] >= 0) {
+        const store_entry_t *cur = store_row((uint16_t)g_rec_row[slot]);
+        if (cur->len == g_rec_len[slot] && memcmp(cur->data, g_rec_data[slot], g_rec_len[slot]) == 0) {
+            g_rec_dirty[slot] = false; return true;
         }
     }
     uint16_t picked = 0xFFFFu;
@@ -1024,17 +1064,17 @@ static bool store_commit(uint8_t id) {
         uint16_t rr = (uint16_t)((g_store_wr_cursor + n) % STORE_ROWS);
         if (!store_row_live(rr)) { picked = rr; break; }
     }
-    if (picked == 0xFFFFu) return false;   // impossible: rows > records
+    if (picked == 0xFFFFu) return false;   // impossible: rows > slots
     g_store_wr_cursor = (uint16_t)((picked + 1u) % STORE_ROWS);
 
     store_entry_t e;
     memset(&e, 0xFF, sizeof e);
     e.magic  = STORE_ENTRY_MAGIC;
-    e.seq    = g_rec_seq[id] + 1u;
-    e.rec_id = id;
-    e.len    = g_rec_len[id];
-    e.crc    = store_crc(id, e.len, g_rec_data[id]);
-    memcpy(e.data, g_rec_data[id], e.len);
+    e.seq    = g_rec_seq[slot] + 1u;
+    memcpy(e.name, g_rec_name[slot], STORE_NAME_LEN);
+    e.len    = g_rec_len[slot];
+    e.crc    = store_crc(e.name, e.len, g_rec_data[slot]);
+    memcpy(e.data, g_rec_data[slot], e.len);
 
     uint32_t addr = STORE_BASE + (uint32_t)picked * STORE_ROW_SIZE;
     cs_nvm_erase_row(addr);
@@ -1042,10 +1082,11 @@ static bool store_commit(uint8_t id) {
         cs_nvm_write_page(addr + p, (const uint8_t *)&e + p, STORE_PAGE_SIZE);
 
     const store_entry_t *chk = store_row(picked);
-    if (!store_entry_valid(chk) || chk->seq != e.seq || chk->rec_id != id) return false;
-    g_rec_seq[id] = e.seq;
-    g_rec_row[id] = (int16_t)picked;
-    g_rec_dirty[id] = false;
+    if (!store_entry_valid(chk) || chk->seq != e.seq ||
+        memcmp(chk->name, e.name, STORE_NAME_LEN) != 0) return false;
+    g_rec_seq[slot] = e.seq;
+    g_rec_row[slot] = (int16_t)picked;
+    g_rec_dirty[slot] = false;
     return true;
 }
 
@@ -1184,9 +1225,10 @@ static void pio_il_arm(void) {
     PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN;
     PORT->Group[PIO_INT_GROUP].DIRSET.reg = (1u << PIO_INT_PIN);
     g_pio_il_state = 0u;
-    if (g_rec_len[REC_INTERLOCK_CFG] > 0u) {
-        g_pio_il_pstat = (uint8_t)il_parse((const char*)g_rec_data[REC_INTERLOCK_CFG],
-                                           g_rec_len[REC_INTERLOCK_CFG], &g_pio_il, NULL);
+    int ils = store_find_str("ilcf");      // interlock-config named slot
+    if (ils >= 0 && g_rec_len[ils] > 0u) {
+        g_pio_il_pstat = (uint8_t)il_parse((const char*)g_rec_data[ils],
+                                           g_rec_len[ils], &g_pio_il, NULL);
         if (g_pio_il_pstat == (uint8_t)IL_PARSE_OK && g_pio_il.watch_count > 0u)
             g_pio_il_valid = true;
     } else {
@@ -1559,9 +1601,10 @@ static void mixed_il_arm(void) {
     memset(g_mixed_deb, 0, sizeof g_mixed_deb);
     memset(g_mixed_adc_val, 0, sizeof g_mixed_adc_val);
     g_mixed_gpio_raw = 0u; g_mixed_gpio_deb = 0u;
-    if (g_rec_len[REC_INTERLOCK_CFG] > 0u) {
-        g_mixed_il_pstat = (uint8_t)il_parse((const char*)g_rec_data[REC_INTERLOCK_CFG],
-                                             g_rec_len[REC_INTERLOCK_CFG], &g_mixed_il, NULL);
+    int ils = store_find_str("ilcf");      // interlock-config named slot
+    if (ils >= 0 && g_rec_len[ils] > 0u) {
+        g_mixed_il_pstat = (uint8_t)il_parse((const char*)g_rec_data[ils],
+                                             g_rec_len[ils], &g_mixed_il, NULL);
         if (g_mixed_il_pstat == (uint8_t)IL_PARSE_OK && g_mixed_il.watch_count > 0u) {
             // Claim the declared pins; only mark valid if every claim succeeds.
             if (mixed_claim_pins() == HAL_PIN_CLAIM_OK)
@@ -2168,14 +2211,17 @@ static uint8_t i2c_reg_read(uint8_t reg) {
     case 0x06: case 0x07: case 0x08: case 0x09:
     case 0x0A: case 0x0B: case 0x0C: case 0x0D:
         return g_unique_id[reg - 0x06u];
+    // NOTE: this register window is the legacy SLOT-indexed access path (sel =
+    // slot 0..STORE_SLOTS-1). A name-based open/read/write interface is a later
+    // step in the named-file-filesystem migration.
     case REG_REC_SEL:  return g_store_rec_sel;
-    case REG_REC_LEN:  return (g_store_rec_sel < REC_COUNT) ? g_rec_len[g_store_rec_sel] : 0u;
+    case REG_REC_LEN:  return (g_store_rec_sel < STORE_SLOTS) ? g_rec_len[g_store_rec_sel] : 0u;
     case REG_REC_OFF:  return g_store_rec_off;
     case REG_REC_DATA: {                              // data port: advances OFFSET, not reg ptr
         uint8_t v = 0xFFu;
-        if (g_store_rec_sel < REC_COUNT && g_store_rec_off < REC_DATA_MAX)
+        if (g_store_rec_sel < STORE_SLOTS && g_store_rec_off < STORE_DATA_MAX)
             v = g_rec_data[g_store_rec_sel][g_store_rec_off];
-        if (g_store_rec_off < REC_DATA_MAX) g_store_rec_off++;
+        if (g_store_rec_off < STORE_DATA_MAX) g_store_rec_off++;
         return v;
     }
     case REG_STORE_STAT: return g_status;
@@ -2244,20 +2290,23 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
         if ((val & MIXED_IL_INT_BIT) && g_mode == MODE_MIXED) mixed_il_manual_reset();
         break;
     case 0x0E: if (val == 0xA5u) g_reset_pending = true; break;  // RESET (magic 0xA5; deferred)
-    case REG_REC_SEL: if (val < REC_COUNT) { g_store_rec_sel = val; g_store_rec_off = 0u; } break;
-    case REG_REC_LEN: if (g_store_rec_sel < REC_COUNT && val <= REC_DATA_MAX) g_rec_len[g_store_rec_sel] = val; break;
+    // NOTE: SLOT-indexed legacy access path (sel = slot 0..STORE_SLOTS-1). The
+    // name-based open/read/write interface is a later migration step.
+    case REG_REC_SEL: if (val < STORE_SLOTS) { g_store_rec_sel = val; g_store_rec_off = 0u; } break;
+    case REG_REC_LEN: if (g_store_rec_sel < STORE_SLOTS && val <= STORE_DATA_MAX) g_rec_len[g_store_rec_sel] = val; break;
     case REG_REC_OFF: g_store_rec_off = val; break;
     case REG_REC_DATA:                                    // data port: write byte, grow len, advance offset
-        if (g_store_rec_sel < REC_COUNT && g_store_rec_off < REC_DATA_MAX) {
+        if (g_store_rec_sel < STORE_SLOTS && g_store_rec_off < STORE_DATA_MAX) {
             g_rec_data[g_store_rec_sel][g_store_rec_off] = val;
             if ((uint16_t)g_store_rec_off + 1u > g_rec_len[g_store_rec_sel])
                 g_rec_len[g_store_rec_sel] = (uint8_t)(g_store_rec_off + 1u);
             g_rec_dirty[g_store_rec_sel] = true;
         }
-        if (g_store_rec_off < REC_DATA_MAX) g_store_rec_off++;
+        if (g_store_rec_off < STORE_DATA_MAX) g_store_rec_off++;
         break;
     case REG_REC_CTRL:                                    // 0xC0 = commit selected, 0x5E = reload all
-        if (val == 0xC0u && g_store_rec_sel < REC_COUNT) g_commit_pending = (int8_t)g_store_rec_sel;
+        if (val == 0xC0u && g_store_rec_sel < STORE_SLOTS && g_rec_used[g_store_rec_sel])
+            g_commit_pending = (int8_t)g_store_rec_sel;
         else if (val == 0x5Eu) store_load();
         break;
     case REG_SET_ADDR:                                    // commissioning data-port: [0xAC magic][new_addr]
@@ -2266,10 +2315,13 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
         } else {
             g_setaddr_armed = false;
             if (val >= 0x08u && val <= 0x77u) {           // valid 7-bit address
-                g_rec_data[REC_IDENTITY][0] = val;        // identity record byte 0 = I2C address
-                if (g_rec_len[REC_IDENTITY] < 1u) g_rec_len[REC_IDENTITY] = 1u;
-                g_rec_dirty[REC_IDENTITY] = true;
-                g_commit_pending = (int8_t)REC_IDENTITY;  // persist; effective on next RESET
+                int s = store_alloc_str("idnt");          // identity named slot
+                if (s >= 0) {
+                    g_rec_data[s][0] = val;               // identity record byte 0 = I2C address
+                    if (g_rec_len[s] < 1u) g_rec_len[s] = 1u;
+                    g_rec_dirty[s] = true;
+                    g_commit_pending = (int8_t)s;         // persist; effective on next RESET
+                }
             }
         }
         break;
@@ -2281,14 +2333,15 @@ static void i2c_slave_init(void) {
     i2c_read_unique_id();   // for commissioning identification (UNIQUE_ID regs)
     store_load();           // scan the config log -> RAM shadow of each record
 
-    // Identity record: byte0 = I2C address, byte1 = power-up mode. Default 0x55
-    // / IDLE if unprovisioned. (Set via SET_ADDR commissioning, effective here.)
-    if (g_rec_len[REC_IDENTITY] >= 1u) {
-        uint8_t a = g_rec_data[REC_IDENTITY][0];
+    // Identity record ("idnt"): byte0 = I2C address, byte1 = power-up mode.
+    // Default 0x55 / IDLE if unprovisioned. (Set via SET_ADDR commissioning.)
+    int idn = store_find_str("idnt");
+    if (idn >= 0 && g_rec_len[idn] >= 1u) {
+        uint8_t a = g_rec_data[idn][0];
         if (a >= 0x08u && a <= 0x77u) g_i2c_addr = a;
     }
-    if (g_rec_len[REC_IDENTITY] >= 2u) {
-        uint8_t m = g_rec_data[REC_IDENTITY][1];
+    if (idn >= 0 && g_rec_len[idn] >= 2u) {
+        uint8_t m = g_rec_data[idn][1];
         if (m <= MODE_MAX) g_mode = m;
     }
 
