@@ -59,6 +59,11 @@ IL_NAME_MAX = 16
 ADC_FULLSCALE = 4095
 VREF_DEFAULT = 3.3                    # full-scale volts (INTVCC1 ref + GAIN=DIV2)
 
+# GPIO power-on pin map ("gpmp"): the 8 usable GPIO channels, in gpmp bit order
+# 0..7 (D4/D5 = I2C, D6 = INT). Applied at startup before the interlock arms.
+GPIO_PINS = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
+GPMP_VERSION = 1
+
 _OP_FROM_SYM = {'>': 'gt', '<': 'lt', '>=': 'ge', '<=': 'le', '==': 'eq', '!=': 'ne'}
 _OP_INVERT = {'gt': 'le', 'le': 'gt', 'lt': 'ge', 'ge': 'lt', 'eq': 'ne', 'ne': 'eq'}
 
@@ -287,43 +292,64 @@ class Unit:
     def idnt(self):
         return bytes([self.addr, self.mode])
 
-    def _cfg_section(self):
-        items = []
-        for label, (base, mods) in self.roles.items():
-            items.append("(%s):%s" % (label, ",".join([base] + mods)))
-        return "cfg[%s]" % ",".join(items)
+    def _cfg_token(self, pin):
+        """il_parse cfg token for one pin, derived from its declared role."""
+        base, mods = self.roles[pin]
+        if base == 'adc':
+            return "(%s):adc%s" % (pin, "".join("," + m for m in mods))
+        if base == 'in':
+            pull = mods[0] if mods else 'none'
+            sfx = {'up': ',up', 'down': ',down', 'none': ''}.get(pull)
+            if sfx is None:
+                raise DSLError("input %s pull must be up/down/none, got %r" % (pin, pull))
+            return "(%s):in%s" % (pin, sfx)
+        if base == 'out':
+            return "(%s):out" % pin          # interlock drives it; init lives in gpmp
+        raise DSLError("pin %s: bad role base %r" % (pin, base))
 
     def ilcf(self):
-        if self.mode not in MODES_WITH_ILCF:
+        # ilcf carries ONLY the interlock; the GPIO power-on pin state is in gpmp.
+        if self.mode not in MODES_WITH_ILCF or self.il is None or not self.il[1]:
             return None
         if not self.roles:
             raise DSLError("%s mode needs pins()" % MODE_NAME[self.mode])
-        name, when, drive = (self.il or ("il", None, {}))
-        sections = [name, self._cfg_section()]
+        name, when, drive = self.il
+        drive = drive or {}
 
-        if when:
-            groups = _compile_expr(when, self.roles, self.vref)
-            inputs = {p for g in groups for (p, _, _) in g}
-            for p in inputs:
-                if p not in self.roles or self.roles[p][0] == 'out':
-                    raise DSLError("watched pin %r is not a declared input" % p)
-            if len(inputs) > IL_MAX_INPUTS:
-                raise DSLError("%d watched inputs > IL_MAX_INPUTS=%d"
-                               % (len(inputs), IL_MAX_INPUTS))
-            total = sum(len(g) for g in groups)
-            if total > IL_MAX_WATCHES:
-                raise DSLError("%d watch clauses > IL_MAX_WATCHES=%d (after DNF "
-                               "expansion); simplify the expression" % (total, IL_MAX_WATCHES))
-            sections.append("watch[%s]" % "|".join(
-                ",".join(self._clause(p, op, thr) for (p, op, thr) in g) for g in groups))
+        groups = _compile_expr(when, self.roles, self.vref)
+        inputs = []                           # watched input pins, first-seen order
+        for g in groups:
+            for (p, _, _) in g:
+                if p not in inputs:
+                    inputs.append(p)
+        for p in inputs:
+            if p not in self.roles or self.roles[p][0] == 'out':
+                raise DSLError("watched pin %r is not a declared input" % p)
+        if len(inputs) > IL_MAX_INPUTS:
+            raise DSLError("%d watched inputs > IL_MAX_INPUTS=%d" % (len(inputs), IL_MAX_INPUTS))
+        total = sum(len(g) for g in groups)
+        if total > IL_MAX_WATCHES:
+            raise DSLError("%d watch clauses > IL_MAX_WATCHES=%d (after DNF expansion); "
+                           "simplify the expression" % (total, IL_MAX_WATCHES))
+        if len(drive) > IL_MAX_OUTPUTS:
+            raise DSLError("%d outputs > IL_MAX_OUTPUTS=%d" % (len(drive), IL_MAX_OUTPUTS))
+        for label in drive:
+            if self.roles.get(label, (None,))[0] != 'out':
+                raise DSLError("drive pin %r not declared as 'out'" % label)
 
+        # MIXED's cfg declares every channel (the mode samples them all); GPIO's
+        # cfg declares only the interlock's pins (all 8 live in gpmp, can't fit).
+        if self.mode == MODES['MIXED']:
+            cfg_pins = list(self.roles.keys())
+        else:
+            cfg_pins = inputs + [p for p in drive if p not in inputs]
+
+        sections = [name, "cfg[%s]" % ",".join(self._cfg_token(p) for p in cfg_pins)]
+        sections.append("watch[%s]" % "|".join(
+            ",".join(self._clause(p, op, thr) for (p, op, thr) in g) for g in groups))
         if drive:
-            if len(drive) > IL_MAX_OUTPUTS:
-                raise DSLError("%d outputs > IL_MAX_OUTPUTS=%d" % (len(drive), IL_MAX_OUTPUTS))
             ok, err = [], []
             for label, v in drive.items():
-                if self.roles.get(label, (None,))[0] != 'out':
-                    raise DSLError("drive pin %r not declared as 'out'" % label)
                 if v not in (0, 1):
                     raise DSLError("drive value for %r must be 0 or 1" % label)
                 ok.append("%s:%d" % (label, v))
@@ -340,9 +366,52 @@ class Unit:
     def _clause(pin, op, thr):
         return "%s:%d" % (pin, thr) if op == 'eq' else "%s:%s:%d" % (pin, op, thr)
 
+    def gpmp(self):
+        """GPIO power-on pin map: 5 bytes [VER, DIR, PULLEN, OUT, INTCFG].
+
+        Bitmaps over GPIO_PINS (bit 0..7). All 8 usable pins MUST be defined.
+        OUT does double duty (SAMD21 PORT.OUT): output drive level, or pull
+        direction (1=up,0=down) for a pulled input.
+        """
+        if self.mode != MODES['GPIO']:
+            return None
+        for p in self.roles:
+            if p not in GPIO_PINS:
+                raise DSLError("GPIO: pin %s is not a usable channel %s (D6=INT)"
+                               % (p, ",".join(GPIO_PINS)))
+        dir_bm = pullen_bm = out_bm = 0
+        for i, pin in enumerate(GPIO_PINS):
+            if pin not in self.roles:
+                raise DSLError("GPIO: pin %s undefined -- all 8 of %s must be set"
+                               % (pin, ",".join(GPIO_PINS)))
+            base, mods = self.roles[pin]
+            bit = 1 << i
+            if base == 'out':
+                dir_bm |= bit
+                init = mods[0] if mods else '0'
+                if init not in ('0', '1'):
+                    raise DSLError("output %s init must be 0 or 1, got %r" % (pin, init))
+                if init == '1':
+                    out_bm |= bit
+            elif base == 'in':
+                pull = mods[0] if mods else 'none'
+                if pull not in ('up', 'down', 'none'):
+                    raise DSLError("input %s pull must be up/down/none, got %r" % (pin, pull))
+                if pull != 'none':
+                    pullen_bm |= bit
+                    if pull == 'up':
+                        out_bm |= bit
+            else:
+                raise DSLError("GPIO pin %s: role %r not allowed (in/out only)" % (pin, base))
+        intcfg = 0x01 if self.il else 0x00   # bit0: open-drain active-low INT enabled
+        return bytes([GPMP_VERSION, dir_bm, pullen_bm, out_bm, intcfg])
+
     def files(self):
         """Return {name: bytes} ready for the commission tool to write."""
         out = {'idnt': self.idnt()}
+        gpmp = self.gpmp()
+        if gpmp is not None:
+            out['gpmp'] = gpmp
         ilcf = self.ilcf()
         if ilcf is not None:
             out['ilcf'] = ilcf.encode('ascii')
@@ -454,6 +523,41 @@ def _selftest():
     lo = Unit(0x55, 'MIXED'); lo.pins(a0='adc', d8='in', d6='out')
     lo.interlock('s', when='a0 > 2.5v && d8', drive={'d6': 1})
     assert up.ilcf() == lo.ilcf(), (up.ilcf(), lo.ilcf())
+
+    # 8. GPIO: full pin map (gpmp) + interlock cfg restricted to its own pins
+    u = Unit(0x20, 'GPIO')
+    u.pins(D0='in:up', D1='in:up', D2='in:none', D3='in:down',
+           D7='out:0', D8='out:0', D9='out:1', D10='out:0')
+    u.interlock('safe', '(D0 && D1) && (D2 || D3)', drive={'D8': 1})
+    f = u.files()
+    assert f['idnt'] == bytes([0x20, 1]), f['idnt']
+    # bits 0..7 = D0,D1,D2,D3,D7,D8,D9,D10
+    #  DIR    outputs D7,D8,D9,D10 = 0xF0
+    #  PULLEN pulled inputs D0,D1,D3 = 0x0B   (D2 none)
+    #  OUT    up-inputs D0,D1 + out:1 D9 = 0x43
+    #  INTCFG interlock present -> 0x01
+    assert f['gpmp'] == bytes([1, 0xF0, 0x0B, 0x43, 0x01]), list(f['gpmp'])
+    exp = ("safe;cfg[(D0):in,up,(D1):in,up,(D2):in,(D3):in,down,(D8):out];"
+           "watch[D0:1,D1:1,D2:1|D0:1,D1:1,D3:1];out_ok[D8:1];out_err[D8:0]")
+    assert f['ilcf'].decode() == exp, f['ilcf'].decode()
+
+    # 9. GPIO: all 8 channels required; reject non-channel pins; GPIO w/o
+    #    interlock -> gpmp only (no ilcf), INTCFG disabled.
+    for fn in (
+        lambda: Unit(0x20, 'GPIO').pins(D0='in:up').gpmp(),                  # missing pins
+        lambda: Unit(0x20, 'GPIO').pins(D6='out:0').gpmp(),                  # D6=INT, not a channel
+    ):
+        try:
+            fn()
+        except DSLError:
+            pass
+        else:
+            raise AssertionError("expected DSLError from %r" % fn)
+    g = Unit(0x20, 'GPIO')
+    g.pins(**{p: 'out:0' for p in GPIO_PINS})
+    fg = g.files()
+    assert set(fg) == {'idnt', 'gpmp'}, set(fg)            # no interlock -> no ilcf
+    assert fg['gpmp'] == bytes([1, 0xFF, 0x00, 0x00, 0x00]), list(fg['gpmp'])
 
     print("slave_dsl self-test: PASS")
 
