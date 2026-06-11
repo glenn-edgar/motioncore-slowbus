@@ -26,6 +26,11 @@ SLIP_ESC_ESC = 0xDD
 OP_SHELL_EXEC = 0x0109   # host -> chip
 OP_SHELL_REPLY = 0x0011  # chip -> host
 
+# Dongle state-machine handshake (must reach OPERATIONAL before shell-exec is legal).
+OP_REGISTER_ACK = 0x0103       # host -> chip: BOOT -> L1_DONE (only if commissioned)
+OP_COMMISSION_SET = 0x0105     # host -> chip: set instance_id (fresh/UNCOMMISSIONED chip)
+OP_OPERATIONAL_BEGIN = 0x0108  # host -> chip: L1_DONE -> OPERATIONAL
+
 SHELL_STATUS_OK = 0
 
 # Shell command IDs (the shell `command_id` inside an exec body)
@@ -207,9 +212,13 @@ class Dongle:
         self.port = port
         self.timeout = timeout
         self._ser = serial.Serial(port, 115200, timeout=timeout)
+        import time as _t
         self._seq = 0
-        self._req_id = 0
+        # Seed req_id uniquely per process so a stale reply left in the chip's
+        # TX ring from an earlier session can't match by a colliding req_id.
+        self._req_id = int(_t.monotonic() * 1000.0) & 0xFFFF
         self._decoder = SlipDecoder()
+        self._handshake()
 
     def close(self):
         try:
@@ -233,6 +242,33 @@ class Dongle:
         self._req_id = (self._req_id + 1) & 0xFFFF
         return self._req_id
 
+    def _write_frame(self, cmd, payload=b""):
+        self._ser.write(encode_m2s(1, cmd, self._next_seq(), bytes(payload)))
+        self._ser.flush()
+
+    def _drain(self, dur):
+        import time
+        t = time.monotonic()
+        while time.monotonic() - t < dur:
+            self._ser.read(256)
+        self._ser.reset_input_buffer()
+
+    def _handshake(self):
+        """Advance the dongle BOOT -> L1_DONE -> OPERATIONAL so shell-exec is
+        legal. Assumes the chip is already commissioned (instance_id set); a
+        fresh UNCOMMISSIONED chip first needs OP_COMMISSION_SET (+ reboot),
+        not yet automated here.
+        """
+        import time
+        time.sleep(0.3)                      # let boot frames (REGISTER/DBG_LOG) flow
+        self._drain(0.4)
+        self._write_frame(OP_REGISTER_ACK)   # BOOT -> L1_DONE
+        time.sleep(0.1)
+        self._write_frame(OP_OPERATIONAL_BEGIN)  # L1_DONE -> OPERATIONAL
+        time.sleep(0.15)
+        self._drain(0.2)                     # clear transition logs + heartbeats
+        self._decoder = SlipDecoder()
+
     def shell_exec(self, command_id, args=b"") -> tuple:
         """Send OP_SHELL_EXEC, await the matching OP_SHELL_REPLY.
 
@@ -243,6 +279,8 @@ class Dongle:
         req_id = self._next_req_id()
         exec_body = struct.pack("<HH", req_id, command_id) + bytes(args)
         frame = encode_m2s(1, OP_SHELL_EXEC, self._next_seq(), exec_body)
+        self._ser.reset_input_buffer()   # drop stale/heartbeat frames before this request
+        self._decoder = SlipDecoder()
         self._ser.write(frame)
         self._ser.flush()
 
