@@ -14,17 +14,18 @@ Three layers, matching the firmware:
 from the Pico-consumed CBOR files (net, site). The master commission program
 walks units, calls .files(), and writes each blob (offline -> write -> reboot).
 
-Boolean expressions support and / or / not / parentheses and comparisons:
+Boolean expressions use C logical operators -- && (AND), || (OR), ~ (NOT) --
+parentheses, and comparisons:
 
     interlock('safe',
-        when='(A0 > 2.5V and D8) or not D9',
+        when='(A0 > 2.5V && D8) || ~D9',
         drive={'D6': 1})        # D6 = 1 while the condition holds, else 0
 
-Comparisons:  >  <  >=  <=  ==  !=   (a bare GPIO pin means "== 1").
-ADC thresholds may be volts ('2.5V', full-scale 0..VDDANA≈3.3 V over 0..4095)
-or a raw count (0..4095).  not/De-Morgan is pushed into the comparison operator
-(the firmware has no NOT), then AND-over-OR is distributed to DNF: clauses in a
-group are ANDed (`,`), groups are ORed (`|`).
+Comparisons:  >  <  >=  <=  ==  !=   (a bare GPIO pin means "== 1").  Pin names
+are case-insensitive (d0 == D0).  ADC thresholds may be volts ('2.5V', full-scale
+0..VDDANA≈3.3 V over 0..4095) or a raw count (0..4095).  ~/De-Morgan is pushed
+into the comparison operator (the firmware has no NOT), then AND-over-OR is
+distributed to DNF: clauses in a group are ANDed (`,`), groups are ORed (`|`).
 
 Firmware limits (enforced here with clear errors):
   <=4 watched input pins, <=8 watch clauses total, <=2 outputs,
@@ -34,7 +35,7 @@ Authoring style — a unit .py file just calls the module-level functions:
 
     unit(addr=0x55, type='MIXED')
     pins(A0='adc:oversample_16', D8='in:up', D6='out')
-    interlock('safe', when='A0 > 2.5V and D8', drive={'D6': 1})
+    interlock('safe', when='A0 > 2.5V && D8', drive={'D6': 1})
 
 then `load('lift.py')` returns the Unit; `unit.files()` gives {'idnt':..,'ilcf':..}.
 """
@@ -75,10 +76,13 @@ class DSLError(Exception):
 
 _TOKEN = re.compile(r'''
     \s*(?:
+        (?P<and_op>&&) |
+        (?P<or_op>\|\|) |
+        (?P<not_op>~) |
         (?P<op>>=|<=|==|!=|>|<) |
         (?P<lp>\() |
         (?P<rp>\)) |
-        (?P<num>\d+(?:\.\d+)?V?) |
+        (?P<num>\d+(?:\.\d+)?[Vv]?) |
         (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
     )
 ''', re.VERBOSE)
@@ -130,20 +134,20 @@ class _ExprParser:
 
     def _or(self):
         children = [self._and()]
-        while self._peek() == ('ident', 'or'):
+        while self._peek()[0] == 'or_op':          # ||
             self._next()
             children.append(self._and())
         return children[0] if len(children) == 1 else ('or', children)
 
     def _and(self):
         children = [self._not()]
-        while self._peek() == ('ident', 'and'):
+        while self._peek()[0] == 'and_op':         # &&
             self._next()
             children.append(self._not())
         return children[0] if len(children) == 1 else ('and', children)
 
     def _not(self):
-        if self._peek() == ('ident', 'not'):
+        if self._peek()[0] == 'not_op':            # ~
             self._next()
             return ('not', self._not())
         return self._atom()
@@ -158,9 +162,9 @@ class _ExprParser:
             return node
         if kind == 'ident':
             self._next()
-            if val in ('and', 'or', 'not'):
-                raise DSLError("unexpected keyword %r" % val)
-            return self._comparison(val)
+            # pin names are case-insensitive (d0 == D0); virtuals keep their case
+            pin = val if val.startswith('_') else val.upper()
+            return self._comparison(pin)
         raise DSLError("expected a pin or '(', got %r" % (val,))
 
     def _comparison(self, pin):
@@ -184,7 +188,7 @@ class _ExprParser:
         return ('lit', pin, 'eq', 1)
 
     def _value(self, pin, base, tok):
-        if tok.endswith('V'):
+        if tok[-1:] in ('V', 'v'):
             if base != 'adc':
                 raise DSLError("voltage threshold on non-ADC pin %r" % pin)
             return _volts_to_count(float(tok[:-1]), self.vref)
@@ -269,13 +273,14 @@ class Unit:
             base, mods = parts[0], parts[1:]
             if base not in _ROLE_BASES:
                 raise DSLError("pin %s: bad role base %r" % (label, base))
-            self.roles[label] = (base, mods)
+            self.roles[label.upper()] = (base, mods)   # pin names case-insensitive
         return self
 
     def interlock(self, name, when, drive=None):
         if len(name) >= IL_NAME_MAX:
             raise DSLError("interlock name %r >= %d chars" % (name, IL_NAME_MAX))
-        self.il = (name, when, dict(drive or {}))
+        drive = {k.upper(): v for k, v in (drive or {}).items()}
+        self.il = (name, when, drive)
         return self
 
     # -- emission --------------------------------------------------------
@@ -391,23 +396,23 @@ def _selftest():
     # 1. MIXED: AND condition + drive, volts -> count (2.5/3.3*4095 = 3102)
     u = Unit(0x55, 'MIXED')
     u.pins(A0='adc:oversample_16', D8='in:up', D6='out')
-    u.interlock('safe', when='A0 > 2.5V and D8', drive={'D6': 1})
+    u.interlock('safe', when='A0 > 2.5V && D8', drive={'D6': 1})
     f = u.files()
     assert f['idnt'] == bytes([0x55, 3]), f['idnt']
     exp = (b"safe;cfg[(A0):adc,oversample_16,(D8):in,up,(D6):out];"
            b"watch[A0:gt:3102,D8:1];out_ok[D6:1];out_err[D6:0]")
     assert f['ilcf'] == exp, f['ilcf']
 
-    # 2. OR + NOT -> two DNF groups; not D8 -> ne 1
+    # 2. OR + NOT -> two DNF groups; ~D8 -> ne 1
     u = Unit(0x55, 'MIXED')
     u.pins(A0='adc', D8='in', D6='out')
-    u.interlock('s', when='A0 > 2.5V and D8 or not D8', drive={'D6': 1})
+    u.interlock('s', when='A0 > 2.5V && D8 || ~D8', drive={'D6': 1})
     assert u.ilcf().split(';')[2] == "watch[A0:gt:3102,D8:1|D8:ne:1]", u.ilcf()
 
-    # 3. De-Morgan: not (A0 > 1.0V or D8) -> (A0<=372) and (not D8) -> one group
+    # 3. De-Morgan: ~(A0 > 1.0V || D8) -> (A0<=1241) && (~D8) -> one group
     u = Unit(0x55, 'MIXED')
     u.pins(A0='adc', D8='in', D6='out')
-    u.interlock('s', when='not (A0 > 1.0V or D8)', drive={'D6': 0})
+    u.interlock('s', when='~(A0 > 1.0V || D8)', drive={'D6': 0})
     assert u.ilcf().split(';')[2] == "watch[A0:le:1241,D8:ne:1]", u.ilcf()
     assert u.ilcf().split(';')[3] == "out_ok[D6:0]"      # ok=0
     assert u.ilcf().split(';')[4] == "out_err[D6:1]"     # err=1-0
@@ -419,7 +424,7 @@ def _selftest():
 
     # 5. error cases
     for fn in (
-        lambda: Unit(0x55, 'MIXED').pins(D8='in').interlock('s', when='Z9 and D8').ilcf(),
+        lambda: Unit(0x55, 'MIXED').pins(D8='in').interlock('s', when='Z9 && D8').ilcf(),
         lambda: Unit(0x55, 'MIXED').pins(A0='adc').interlock('s', when='A0').ilcf(),
         lambda: Unit(0x55, 'MIXED').pins(D6='out').interlock('s', when='D6 > 1').ilcf(),
         lambda: Unit(0x55, 'BOGUS'),
@@ -435,13 +440,20 @@ def _selftest():
     # 6. clause-count guard: 3-deep OR-of-ANDs exceeding 8 clauses
     u = Unit(0x55, 'MIXED')
     u.pins(A0='adc', A1='adc', D8='in', D9='in')
-    u.interlock('big', when='(A0>1V or A1>1V) and (D8 or D9) and (A0<3V or A1<3V)')
+    u.interlock('big', when='(A0>1V || A1>1V) && (D8 || D9) && (A0<3V || A1<3V)')
     try:
         u.ilcf()
     except DSLError as e:
         assert 'IL_MAX_WATCHES' in str(e), e
     else:
         raise AssertionError("expected clause-count overflow")
+
+    # 7. pin names are case-insensitive: lowercase pins/expr == uppercase
+    up = Unit(0x55, 'MIXED'); up.pins(A0='adc', D8='in', D6='out')
+    up.interlock('s', when='A0 > 2.5V && D8', drive={'D6': 1})
+    lo = Unit(0x55, 'MIXED'); lo.pins(a0='adc', d8='in', d6='out')
+    lo.interlock('s', when='a0 > 2.5v && d8', drive={'d6': 1})
+    assert up.ilcf() == lo.ilcf(), (up.ilcf(), lo.ilcf())
 
     print("slave_dsl self-test: PASS")
 
