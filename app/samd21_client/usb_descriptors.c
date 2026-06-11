@@ -87,6 +87,10 @@ static char const *string_desc_arr[] = {
 
 static uint16_t _desc_str[32 + 1];
 
+// SAMD21 128-bit factory UID (user_functions.c) -> the USB serial number, so each
+// chip enumerates with a distinct ttyACM serial the host uses to tell them apart.
+extern void register_dongle_chip_uid(uint8_t out[16]);
+
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
   (void) langid;
   size_t chr_count;
@@ -97,15 +101,19 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
       chr_count = 1;
       break;
 
-    case STRID_SERIAL:
-      chr_count = board_usb_get_serial(_desc_str + 1, 32);
-      if (chr_count == 0) {
-        const char *str = string_desc_arr[STRID_SERIAL];
-        chr_count = strlen(str);
-        if (chr_count > 32) chr_count = 32;
-        for (size_t i = 0; i < chr_count; i++) _desc_str[1 + i] = str[i];
+    case STRID_SERIAL: {
+      // The real 128-bit SAMD21 factory UID as 32 hex chars (NOT the BSP's
+      // board_usb_get_serial, which returns a fixed placeholder on this part).
+      uint8_t uid[16];
+      register_dongle_chip_uid(uid);
+      static const char hx[] = "0123456789ABCDEF";
+      for (int i = 0; i < 16; i++) {
+        _desc_str[1 + 2 * i]     = (uint16_t)hx[(uid[i] >> 4) & 0xF];
+        _desc_str[1 + 2 * i + 1] = (uint16_t)hx[uid[i] & 0xF];
       }
+      chr_count = 32;
       break;
+    }
 
     default:
       if (!(index < sizeof(string_desc_arr) / sizeof(string_desc_arr[0]))) return NULL;

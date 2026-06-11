@@ -26,10 +26,12 @@ SLIP_ESC_ESC = 0xDD
 OP_SHELL_EXEC = 0x0109   # host -> chip
 OP_SHELL_REPLY = 0x0011  # chip -> host
 
-# Dongle state-machine handshake (must reach OPERATIONAL before shell-exec is legal).
-OP_REGISTER_ACK = 0x0103       # host -> chip: BOOT -> L1_DONE (only if commissioned)
-OP_COMMISSION_SET = 0x0105     # host -> chip: set instance_id (fresh/UNCOMMISSIONED chip)
-OP_OPERATIONAL_BEGIN = 0x0108  # host -> chip: L1_DONE -> OPERATIONAL
+# Legacy dongle state-machine opcodes — NO LONGER NEEDED. The firmware now
+# dispatches OP_SHELL_EXEC synchronously with no handshake; these are ignored by
+# it. Kept only for reference / talking to old s_engine-era firmware.
+OP_REGISTER_ACK = 0x0103
+OP_COMMISSION_SET = 0x0105
+OP_OPERATIONAL_BEGIN = 0x0108
 
 SHELL_STATUS_OK = 0
 
@@ -218,7 +220,7 @@ class Dongle:
         # TX ring from an earlier session can't match by a colliding req_id.
         self._req_id = int(_t.monotonic() * 1000.0) & 0xFFFF
         self._decoder = SlipDecoder()
-        self._handshake()
+        self._connect()
 
     def close(self):
         try:
@@ -242,10 +244,6 @@ class Dongle:
         self._req_id = (self._req_id + 1) & 0xFFFF
         return self._req_id
 
-    def _write_frame(self, cmd, payload=b""):
-        self._ser.write(encode_m2s(1, cmd, self._next_seq(), bytes(payload)))
-        self._ser.flush()
-
     def _drain(self, dur):
         import time
         t = time.monotonic()
@@ -253,20 +251,14 @@ class Dongle:
             self._ser.read(256)
         self._ser.reset_input_buffer()
 
-    def _handshake(self):
-        """Advance the dongle BOOT -> L1_DONE -> OPERATIONAL so shell-exec is
-        legal. Assumes the chip is already commissioned (instance_id set); a
-        fresh UNCOMMISSIONED chip first needs OP_COMMISSION_SET (+ reboot),
-        not yet automated here.
+    def _connect(self):
+        """Clear the chip's boot frames (the [BOOT]/interlock OP_DBG_LOG lines)
+        before the first command. The firmware dispatches OP_SHELL_EXEC
+        synchronously with no state handshake, so nothing else is needed.
         """
         import time
-        time.sleep(0.3)                      # let boot frames (REGISTER/DBG_LOG) flow
-        self._drain(0.4)
-        self._write_frame(OP_REGISTER_ACK)   # BOOT -> L1_DONE
-        time.sleep(0.1)
-        self._write_frame(OP_OPERATIONAL_BEGIN)  # L1_DONE -> OPERATIONAL
-        time.sleep(0.15)
-        self._drain(0.2)                     # clear transition logs + heartbeats
+        time.sleep(0.2)
+        self._drain(0.3)
         self._decoder = SlipDecoder()
 
     def shell_exec(self, command_id, args=b"") -> tuple:
