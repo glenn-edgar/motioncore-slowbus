@@ -18,9 +18,6 @@ BSP_BOARD    := $(BSP_FAMILY)/boards/seeeduino_xiao
 CMSIS        := $(TUSB)/lib/CMSIS_5/CMSIS/Core/Include
 UF2CONV      := $(TUSB)/tools/uf2/utils/uf2conv.py
 
-# s_engine runtime, vendored into slow_bus (was ../s_engine/runtime in motioncore).
-SENGINE_RT   := $(TOP)/vendor/s_engine
-
 BUILD        := $(HERE)/build
 TARGET       := register_dongle
 
@@ -82,7 +79,6 @@ OPT  := -Os -ffunction-sections -fdata-sections
 INC := \
   -I$(HERE) \
   -I$(LIBCOMM) \
-  -I$(SENGINE_RT) \
   -I$(SRC) \
   -I$(TUSB)/hw \
   -I$(BSP_FAMILY) \
@@ -127,27 +123,10 @@ APP_SRCS := \
   $(HERE)/samd21_hal_pin.c \
   $(HERE)/samd21_pin_table.c \
   $(HERE)/samd21_interlocks.c \
-  $(HERE)/samd21_interlock_dsl.c \
-  $(HERE)/register_dongle_v2_module_rom.c
+  $(HERE)/samd21_interlock_dsl.c
 
 LIBCOMM_SRCS := \
   $(LIBCOMM)/frame.c
-
-# M-port engine subset. Explicitly excludes:
-#   s_engine_loader.c   - no blob loader
-#   s_engine_init.c     - printf-diagnostic path; we use s_engine_init_rom
-#   s_engine_builtins.c - global registration table; emit-c uses headers directly
-#   s_engine_stack.c    - no stack on M-port
-#   *.cc                - C++ helpers not needed for the M-port subset
-SENGINE_SRCS := \
-  $(SENGINE_RT)/s_engine_module.c \
-  $(SENGINE_RT)/s_engine_eval.c \
-  $(SENGINE_RT)/s_engine_node.c \
-  $(SENGINE_RT)/s_engine_rom_init.c \
-  $(SENGINE_RT)/s_engine_exception.c \
-  $(SENGINE_RT)/s_engine_event_queue.c \
-  $(SENGINE_RT)/se_dict_hash.c \
-  $(SENGINE_RT)/se_dict_string.c
 
 BSP_SRCS := \
   $(BSP_FAMILY)/family.c \
@@ -170,9 +149,8 @@ VENDOR_SRCS := $(BSP_SRCS) $(TUSB_SRCS)
 
 APP_OBJS     := $(patsubst $(HERE)/%.c,$(BUILD)/app/%.o,$(APP_SRCS))
 VENDOR_OBJS  := $(patsubst $(TOP)/%.c,$(BUILD)/vendor/%.o,$(VENDOR_SRCS))
-SENGINE_OBJS := $(patsubst $(SENGINE_RT)/%.c,$(BUILD)/sengine/%.o,$(SENGINE_SRCS))
 LIBCOMM_OBJS := $(patsubst $(LIBCOMM)/%.c,$(BUILD)/libcomm/%.o,$(LIBCOMM_SRCS))
-OBJS         := $(APP_OBJS) $(VENDOR_OBJS) $(SENGINE_OBJS) $(LIBCOMM_OBJS)
+OBJS         := $(APP_OBJS) $(VENDOR_OBJS) $(LIBCOMM_OBJS)
 
 DEPS := $(OBJS:.o=.d)
 
@@ -215,11 +193,6 @@ $(BUILD)/app/%.o: $(HERE)/%.c
 
 # Vendor/SDK/TinyUSB sources -> build/vendor/...
 $(BUILD)/vendor/%.o: $(TOP)/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
-
-# s_engine runtime sources -> build/sengine/...
-$(BUILD)/sengine/%.o: $(SENGINE_RT)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
