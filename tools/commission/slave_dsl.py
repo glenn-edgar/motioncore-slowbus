@@ -62,7 +62,7 @@ VREF_DEFAULT = 3.3                    # full-scale volts (INTVCC1 ref + GAIN=DIV
 # GPIO power-on pin map ("gpmp"): the 8 usable GPIO channels, in gpmp bit order
 # 0..7 (D4/D5 = I2C, D6 = INT). Applied at startup before the interlock arms.
 GPIO_PINS = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
-GPMP_VERSION = 1
+GPMP_VERSION = 2
 
 _OP_FROM_SYM = {'>': 'gt', '<': 'lt', '>=': 'ge', '<=': 'le', '==': 'eq', '!=': 'ne'}
 _OP_INVERT = {'gt': 'le', 'le': 'gt', 'lt': 'ge', 'ge': 'lt', 'eq': 'ne', 'ne': 'eq'}
@@ -367,11 +367,12 @@ class Unit:
         return "%s:%d" % (pin, thr) if op == 'eq' else "%s:%s:%d" % (pin, op, thr)
 
     def gpmp(self):
-        """GPIO power-on pin map: 5 bytes [VER, DIR, PULLEN, OUT, INTCFG].
+        """GPIO power-on pin map: 6 bytes [VER=2, DIR, PULLEN, OUT, OD, INTCFG].
 
         Bitmaps over GPIO_PINS (bit 0..7). All 8 usable pins MUST be defined.
         OUT does double duty (SAMD21 PORT.OUT): output drive level, or pull
-        direction (1=up,0=down) for a pulled input.
+        direction (1=up,0=down) for a pulled input. OD marks open-drain outputs
+        (drive low / Hi-Z); for an OD output OUT=1 means released (Hi-Z) at boot.
         """
         if self.mode != MODES['GPIO']:
             return None
@@ -379,7 +380,7 @@ class Unit:
             if p not in GPIO_PINS:
                 raise DSLError("GPIO: pin %s is not a usable channel %s (D6=INT)"
                                % (p, ",".join(GPIO_PINS)))
-        dir_bm = pullen_bm = out_bm = 0
+        dir_bm = pullen_bm = out_bm = od_bm = 0
         for i, pin in enumerate(GPIO_PINS):
             if pin not in self.roles:
                 raise DSLError("GPIO: pin %s undefined -- all 8 of %s must be set"
@@ -388,11 +389,15 @@ class Unit:
             bit = 1 << i
             if base == 'out':
                 dir_bm |= bit
-                init = mods[0] if mods else '0'
-                if init not in ('0', '1'):
-                    raise DSLError("output %s init must be 0 or 1, got %r" % (pin, init))
-                if init == '1':
+                kind = mods[0] if mods else '0'
+                if kind == 'od':                       # open-drain, powers up released (Hi-Z)
+                    od_bm |= bit
                     out_bm |= bit
+                elif kind in ('0', '1'):               # push-pull, drive level
+                    if kind == '1':
+                        out_bm |= bit
+                else:
+                    raise DSLError("output %s must be 0, 1 or od, got %r" % (pin, kind))
             elif base == 'in':
                 pull = mods[0] if mods else 'none'
                 if pull not in ('up', 'down', 'none'):
@@ -404,7 +409,7 @@ class Unit:
             else:
                 raise DSLError("GPIO pin %s: role %r not allowed (in/out only)" % (pin, base))
         intcfg = 0x01 if self.il else 0x00   # bit0: open-drain active-low INT enabled
-        return bytes([GPMP_VERSION, dir_bm, pullen_bm, out_bm, intcfg])
+        return bytes([GPMP_VERSION, dir_bm, pullen_bm, out_bm, od_bm, intcfg])
 
     def files(self):
         """Return {name: bytes} ready for the commission tool to write."""
@@ -535,8 +540,8 @@ def _selftest():
     #  DIR    outputs D7,D8,D9,D10 = 0xF0
     #  PULLEN pulled inputs D0,D1,D3 = 0x0B   (D2 none)
     #  OUT    up-inputs D0,D1 + out:1 D9 = 0x43
-    #  INTCFG interlock present -> 0x01
-    assert f['gpmp'] == bytes([1, 0xF0, 0x0B, 0x43, 0x01]), list(f['gpmp'])
+    #  OD     none -> 0x00 ; INTCFG interlock present -> 0x01
+    assert f['gpmp'] == bytes([2, 0xF0, 0x0B, 0x43, 0x00, 0x01]), list(f['gpmp'])
     exp = ("safe;cfg[(D0):in,up,(D1):in,up,(D2):in,(D3):in,down,(D8):out];"
            "watch[D0:1,D1:1,D2:1|D0:1,D1:1,D3:1];out_ok[D8:1];out_err[D8:0]")
     assert f['ilcf'].decode() == exp, f['ilcf'].decode()
@@ -557,7 +562,18 @@ def _selftest():
     g.pins(**{p: 'out:0' for p in GPIO_PINS})
     fg = g.files()
     assert set(fg) == {'idnt', 'gpmp'}, set(fg)            # no interlock -> no ilcf
-    assert fg['gpmp'] == bytes([1, 0xFF, 0x00, 0x00, 0x00]), list(fg['gpmp'])
+    assert fg['gpmp'] == bytes([2, 0xFF, 0x00, 0x00, 0x00, 0x00]), list(fg['gpmp'])
+
+    # 10. open-drain output (out:od): OD bit set, OUT=1 (released/Hi-Z) at boot
+    u = Unit(0x20, 'GPIO')
+    u.pins(D0='in:up', D1='in:none', D2='in:none', D3='in:none',
+           D7='out:0', D8='out:od', D9='out:1', D10='out:od')
+    g = u.gpmp()
+    #  DIR  outputs D7,D8,D9,D10 = 0xF0
+    #  PULLEN D0 up = 0x01
+    #  OUT  D0(up) + D8,D10(od released) + D9(out:1) = bits 0,5,6,7 = 0xE1
+    #  OD   D8,D10 = bits 5,7 = 0xA0
+    assert g == bytes([2, 0xF0, 0x01, 0xE1, 0xA0, 0x00]), list(g)
 
     print("slave_dsl self-test: PASS")
 

@@ -1142,6 +1142,7 @@ void i2c_store_service(void) {
 #define REG_PIO_GPIO   0x13u
 #define REG_PIO_OLAT   0x14u
 #define REG_PIO_GPPD   0x17u            // pull-DOWN enable (companion to GPPU pull-up)
+#define REG_PIO_OD     0x18u            // RO: open-drain output mask (commission-static)
 
 static const struct { uint8_t group, pin; } g_pio_ch[8] = {
     {0, 2}, {0, 4}, {0, 10}, {0, 11},   // CH0..3 = D0 D1 D2 D3
@@ -1150,9 +1151,24 @@ static const struct { uint8_t group, pin; } g_pio_ch[8] = {
 static uint8_t g_pio_iodir = 0xFFu;   // power-on default: all inputs (safe)
 static uint8_t g_pio_gppu;            // pull-UP enable   (gpmp PULLEN &  OUT)
 static uint8_t g_pio_gppd;            // pull-DOWN enable (gpmp PULLEN & ~OUT)
+static uint8_t g_pio_od;              // open-drain outputs (gpmp OD): value 1 -> Hi-Z
 static uint8_t g_pio_ipol;
 static uint8_t g_pio_olat;
 
+// Drive output channel ch to its g_pio_olat value, honoring open-drain (g_pio_od):
+// push-pull -> drive the level; open-drain -> value 0 = drive low, value 1 = Hi-Z
+// (released), so several chips can wire-OR a shared line.
+static void pio_drive_ch_out(uint8_t ch) {
+    uint8_t g = g_pio_ch[ch].group, p = g_pio_ch[ch].pin, bit = (uint8_t)(1u << ch);
+    uint32_t m = 1u << p;
+    if ((g_pio_od & bit) && (g_pio_olat & bit)) {       // open-drain, value 1 -> release
+        PORT->Group[g].DIRCLR.reg = m;                  // Hi-Z
+    } else {                                            // drive (push-pull, or od value 0 = low)
+        if (g_pio_olat & bit) PORT->Group[g].OUTSET.reg = m;
+        else                  PORT->Group[g].OUTCLR.reg = m;
+        PORT->Group[g].DIRSET.reg = m;
+    }
+}
 static void pio_apply_ch(uint8_t ch) {
     uint8_t g = g_pio_ch[ch].group, p = g_pio_ch[ch].pin, bit = (uint8_t)(1u << ch);
     if (g_pio_iodir & bit) {                            // input
@@ -1167,23 +1183,19 @@ static void pio_apply_ch(uint8_t ch) {
             PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
         }
     } else {                                            // output (INEN kept for read-back)
-        if (g_pio_olat & bit) PORT->Group[g].OUTSET.reg = (1u << p);
-        else                  PORT->Group[g].OUTCLR.reg = (1u << p);
         PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
-        PORT->Group[g].DIRSET.reg = (1u << p);
+        pio_drive_ch_out(ch);                           // od-aware: drive level or Hi-Z
     }
 }
 static void pio_apply_all(void) { for (uint8_t i = 0; i < 8; i++) pio_apply_ch(i); }
 static void pio_update_outputs(void) {                  // OLAT change: just the output pins
     for (uint8_t i = 0; i < 8; i++) {
         if (g_pio_iodir & (1u << i)) continue;
-        uint8_t g = g_pio_ch[i].group, p = g_pio_ch[i].pin;
-        if (g_pio_olat & (1u << i)) PORT->Group[g].OUTSET.reg = (1u << p);
-        else                        PORT->Group[g].OUTCLR.reg = (1u << p);
+        pio_drive_ch_out(i);                            // od-aware
     }
 }
 static void pio_safe_all(void) {                        // leaving PIO: all inputs, no pull
-    g_pio_iodir = 0xFFu; g_pio_olat = 0u; g_pio_gppu = 0u; g_pio_gppd = 0u;
+    g_pio_iodir = 0xFFu; g_pio_olat = 0u; g_pio_gppu = 0u; g_pio_gppd = 0u; g_pio_od = 0u;
     for (uint8_t i = 0; i < 8; i++) {
         uint8_t g = g_pio_ch[i].group, p = g_pio_ch[i].pin;
         PORT->Group[g].DIRCLR.reg = (1u << p);
@@ -1200,14 +1212,17 @@ static uint8_t pio_read_gpio(void) {
 }
 
 // Apply the commissioned GPIO power-on pin map ("gpmp") to the channel shadow
-// registers; pio_apply_all() then programs the pads. 5 bytes, bit i = channel i:
-//   [0]=version(1) [1]=DIR(output=1) [2]=PULLEN [3]=OUT(drive level / pull dir)
-//   [4]=INTCFG (bit0 = open-drain active-low INT enabled).
+// registers; pio_apply_all() then programs the pads. Bit i = channel i.
+//   v1 (5 B): [VER=1, DIR(output=1), PULLEN, OUT(level/pull-dir), INTCFG]
+//   v2 (6 B): [VER=2, DIR, PULLEN, OUT, OD(open-drain outputs), INTCFG]
 // Absent / short / unknown-version -> leave the safe default (all inputs, no pull).
 static void gpmp_apply(void) {
     int s = store_find_str("gpmp");
-    if (s < 0 || g_rec_len[s] < 5u || g_rec_data[s][0] != 1u) return;
+    if (s < 0 || g_rec_len[s] < 5u) return;
     const uint8_t *m = g_rec_data[s];
+    if (m[0] == 2u && g_rec_len[s] >= 6u) g_pio_od = m[4];
+    else if (m[0] == 1u)                  g_pio_od = 0u;
+    else                                  return;          // unknown version
     uint8_t dir = m[1], pullen = m[2], out = m[3];
     g_pio_iodir = (uint8_t)~dir;                          // firmware convention: input = 1
     g_pio_olat  = out;                                    // output drive levels (input bits unused)
@@ -1238,9 +1253,18 @@ static uint8_t pio_phys_read(uint8_t phys) {
     return (PORT->Group[phys >> 5].IN.reg & (1u << (phys & 0x1Fu))) ? 1u : 0u;
 }
 static void pio_phys_drive(uint8_t phys, uint8_t v) {
-    uint32_t m = 1u << (phys & 0x1Fu);
-    if (v) PORT->Group[phys >> 5].OUTSET.reg = m;
-    else   PORT->Group[phys >> 5].OUTCLR.reg = m;
+    uint8_t grp = phys >> 5, pin = phys & 0x1Fu;
+    uint32_t m = 1u << pin;
+    // Open-drain if this phys is a channel flagged in g_pio_od: value 1 -> release.
+    for (uint8_t ch = 0; ch < 8; ch++) {
+        if (g_pio_ch[ch].group == grp && g_pio_ch[ch].pin == pin) {
+            if ((g_pio_od & (1u << ch)) && v) { PORT->Group[grp].DIRCLR.reg = m; return; }
+            break;
+        }
+    }
+    if (v) PORT->Group[grp].OUTSET.reg = m;
+    else   PORT->Group[grp].OUTCLR.reg = m;
+    PORT->Group[grp].DIRSET.reg = m;                    // ensure driven (od low / push-pull)
 }
 // INT (D6) is open-drain, active-low: asserted -> actively drive 0; released ->
 // Hi-Z (pin to input), so several chips can wire-OR onto one shared INT line
@@ -1327,6 +1351,7 @@ static uint8_t pio_reg_read(uint8_t reg) {
     case REG_PIO_IPOL:    return g_pio_ipol;
     case REG_PIO_GPIO:    return pio_read_gpio();
     case REG_PIO_OLAT:    return g_pio_olat;
+    case REG_PIO_OD:      return g_pio_od;
     case REG_PIO_ILSTAT:  return g_pio_il_pstat;
     case REG_PIO_ILSTATE: return g_pio_il_state;
     default:              return 0xFFu;
@@ -1334,9 +1359,13 @@ static uint8_t pio_reg_read(uint8_t reg) {
 }
 static void pio_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
-    case REG_PIO_IODIR: g_pio_iodir = val; pio_apply_all(); break;
-    case REG_PIO_GPPU:  g_pio_gppu  = val; g_pio_gppd &= (uint8_t)~val; pio_apply_all(); break;
-    case REG_PIO_GPPD:  g_pio_gppd  = val; g_pio_gppu &= (uint8_t)~val; pio_apply_all(); break;
+    // DIR/PULL/OD are the fixed wiring description: set once by gpmp at boot,
+    // read-only at runtime (the board can't change). Only output VALUES + the
+    // read-polarity are writable.
+    case REG_PIO_IODIR:
+    case REG_PIO_GPPU:
+    case REG_PIO_GPPD:
+    case REG_PIO_OD:    break;                             // commission-static, ignore writes
     case REG_PIO_IPOL:  g_pio_ipol  = val; break;
     case REG_PIO_GPIO:                                     // GPIO write == OLAT (MCP-style)
     case REG_PIO_OLAT:  g_pio_olat  = val; pio_update_outputs(); break;
