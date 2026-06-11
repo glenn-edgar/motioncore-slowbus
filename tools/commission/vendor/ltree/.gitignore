@@ -1,0 +1,4 @@
+# build artifacts (rebuild with `make`); ltree.so is committed for convenience
+test_ltree
+*.o
+*~
