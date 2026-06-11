@@ -307,10 +307,19 @@ class Unit:
             return "(%s):out" % pin          # interlock drives it; init lives in gpmp
         raise DSLError("pin %s: bad role base %r" % (pin, base))
 
+    # An inert ilcf: a name with no watch section -> il_parse OK but the firmware
+    # won't arm it (needs >=1 watch). Emitted when a GPIO/MIXED unit has no
+    # interlock, so commissioning OVERWRITES any stale interlock left in flash
+    # (there is no file-delete yet). Without this, a no-interlock re-commission
+    # leaves the previous interlock armed (it can hold an output at its safe value).
+    ILCF_OFF = "off"
+
     def ilcf(self):
         # ilcf carries ONLY the interlock; the GPIO power-on pin state is in gpmp.
-        if self.mode not in MODES_WITH_ILCF or self.il is None or not self.il[1]:
+        if self.mode not in MODES_WITH_ILCF:
             return None
+        if self.il is None or not self.il[1]:
+            return self.ILCF_OFF
         if not self.roles:
             raise DSLError("%s mode needs pins()" % MODE_NAME[self.mode])
         name, when, drive = self.il
@@ -561,7 +570,8 @@ def _selftest():
     g = Unit(0x20, 'GPIO')
     g.pins(**{p: 'out:0' for p in GPIO_PINS})
     fg = g.files()
-    assert set(fg) == {'idnt', 'gpmp'}, set(fg)            # no interlock -> no ilcf
+    assert set(fg) == {'idnt', 'gpmp', 'ilcf'}, set(fg)    # inert ilcf overwrites stale
+    assert fg['ilcf'] == b'off', fg['ilcf']
     assert fg['gpmp'] == bytes([2, 0xFF, 0x00, 0x00, 0x00, 0x00]), list(fg['gpmp'])
 
     # 10. open-drain output (out:od): OD bit set, OUT=1 (released/Hi-Z) at boot

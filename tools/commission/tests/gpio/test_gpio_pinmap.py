@@ -30,15 +30,16 @@ def run():
     c.eq("GPPD (down)",   dg.reg_read(R["GPPD"]),  0x02)   # D1
     c.eq("OD",            dg.reg_read(R["OD"]),    0xC0)   # D9, D10
     c.eq("OLAT",          dg.reg_read(R["OLAT"]),  0xE5)
-    # Pulled-input reads are deterministic -- assert those. Output-pin reads are
-    # load-dependent (a wired output reads the BUS, not its own drive), so report
-    # them as info only; driven-output read-back is in test_gpio_outputs.py.
+    # Pulled inputs read their pull; unloaded push-pull outputs read their drive.
+    # (On a populated board a WIRED output reads the bus, not its own drive -- if
+    # an output here is wired, relax its assert to info.) Open-drain D9/D10 power
+    # up released (Hi-Z) so their read floats -- not asserted.
     g = dg.reg_read(R["GPIO"])
     c.eq("D0 pull-up reads 1",   (g >> 0) & 1, 1)
     c.eq("D1 pull-down reads 0", (g >> 1) & 1, 0)
     c.eq("D2 pull-up reads 1",   (g >> 2) & 1, 1)
-    print("  (info) output reads D7,D8,D9,D10 = %s  (load-dependent)"
-          % [(g >> bit(p)) & 1 for p in ("D7", "D8", "D9", "D10")])
+    c.eq("D7 out:0 reads 0",     (g >> bit("D7")) & 1, 0)
+    c.eq("D8 out:1 reads 1",     (g >> bit("D8")) & 1, 1)
 
     # Static config is read-only at runtime: writes must be ignored.
     for reg in ("IODIR", "GPPU", "GPPD", "OD"):

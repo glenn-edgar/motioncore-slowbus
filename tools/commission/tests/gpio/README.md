@@ -34,10 +34,15 @@ robot:/tmp/commission/tests/gpio/`.
 
 ## Notes that bit us (so they don't bite you)
 
-- **A wired output reads the bus, not its own drive.** `test_gpio_pinmap` asserts
-  only pulled-*input* reads + config registers; output-pin reads are reported as
-  info because a populated board may hold an output at the bus level. (On this
-  bench D8/PA07 is wired low — driving it high still reads 0.)
+- **Commissioning does not delete files yet.** A no-interlock GPIO/MIXED unit
+  therefore emits an **inert `ilcf` (`"off"`)** so it OVERWRITES any interlock left
+  in flash by a previous commission — otherwise the old interlock re-arms at boot
+  and can hold an output at its safe value (this exact bug made D8 read 0 even
+  though it's unwired). The proper fix (file DELETE + commissioner reconciliation)
+  is still a TODO for cross-mode stale files.
+- **A wired output reads the bus, not its own drive** — a genuine gotcha on a
+  populated board (an output tied to a circuit reads the bus level). If you wire
+  an output in a test, relax its read assert to info.
 - **The board is fixed**, so `IODIR`/`GPPU`/`GPPD`/`OD` are commission-static and
   **read-only** at runtime; only `OLAT`/`GPIO` (output values) and `IPOL` move.
   To change wiring config you change the DSL and re-commission (offline → write →
