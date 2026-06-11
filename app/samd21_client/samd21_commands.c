@@ -1141,13 +1141,15 @@ void i2c_store_service(void) {
 #define REG_PIO_IPOL   0x12u
 #define REG_PIO_GPIO   0x13u
 #define REG_PIO_OLAT   0x14u
+#define REG_PIO_GPPD   0x17u            // pull-DOWN enable (companion to GPPU pull-up)
 
 static const struct { uint8_t group, pin; } g_pio_ch[8] = {
     {0, 2}, {0, 4}, {0, 10}, {0, 11},   // CH0..3 = D0 D1 D2 D3
     {1, 9}, {0,  7}, {0,  5}, {0,  6},   // CH4..7 = D7 D8 D9 D10  (D6 is now INT)
 };
 static uint8_t g_pio_iodir = 0xFFu;   // power-on default: all inputs (safe)
-static uint8_t g_pio_gppu;
+static uint8_t g_pio_gppu;            // pull-UP enable   (gpmp PULLEN &  OUT)
+static uint8_t g_pio_gppd;            // pull-DOWN enable (gpmp PULLEN & ~OUT)
 static uint8_t g_pio_ipol;
 static uint8_t g_pio_olat;
 
@@ -1157,6 +1159,9 @@ static void pio_apply_ch(uint8_t ch) {
         PORT->Group[g].DIRCLR.reg = (1u << p);
         if (g_pio_gppu & bit) {                         // input + pull-up
             PORT->Group[g].OUTSET.reg = (1u << p);      // OUT=1 selects pull-up direction
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+        } else if (g_pio_gppd & bit) {                  // input + pull-down
+            PORT->Group[g].OUTCLR.reg = (1u << p);      // OUT=0 selects pull-down direction
             PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
         } else {
             PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
@@ -1178,7 +1183,7 @@ static void pio_update_outputs(void) {                  // OLAT change: just the
     }
 }
 static void pio_safe_all(void) {                        // leaving PIO: all inputs, no pull
-    g_pio_iodir = 0xFFu; g_pio_olat = 0u;
+    g_pio_iodir = 0xFFu; g_pio_olat = 0u; g_pio_gppu = 0u; g_pio_gppd = 0u;
     for (uint8_t i = 0; i < 8; i++) {
         uint8_t g = g_pio_ch[i].group, p = g_pio_ch[i].pin;
         PORT->Group[g].DIRCLR.reg = (1u << p);
@@ -1192,6 +1197,22 @@ static uint8_t pio_read_gpio(void) {
         if (PORT->Group[g].IN.reg & (1u << p)) v |= (uint8_t)(1u << i);
     }
     return (uint8_t)(v ^ g_pio_ipol);                   // input polarity invert
+}
+
+// Apply the commissioned GPIO power-on pin map ("gpmp") to the channel shadow
+// registers; pio_apply_all() then programs the pads. 5 bytes, bit i = channel i:
+//   [0]=version(1) [1]=DIR(output=1) [2]=PULLEN [3]=OUT(drive level / pull dir)
+//   [4]=INTCFG (bit0 = open-drain active-low INT enabled).
+// Absent / short / unknown-version -> leave the safe default (all inputs, no pull).
+static void gpmp_apply(void) {
+    int s = store_find_str("gpmp");
+    if (s < 0 || g_rec_len[s] < 5u || g_rec_data[s][0] != 1u) return;
+    const uint8_t *m = g_rec_data[s];
+    uint8_t dir = m[1], pullen = m[2], out = m[3];
+    g_pio_iodir = (uint8_t)~dir;                          // firmware convention: input = 1
+    g_pio_olat  = out;                                    // output drive levels (input bits unused)
+    g_pio_gppu  = (uint8_t)(pullen & out);                // pulled input, OUT=1 -> pull-up
+    g_pio_gppd  = (uint8_t)(pullen & (uint8_t)~out);      // pulled input, OUT=0 -> pull-down
 }
 
 // ---- PIO mode (PIO-b): gpio interlock layered on the expander -----------------
@@ -1221,7 +1242,18 @@ static void pio_phys_drive(uint8_t phys, uint8_t v) {
     if (v) PORT->Group[phys >> 5].OUTSET.reg = m;
     else   PORT->Group[phys >> 5].OUTCLR.reg = m;
 }
-static void pio_int_assert(bool on) { pio_phys_drive((PIO_INT_GROUP << 5) | PIO_INT_PIN, on ? 1u : 0u); }
+// INT (D6) is open-drain, active-low: asserted -> actively drive 0; released ->
+// Hi-Z (pin to input), so several chips can wire-OR onto one shared INT line
+// (external pull-up holds it high when nobody is tripped).
+static void pio_int_assert(bool on) {
+    uint32_t m = 1u << PIO_INT_PIN;
+    if (on) {
+        PORT->Group[PIO_INT_GROUP].OUTCLR.reg = m;   // drive low
+        PORT->Group[PIO_INT_GROUP].DIRSET.reg = m;
+    } else {
+        PORT->Group[PIO_INT_GROUP].DIRCLR.reg = m;   // release: Hi-Z
+    }
+}
 
 static bool pio_watch_pass(const il_watch_t* w) {
     uint16_t v = pio_phys_read(g_pio_il.inputs[w->input_idx].phys_id);   // digital 0/1
@@ -1242,9 +1274,8 @@ static void pio_il_drive_safe(void) {                   // force out_err pins to
 // Arm from the interlock_cfg record; set up INT pin (D10 output, deasserted).
 static void pio_il_arm(void) {
     g_pio_il_valid = false; g_pio_il_tripped = false;
-    PORT->Group[PIO_INT_GROUP].OUTCLR.reg = (1u << PIO_INT_PIN);
     PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN;
-    PORT->Group[PIO_INT_GROUP].DIRSET.reg = (1u << PIO_INT_PIN);
+    PORT->Group[PIO_INT_GROUP].DIRCLR.reg = (1u << PIO_INT_PIN);   // open-drain INT: Hi-Z idle
     g_pio_il_state = 0u;
     int ils = store_find_str("ilcf");      // interlock-config named slot
     if (ils >= 0 && g_rec_len[ils] > 0u) {
@@ -1292,6 +1323,7 @@ static uint8_t pio_reg_read(uint8_t reg) {
     switch (reg) {
     case REG_PIO_IODIR:   return g_pio_iodir;
     case REG_PIO_GPPU:    return g_pio_gppu;
+    case REG_PIO_GPPD:    return g_pio_gppd;
     case REG_PIO_IPOL:    return g_pio_ipol;
     case REG_PIO_GPIO:    return pio_read_gpio();
     case REG_PIO_OLAT:    return g_pio_olat;
@@ -1303,7 +1335,8 @@ static uint8_t pio_reg_read(uint8_t reg) {
 static void pio_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case REG_PIO_IODIR: g_pio_iodir = val; pio_apply_all(); break;
-    case REG_PIO_GPPU:  g_pio_gppu  = val; pio_apply_all(); break;
+    case REG_PIO_GPPU:  g_pio_gppu  = val; g_pio_gppd &= (uint8_t)~val; pio_apply_all(); break;
+    case REG_PIO_GPPD:  g_pio_gppd  = val; g_pio_gppu &= (uint8_t)~val; pio_apply_all(); break;
     case REG_PIO_IPOL:  g_pio_ipol  = val; break;
     case REG_PIO_GPIO:                                     // GPIO write == OLAT (MCP-style)
     case REG_PIO_OLAT:  g_pio_olat  = val; pio_update_outputs(); break;
@@ -1614,9 +1647,8 @@ fail:
 static void mixed_il_arm(void) {
     g_mixed_il_valid = false; g_mixed_il_tripped = false;
     // INT pin = D6 = PB08 (same as PIO): drive low (deasserted), keep INEN for read-back.
-    PORT->Group[PIO_INT_GROUP].OUTCLR.reg = (1u << PIO_INT_PIN);
     PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN;
-    PORT->Group[PIO_INT_GROUP].DIRSET.reg = (1u << PIO_INT_PIN);
+    PORT->Group[PIO_INT_GROUP].DIRCLR.reg = (1u << PIO_INT_PIN);   // open-drain INT: Hi-Z idle
     g_mixed_il_state = 0u;
     // Fresh arm: clear debounce + cached readings so no stale edges/values leak in.
     memset(g_mixed_sr,  0, sizeof g_mixed_sr);
@@ -2324,6 +2356,7 @@ static void mode_enter(uint8_t m) {
     if (m == MODE_PIO) {                            // entering PIO
         DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)
         while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        gpmp_apply();                               // load the commissioned power-on pin map
         pio_apply_all();                            // claim + configure the 8 channels
         pio_il_arm();                               // parse interlock_cfg, set up INT pin
     } else if (m == MODE_ADC) {                     // entering ADC
