@@ -259,18 +259,22 @@ static il_parse_status_t parse_cfg(parser_t* p, il_inst_t* inst) {
             if (mod_count >= 4) return IL_PARSE_UNKNOWN_MODE;
             if (!read_ident(p, &mod_strs[mod_count], &mod_lens[mod_count])) return IL_PARSE_UNEXPECTED_CHAR;
             mod_count++;
+            // A comma continues THIS group's mod-list only when it is followed by
+            // a known modifier. A comma before '(' or a bare pin label is a GROUP
+            // separator and must be left for the outer loop — so remember where the
+            // comma was and give it back in those cases (else multi-group cfg, e.g.
+            // "(A0):adc,(D8):in", loses the separator and fails as UNEXPECTED_CHAR).
+            uint16_t pre_comma = p->pos;
             if (!consume_char(p, ',')) break;
-            // Lookahead: comma followed by '(' means next group begins. An
-            // ident that is NOT a known modifier also ends the list.
             skip_ws(p);
-            if (peek(p) == '(') break;
-            if (!is_ident_start(peek(p))) break;
-            uint16_t save = p->pos;
+            if (peek(p) == '(')              { p->pos = pre_comma; break; }
+            if (!is_ident_start(peek(p)))    { p->pos = pre_comma; break; }
+            uint16_t at_ident = p->pos;
             const char* ns; uint8_t nl;
             if (!read_ident(p, &ns, &nl)) return IL_PARSE_UNEXPECTED_CHAR;
             bool is_mod = is_known_modifier(ns, nl);
-            p->pos = save;
-            if (!is_mod) break;
+            if (!is_mod) { p->pos = pre_comma; break; }   // next group's bare pin
+            p->pos = at_ident;                            // re-read as this group's modifier
         }
 
         // Resolve mode from first modifier; rest are qualifiers (pull / adc cfg).
