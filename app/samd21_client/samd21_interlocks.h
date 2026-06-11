@@ -40,14 +40,16 @@
 // v3 (slice 4): grows il_input_t with oversample_exp + sh_cyc for ADC inputs.
 // v4 (slice 5): adds self_size header + panic_code/panic_arg/panic_sp to crash record.
 // v5 (slice 6): grows il_input_t to 8 B with debounce_depth + hyst for ADC/virtual.
-#define INTERLOCK_PERSIST_VERSION    5u
+// v6 (slice 7): grows il_watch_t with a `group` field (DNF OR-groups) + bumps
+//               IL_MAX_WATCHES 4 -> 8 so non-trivial boolean expressions fit.
+#define INTERLOCK_PERSIST_VERSION    6u
 
 // ---- Slice 2: DSL-driven interlock instance ------------------------------
 
 #define IL_NAME_MAX        16u
 #define IL_DSL_MAX        128u
 #define IL_MAX_INPUTS       4u
-#define IL_MAX_WATCHES      4u
+#define IL_MAX_WATCHES      8u
 #define IL_MAX_OUTPUTS      2u
 
 // id=2 means "this slot's behaviour is described by il_inst_t / dsl_text"
@@ -99,6 +101,9 @@ typedef struct {
     uint8_t  input_idx;           // index into il_inst_t.inputs[]
     uint8_t  op;                  // il_compare_op_t
     uint16_t threshold;           // raw value (0/1 for GPIO; 0..4095 for ADC)
+    uint8_t  group;               // slice 7: DNF OR-group id; clauses sharing a
+                                  // group are ANDed, groups are ORed (`|` in DSL)
+    uint8_t  reserved[3];
 } il_watch_t;
 
 typedef struct {
@@ -159,6 +164,13 @@ typedef enum {
 // text where the error was detected. *out is left in undefined state.
 il_parse_status_t il_parse(const char* text, uint16_t text_len,
                            il_inst_t* out, uint16_t* err_offset);
+
+// DNF aggregation of per-watch pass results: tf = OR over groups of (AND of
+// the clauses in that group). wpass[i] is whether watch i passed this tick;
+// only the first inst->watch_count entries are read. watch_count == 0 -> true
+// (no constraints). Shared by all three eval sites (eval_slot, pio, mixed) so
+// the boolean semantics stay identical.
+bool il_dnf_result(const il_inst_t* inst, const bool* wpass);
 
 // ---- Types ---------------------------------------------------------------
 

@@ -378,8 +378,11 @@ static il_parse_status_t parse_cfg(parser_t* p, il_inst_t* inst) {
 // watch[D1:1,D2:1]                    — slice-2 implicit-eq form (still legal)
 // watch[A1:gt:512,A1:lt:3000]         — slice-4 3-part form: pin:op:threshold
 // watch[_t_since_m2s:gt:30]           — slice-6 virtual input; auto-declared
+// watch[A1:gt:512,D8:1 | D9:0]        — slice-7 DNF: `,` ANDs within a group,
+//                                       `|` starts a new group; groups are ORed
 //   op ∈ {eq, ne, lt, gt, le, ge}
 static il_parse_status_t parse_watch(parser_t* p, il_inst_t* inst) {
+    uint8_t cur_group = 0;   // slice 7: which DNF OR-group the next clause joins
     while (true) {
         const char* lbl; uint8_t llen;
         if (!read_ident(p, &lbl, &llen)) return IL_PARSE_UNEXPECTED_CHAR;
@@ -444,9 +447,14 @@ static il_parse_status_t parse_watch(parser_t* p, il_inst_t* inst) {
         inst->watches[inst->watch_count].input_idx = (uint8_t)idx;
         inst->watches[inst->watch_count].op        = (uint8_t)op;
         inst->watches[inst->watch_count].threshold = val;
+        inst->watches[inst->watch_count].group     = cur_group;
         inst->watch_count++;
 
-        if (!consume_char(p, ',')) break;
+        // Separator: ',' = another clause in the SAME group (AND); '|' = start a
+        // new group (OR). Anything else ends the watch list.
+        if (consume_char(p, ',')) continue;
+        if (consume_char(p, '|')) { cur_group++; continue; }
+        break;
     }
     return IL_PARSE_OK;
 }

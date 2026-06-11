@@ -1262,9 +1262,10 @@ static void pio_il_disarm(void) {           // leaving PIO mode
 }
 static void pio_il_tick(void) {             // run from i2c_store_service (superloop)
     if (g_mode != MODE_PIO || !g_pio_il_valid) return;
-    bool all_pass = true;
+    bool wpass[IL_MAX_WATCHES] = {0};
     for (uint8_t i = 0; i < g_pio_il.watch_count; i++)
-        if (!pio_watch_pass(&g_pio_il.watches[i])) { all_pass = false; break; }
+        wpass[i] = pio_watch_pass(&g_pio_il.watches[i]);
+    bool all_pass = il_dnf_result(&g_pio_il, wpass);   // DNF: OR of AND-groups
     g_pio_il_state = (uint8_t)((g_pio_il_tripped ? 1u : 0u) | (all_pass ? 2u : 0u) | 4u);
     if (!g_pio_il_tripped) {
         if (!all_pass) {                                     // a watch failed -> TRIP (latched)
@@ -1696,12 +1697,14 @@ static void mixed_tick(void) {
     g_mixed_gpio_raw = raw_bm;
     g_mixed_gpio_deb = deb_bm;
 
-    // Evaluate every watch against the (debounced/latest) input values.
-    bool all_pass = true;
+    // Evaluate every watch against the (debounced/latest) input values, then
+    // aggregate as DNF (OR of AND-groups).
+    bool wpass[IL_MAX_WATCHES] = {0};
     for (uint8_t i = 0; i < g_mixed_il.watch_count; i++) {
         const il_watch_t* w = &g_mixed_il.watches[i];
-        if (!mixed_watch_pass(w, vals[w->input_idx])) { all_pass = false; break; }
+        wpass[i] = mixed_watch_pass(w, vals[w->input_idx]);
     }
+    bool all_pass = il_dnf_result(&g_mixed_il, wpass);
     g_mixed_il_state = (uint8_t)((g_mixed_il_tripped ? 1u : 0u) | (all_pass ? 2u : 0u) | 4u);
 
     if (!g_mixed_il_tripped) {

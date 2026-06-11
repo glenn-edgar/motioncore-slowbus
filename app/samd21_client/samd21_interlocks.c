@@ -520,6 +520,26 @@ void interlock_warm_restore(void) {
     }
 }
 
+// DNF aggregation (slice 7): tf = OR over groups of (AND of clauses in group).
+// Single-group strings (no `|`) have all clauses in group 0 -> pure AND, so
+// pre-slice-7 behaviour is preserved bit-for-bit. watch_count == 0 -> true.
+bool il_dnf_result(const il_inst_t* inst, const bool* wpass) {
+    if (inst->watch_count == 0u) return true;
+    uint8_t max_group = 0u;
+    for (uint8_t i = 0; i < inst->watch_count; i++)
+        if (inst->watches[i].group > max_group) max_group = inst->watches[i].group;
+    for (uint8_t g = 0; g <= max_group; g++) {
+        bool grp_pass = true, grp_has = false;
+        for (uint8_t i = 0; i < inst->watch_count; i++) {
+            if (inst->watches[i].group != g) continue;
+            grp_has = true;
+            if (!wpass[i]) { grp_pass = false; break; }
+        }
+        if (grp_has && grp_pass) return true;   // one satisfied group -> TRUE
+    }
+    return false;
+}
+
 // Evaluate one slot's watches against a fresh input snapshot. Updates
 // inst->tf_state in place. Does NOT touch outputs — that's the drive phase.
 // Writes captured input values into out_input_vals[IL_MAX_INPUTS] so the
@@ -563,7 +583,7 @@ static void eval_slot(uint8_t slot, il_inst_t* inst, uint16_t* out_input_vals) {
         for (uint8_t i = 0; i < IL_MAX_INPUTS; i++) out_input_vals[i] = input_vals[i];
     }
 
-    bool all_pass = true;
+    bool wpass[IL_MAX_WATCHES] = {0};
     for (uint8_t i = 0; i < inst->watch_count; i++) {
         uint8_t  idx  = inst->watches[i].input_idx;
         uint16_t v    = input_vals[idx];
@@ -599,11 +619,12 @@ static void eval_slot(uint8_t slot, il_inst_t* inst, uint16_t* out_input_vals) {
             default:       pass = false;       break;
         }
         g_watch_last_pass[slot][i] = pass ? 1u : 0u;
-        if (!pass) all_pass = false;
+        wpass[i] = pass;
         // Don't early-out: we want every watch's last_pass updated each tick
         // so hysteresis is consistent across all watches in the slot.
     }
-    inst->tf_state = all_pass ? (uint8_t)IL_TF_TRUE : (uint8_t)IL_TF_FALSE;
+    inst->tf_state = il_dnf_result(inst, wpass) ? (uint8_t)IL_TF_TRUE
+                                                : (uint8_t)IL_TF_FALSE;
 }
 
 // Per-chain-pump tick. Two phases:
