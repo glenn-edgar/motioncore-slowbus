@@ -122,17 +122,29 @@ class Builder:
         if sub_u not in slave_dsl.MODES:
             raise ValueError("unknown device sub-type %r" % sub)
         mode = slave_dsl.MODES[sub_u]
+
+        # Compile the on-chip files via slave_dsl: idnt always; gpmp + ilcf for
+        # GPIO/MIXED. slave_dsl validates (all 8 GPIO pins, limits) and raises
+        # DSLError, so a bad device fails the build loudly.
+        u = slave_dsl.Unit(i2c, sub_u)
+        if pins:
+            u.pins(**pins)
+        if interlock:
+            u.interlock(interlock["name"], interlock["expr"], interlock.get("drive"))
+        files = u.files()                         # {name: raw bytes}
+
+        # The KB node stores the human SOURCE (queryable, regenerable); the record
+        # carries the compiled bytes for the commissioner. (bytes aren't JSON, and
+        # the files are derivable from the source, so keep one source of truth.)
         props = {"i2c": i2c, "cls": cls, "sub": sub_u}
         data = {"pins": pins or {}, "interlock": interlock}
         with _quiet():
             self.kb.add_info_node(DEV_LINK, name, props, data)  # leaf: push+pop
-        rec = {
+        self.devices.append({
             "path": "%s.%s.%s" % (self.path(), DEV_LINK, name),
             "name": name, "i2c": i2c, "cls": cls, "sub": sub_u, "mode": mode,
-            "idnt": bytes([i2c, mode]),
-            "pins": pins or {}, "interlock": interlock,
-        }
-        self.devices.append(rec)
+            "files": files, "pins": pins or {}, "interlock": interlock,
+        })
         return self
 
     # -- roster: immediate I2C devices under a node ----------------------
@@ -174,9 +186,15 @@ def conveyor_io(b):
 
 def _show(title, b, roster_path):
     print("\n=== %s ===" % title)
-    print("devices built:")
+    print("devices built (compiled on-chip files):")
     for d in b.devices:
-        print("  %-46s idnt=%s sub=%s" % (d["path"], list(d["idnt"]), d["sub"]))
+        f = d["files"]
+        desc = "idnt=%s" % list(f["idnt"])
+        if "gpmp" in f:
+            desc += " gpmp=%s" % list(f["gpmp"])
+        if "ilcf" in f:
+            desc += " ilcf=%dB" % len(f["ilcf"])
+        print("  %-46s %s" % (d["path"], desc))
     print("roster(%s):" % roster_path)
     for e in b.roster(roster_path):
         print("  i2c=0x%02X %-6s %s  @ %s" % (e["i2c"], e["sub"], e["cls"], e["path"]))
