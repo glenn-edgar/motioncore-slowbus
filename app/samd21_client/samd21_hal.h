@@ -7,6 +7,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // ---- Watchdog Timer (WDT) --------------------------------------------------
 // Layer-2 WDT per wdt-layer2-pet-from-s-engine: pet site lives inside the
@@ -55,4 +56,10 @@ void samd21_peripherals_init(void);
 
 #ifdef I2C_CLIENT
 void i2c_store_service(void);   // M2b: service a pending config-store flash commit
+
+// Commissioning lifecycle accessors (samd21_commands.c). main.c uses these to
+// reboot into ONLINE on a USB disconnect that follows an OFFLINE session, but
+// only once any pending config-store flash commit has completed.
+bool samd21_is_offline(void);          // true while in the OFFLINE commissioning state
+bool samd21_store_commit_pending(void);// true while a deferred flash commit is queued/in-flight
 #endif

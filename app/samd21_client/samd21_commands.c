@@ -882,6 +882,7 @@ static volatile uint8_t i2c_reg_ptr;        // register address pointer
 static volatile bool    i2c_reg_ptr_known;  // first write byte after addr = the pointer
 static volatile uint8_t g_mode      = MODE_IDLE;
 static volatile uint8_t g_status;           // bit0 flash-busy, bit1 store-err, bit2 int-pending
+static volatile bool    g_offline = false;  // commissioning state: false=ONLINE, true=OFFLINE (STATUS bit3)
 static volatile uint8_t g_int_flags;        // interlock trip flags (W1C)
 static uint8_t          g_i2c_addr  = I2C_CLIENT_ADDR_DEFAULT;
 static uint8_t          g_unique_id[8];
@@ -2225,7 +2226,7 @@ static uint8_t i2c_reg_read(uint8_t reg) {
     case 0x00: return I2C_CLIENT_WHOAMI;
     case 0x01: return I2C_CLIENT_VERSION;
     case 0x02: return g_mode;
-    case 0x03: return g_status;
+    case 0x03: return (uint8_t)(g_status | (g_offline ? 0x08u : 0x00u));   // bit3 = OFFLINE
     case 0x04: return g_int_flags;
     case 0x05: return g_i2c_addr;
     case 0x06: case 0x07: case 0x08: case 0x09:
@@ -2282,6 +2283,101 @@ static void file_list_advance(bool from_start) {
     g_file_off = 0u;
 }
 
+// ============================================================================
+// Commissioning lifecycle: mode enter/leave factoring + offline/tri-state.
+//
+// mode_leave(m) / mode_enter(m) hold the exact per-mode teardown / setup logic
+// that used to be inlined in i2c_reg_write case 0x02. They're shared by the
+// runtime MODE-register switch, the boot-time "apply commissioned mode" (B4),
+// and the offline transition (which leaves the active mode then tri-states).
+// ============================================================================
+
+// "leaving m" — undo whatever mode_enter(m) set up. IDLE = no-op.
+static void mode_leave(uint8_t m) {
+    if (m == MODE_PIO) {                            // leaving PIO
+        pio_il_disarm();                            // deassert INT, drop the latch
+        pio_safe_all();                             // pins safe (inputs)
+        DAC->CTRLB.bit.EOEN = 1;                    // restore DAC output buffer on PA02
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    } else if (m == MODE_ADC) {                     // leaving ADC
+        NVIC_DisableIRQ(TC3_IRQn);                  // stop the DAC waveform generator
+        g_dac_wf.active = false;
+        tc3_stop();
+    } else if (m == MODE_MIXED) {                   // leaving MIXED
+        mixed_il_disarm();                          // deassert INT, drop latch, release pins (safe)
+    } else if (m == MODE_SERVO) {                   // leaving SERVO
+        servo_exit();                               // stop TC4, drive all servo pins low
+        DAC->CTRLB.bit.EOEN = 1;                    // restore DAC output buffer on PA02 (CH0)
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    } else if (m == MODE_COUNTER) {                 // leaving COUNTER
+        counter_exit();                             // stop TC5 (pins stay inputs, safe)
+        DAC->CTRLB.bit.EOEN = 1;                    // restore DAC output buffer on PA02 (CH0)
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    }
+}
+
+// "entering m" — set up the mode's pins/peripherals. IDLE = no-op.
+static void mode_enter(uint8_t m) {
+    if (m == MODE_PIO) {                            // entering PIO
+        DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        pio_apply_all();                            // claim + configure the 8 channels
+        pio_il_arm();                               // parse interlock_cfg, set up INT pin
+    } else if (m == MODE_ADC) {                     // entering ADC
+        adc_mode_setup();                           // DIV16 sampler + window stats + DAC const
+    } else if (m == MODE_MIXED) {                   // entering MIXED
+        mixed_il_arm();                             // parse interlock_cfg, claim pins, set up INT
+    } else if (m == MODE_SERVO) {                   // entering SERVO
+        DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        servo_enter();                              // pins->GPIO low, build schedule, start TC4
+    } else if (m == MODE_COUNTER) {                 // entering COUNTER
+        DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC so it reads as input
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        counter_enter();                            // pins->GPIO inputs, seed last, zero, start TC5
+    }
+}
+
+// Commissioning offline state. g_offline is declared near g_status (above) so
+// the STATUS-register read (case 0x03) can surface it as bit3. false = ONLINE
+// (default at boot): serves config, drives commissioned pins, config WRITES
+// refused. true = OFFLINE: mode halted, all HIL pins tri-stated, config WRITES
+// allowed. OFFLINE->ONLINE only via USB disconnect -> reboot (the cold boot
+// re-applies config in i2c_slave_init/B4).
+bool samd21_is_offline(void) { return g_offline; }
+
+// True while a deferred config-store flash commit is queued or in flight (the
+// i2c_store_service main-loop pump clears g_commit_pending to -1 when done).
+// main.c gates the offline-disconnect reboot on this so files finish persisting.
+bool samd21_store_commit_pending(void) { return g_commit_pending >= 0; }
+
+// Tri-state the full union of HIL pins (the 9 servo/counter channels, which
+// already includes D6/PB08 the INT pin): input, INEN on for read-back, NO pull,
+// NO drive => Hi-Z. Then disable the DAC output buffer, stop both mode timers
+// (idempotent), deassert INT, and latch g_mode=IDLE / g_offline=true.
+void mode_go_offline(void) {
+    mode_leave(g_mode);
+
+    // The servo/counter pad table is the union of all 9 driven channel pins and
+    // includes D6=PB08 (the INT pin, channel 8 here). Tri-state each.
+    for (uint8_t ch = 0; ch < SERVO_CH_COUNT; ch++) {
+        uint8_t g = g_servo_pad[ch].group, p = g_servo_pad[ch].pin;
+        PORT->Group[g].DIRCLR.reg      = (1u << p);          // input (no drive)
+        PORT->Group[g].PINCFG[p].reg   = PORT_PINCFG_INEN;   // INEN on, no pull, no drive => Hi-Z
+    }
+
+    DAC->CTRLB.bit.EOEN = 0;                         // release A0/PA02 from the DAC (Hi-Z input)
+    while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+
+    servo_tc_stop();                                 // stop TC4 (idempotent)
+    counter_tc_stop();                               // stop TC5 (idempotent)
+
+    pio_int_assert(false);                           // deassert INT (D6/PB08)
+
+    g_mode    = MODE_IDLE;
+    g_offline = true;
+}
+
 // Register write dispatch. Read-only / unimplemented regs are ignored.
 static void i2c_reg_write(uint8_t reg, uint8_t val) {
     if (reg >= 0x10u && reg <= 0x3Fu) {                  // mode bank — interpreted per active mode
@@ -2295,45 +2391,9 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case 0x02:                                            // MODE — apply the switch
         if (val <= MODE_MAX && val != g_mode) {
-            if (g_mode == MODE_PIO) {                      // leaving PIO
-                pio_il_disarm();                           // deassert INT, drop the latch
-                pio_safe_all();                            // pins safe (inputs)
-                DAC->CTRLB.bit.EOEN = 1;                   // restore DAC output buffer on PA02
-                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
-            } else if (g_mode == MODE_ADC) {               // leaving ADC
-                NVIC_DisableIRQ(TC3_IRQn);                 // stop the DAC waveform generator
-                g_dac_wf.active = false;
-                tc3_stop();
-            } else if (g_mode == MODE_MIXED) {             // leaving MIXED
-                mixed_il_disarm();                         // deassert INT, drop latch, release pins (safe)
-            } else if (g_mode == MODE_SERVO) {             // leaving SERVO
-                servo_exit();                              // stop TC4, drive all servo pins low
-                DAC->CTRLB.bit.EOEN = 1;                   // restore DAC output buffer on PA02 (CH0)
-                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
-            } else if (g_mode == MODE_COUNTER) {           // leaving COUNTER
-                counter_exit();                            // stop TC5 (pins stay inputs, safe)
-                DAC->CTRLB.bit.EOEN = 1;                   // restore DAC output buffer on PA02 (CH0)
-                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
-            }
+            mode_leave(g_mode);
             g_mode = val;
-            if (val == MODE_PIO) {                         // entering PIO
-                DAC->CTRLB.bit.EOEN = 0;                   // free CH0=PA02 from the DAC (else it pins CH0 low)
-                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
-                pio_apply_all();                           // claim + configure the 8 channels
-                pio_il_arm();                              // parse interlock_cfg, set up INT pin
-            } else if (val == MODE_ADC) {                  // entering ADC
-                adc_mode_setup();                          // DIV16 sampler + window stats + DAC const
-            } else if (val == MODE_MIXED) {                // entering MIXED
-                mixed_il_arm();                            // parse interlock_cfg, claim pins, set up INT
-            } else if (val == MODE_SERVO) {                // entering SERVO
-                DAC->CTRLB.bit.EOEN = 0;                   // free CH0=PA02 from the DAC (else it pins CH0 low)
-                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
-                servo_enter();                             // pins->GPIO low, build schedule, start TC4
-            } else if (val == MODE_COUNTER) {              // entering COUNTER
-                DAC->CTRLB.bit.EOEN = 0;                   // free CH0=PA02 from the DAC so it reads as input
-                while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
-                counter_enter();                           // pins->GPIO inputs, seed last, zero, start TC5
-            }
+            mode_enter(val);
         }
         break;
     case 0x04:                                            // INT_FLAGS: write-1-to-clear
@@ -2414,6 +2474,11 @@ static void i2c_slave_init(void) {
         uint8_t m = g_rec_data[idn][1];
         if (m <= MODE_MAX) g_mode = m;
     }
+
+    // B4: actually ENTER the commissioned mode at boot so the SAMD21 drives its
+    // pins per the freshly-loaded config (previously g_mode was set lazily and
+    // only took effect on the next MODE-register write). IDLE -> no-op.
+    if (g_mode <= MODE_MAX) mode_enter(g_mode);
 
     // 1. Bus clock.
     PM->APBCMASK.reg |= PM_APBCMASK_SERCOM2;
@@ -2519,6 +2584,7 @@ static uint16_t g_file_wr_len;          // bytes appended into the shadow so far
 // args:   name[4]   result: empty   status: OK / BAD_ARGS (store full / short)
 static uint8_t cmd_file_begin(shell_reader_t* args, shell_writer_t* result) {
     (void)result;
+    if (!g_offline) return SHELL_STATUS_BUSY;   // online: not accepting commissioning writes
     if (sr_remaining(args) < STORE_NAME_LEN) return SHELL_STATUS_BAD_ARGS;
     uint8_t name[STORE_NAME_LEN];
     sr_bytes(args, name, STORE_NAME_LEN);
@@ -2537,6 +2603,7 @@ static uint8_t cmd_file_begin(shell_reader_t* args, shell_writer_t* result) {
 // STORE_DATA_MAX (240) or if no BEGIN is open.
 static uint8_t cmd_file_data(shell_reader_t* args, shell_writer_t* result) {
     (void)result;
+    if (!g_offline) return SHELL_STATUS_BUSY;   // online: not accepting commissioning writes
     if (g_file_wr_slot < 0) return SHELL_STATUS_BAD_ARGS;   // no BEGIN
     uint16_t n = sr_remaining(args);
     if ((uint32_t)g_file_wr_len + n > STORE_DATA_MAX) return SHELL_STATUS_BAD_ARGS;
@@ -2552,6 +2619,7 @@ static uint8_t cmd_file_data(shell_reader_t* args, shell_writer_t* result) {
 // i2c_store_service (main loop). Returns immediately; the write is deferred.
 static uint8_t cmd_file_commit(shell_reader_t* args, shell_writer_t* result) {
     (void)result;
+    if (!g_offline) return SHELL_STATUS_BUSY;   // online: not accepting commissioning writes
     if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
     if (g_file_wr_slot < 0)      return SHELL_STATUS_BAD_ARGS;   // no BEGIN
     g_rec_len[g_file_wr_slot]   = (uint8_t)g_file_wr_len;
@@ -2606,6 +2674,19 @@ static uint8_t cmd_reg_readn(shell_reader_t* args, shell_writer_t* result) {
         if (!IS_DATA_PORT(reg)) reg++;          // mirror the I2C register-pointer auto-advance
     }
     return result->overflow ? SHELL_STATUS_RESULT_TOO_BIG : SHELL_STATUS_OK;
+}
+
+// ---------- CMD_OFFLINE --------------------------------------------------
+// args: (none)   result: empty   status: OK
+// Enter the commissioning OFFLINE state: halt the active mode, tri-state every
+// HIL pin (Hi-Z), release the DAC + stop the mode timers, deassert INT, and
+// begin accepting config-file writes. Return to ONLINE only via USB disconnect
+// -> reboot (the cold boot re-applies the freshly-written config; see B4).
+static uint8_t cmd_offline(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
+    mode_go_offline();
+    return SHELL_STATUS_OK;
 }
 #endif // I2C_CLIENT
 
@@ -2874,6 +2955,7 @@ static const shell_cmd_entry_t g_chip_commands[] = {
     { CMD_REG_READ,            "reg_read",           cmd_reg_read           },
     { CMD_REG_WRITE,           "reg_write",          cmd_reg_write          },
     { CMD_REG_READN,           "reg_readn",          cmd_reg_readn          },
+    { CMD_OFFLINE,             "offline",            cmd_offline            },
 #endif
 #endif
 #if !defined(ROLE_BUS_CONTROLLER)

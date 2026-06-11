@@ -88,8 +88,12 @@ def cmd_put(args):
         obj = json.load(f)
     blob = cbor2.dumps(obj, canonical=True)
     with _open(args) as dg:
+        dg.offline()                      # online writes are refused (SHELL_STATUS_BUSY)
         dg.file_put(args.name, blob)
-    print("put %r: %d bytes of CBOR written" % (args.name, len(blob)))
+    # closing the port (end of `with`) drops DTR -> the offline chip reboots into
+    # ONLINE and re-applies the freshly written config.
+    print("put %r: %d bytes of CBOR written (chip reboots online on disconnect)"
+          % (args.name, len(blob)))
 
 
 def cmd_get(args):

@@ -139,6 +139,12 @@ const shell_cmd_entry_t* shell_find_cmd(uint16_t command_id);
 #define CMD_REG_WRITE         ((uint16_t)0x0128)
 #define CMD_REG_READN         ((uint16_t)0x0129)
 
+// CMD_OFFLINE args: (none) -> (). Enter the commissioning OFFLINE state: halt
+// the active mode, tri-state every HIL pin (Hi-Z), and begin accepting config
+// FILE writes. Return to ONLINE only via USB disconnect -> reboot (cold boot
+// re-applies the new config). Online FILE writes are refused (SHELL_STATUS_BUSY).
+#define CMD_OFFLINE           ((uint16_t)0x012A)
+
 // 0x0140..0x014F: interlock framework foundation (slice 1).
 // CMD_INTERLOCK_STATUS args: (empty)
 //   reply: num_slots:u8 then per-slot {state:u8, id:u8, boot_counter:u8},

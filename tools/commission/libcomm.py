@@ -43,6 +43,7 @@ CMD_FILE_LIST = 0x0126
 CMD_REG_READ = 0x0127
 CMD_REG_WRITE = 0x0128
 CMD_REG_READN = 0x0129
+CMD_OFFLINE = 0x012A   # enter commissioning offline state (tri-state outputs, allow writes)
 
 # Sizing
 COMM_PAYLOAD_MAX = 128
@@ -329,6 +330,16 @@ class Dongle:
         return result[:n]
 
     # -- high-level helpers -------------------------------------------------
+
+    def offline(self) -> None:
+        """Enter the commissioning OFFLINE state: the chip tri-states every HIL
+        pin (Hi-Z), halts its mode, and begins accepting config-file writes.
+        Required before any file_put (online writes return SHELL_STATUS_BUSY).
+        The chip returns to ONLINE only on USB disconnect, which reboots it and
+        re-applies the freshly written config -- so close the port when done."""
+        status, _ = self.shell_exec(CMD_OFFLINE)
+        if status != SHELL_STATUS_OK:
+            raise IOError("OFFLINE rejected, status %d" % status)
 
     def whoami(self) -> int:
         return self.reg_read(REG_WHO_AM_I)

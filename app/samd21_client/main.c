@@ -256,6 +256,18 @@ static void usb_cmd_poll(void) {
     }
 }
 
+// 1200-baud "touch" -> reboot into the UF2 bootloader (Arduino/Adafruit-SAMD
+// convention), so the host can reflash over USB without the physical double-tap.
+// Opening the CDC port at 1200 baud sets DBL_TAP_MAGIC at the top of RAM and
+// resets; the SAMD21 UF2 bootloader sees the magic and stays in the bootloader.
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *coding) {
+    (void)itf;
+    if (coding->bit_rate == 1200u) {
+        *((volatile uint32_t *)0x20007FFCu) = 0xF01669EFu;  // top of 32 KB RAM - 4
+        NVIC_SystemReset();
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Entry
 // ----------------------------------------------------------------------------
@@ -337,6 +349,13 @@ int main(void) {
     // Interlock eval cadence: ~1 kHz, gated on board_millis().
     uint32_t next_il_ms = 1;
 
+#ifdef I2C_CLIENT
+    // Tracks the CDC connection state across loop passes so a connected->
+    // disconnected edge can trigger the OFFLINE->ONLINE reboot. Seeded to the
+    // current state so the first pass never sees a spurious edge.
+    bool prev_conn = tud_cdc_connected();
+#endif
+
     // Defensive amendment D — gate entry to the main loop on invariants.
     // Any failure panics with a discriminated code; next boot prints it.
     system_self_check();
@@ -413,6 +432,29 @@ int main(void) {
                 }
             }
         }
+
+        // Commissioning OFFLINE -> ONLINE transition. A host that entered the
+        // OFFLINE state (CMD_OFFLINE), wrote config files, then closed the CDC
+        // port wants the unit to reboot into ONLINE with the new config applied
+        // (i2c_slave_init/B4 re-reads + enters the commissioned mode). Detect the
+        // connected->disconnected edge while offline, and reboot — but only once
+        // any pending config-store flash commit has finished (so files persist).
+        // An ONLINE disconnect (not g_offline) does nothing.
+#ifdef I2C_CLIENT
+        {
+            static bool reboot_armed = false;
+            bool conn = tud_cdc_connected();
+            // Latch the reboot intent on the offline disconnect edge (the edge
+            // fires once); then fire once the pending config-store flash commit
+            // has drained, so the just-written files persist before reset.
+            if (prev_conn && !conn && samd21_is_offline()) reboot_armed = true;
+            prev_conn = conn;
+            if (reboot_armed && !samd21_store_commit_pending()) {
+                NVIC_SystemReset();
+                // not reached
+            }
+        }
+#endif
 
         // Deferred reboot. Wait until the requested time has passed so any
         // in-flight reply / log bytes leave the chip before USB renegotiates.
