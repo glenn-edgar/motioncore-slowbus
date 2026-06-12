@@ -18,7 +18,7 @@ def run():
     dac_const(dg)
     for level in (128, 384, 640, 896):
         set_dac(dg, level)
-        time.sleep(0.35)
+        time.sleep(2.0)          # fast window ~0.8 s at ~125 Hz/ch; ~2 windows to settle
         a = read_avg(dg, ch=0, win=WIN["fast"])
         # within +-3% of level*4 (ADC vs 10-bit DAC, both ref 3.3V)
         ok = abs(a - level * 4) <= max(40, level * 4 // 25)

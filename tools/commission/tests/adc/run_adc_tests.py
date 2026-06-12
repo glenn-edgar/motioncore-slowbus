@@ -10,7 +10,7 @@ REQUIRES the A0->A1 DAC self-test jumper.
 import importlib
 import sys
 
-TESTS = ["test_adc_selftest", "test_adc_interlock"]
+TESTS = ["test_adc_selftest", "test_adc_interlock", "test_adc_twotone"]
 
 
 def main():

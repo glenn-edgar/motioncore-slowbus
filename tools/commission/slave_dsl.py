@@ -95,7 +95,7 @@ _TOKEN = re.compile(r'''
 
 # ADC-mode interlock streams: a watch reads one of these per channel.
 ADC_STATS   = ('avg', 'min', 'max', 'rms')         # windowed stats
-ADC_WINDOWS = {'fast': 0, 'mid': 1, 'slow': 2}     # 10 Hz / 1 Hz / 0.1 Hz tumbling windows
+ADC_WINDOWS = {'fast': 0, 'mid': 1, 'slow': 2}     # 100/1000/10000-sample windows (~0.8/8/80 s @ ~125 Hz/ch)
 # Channels the ADC sweep samples (D6/A6 = interlock output, A0 = DAC -> not watchable).
 ADC_WATCH_PINS = ('A1', 'A2', 'A3', 'A7', 'A8', 'A9', 'A10',
                   'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
