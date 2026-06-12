@@ -1655,13 +1655,17 @@ static void adc_il_manual_reset(void) {
     adc_il_drive(true);
 }
 
-// ADC-b: latch both DDS tones + DC offset from the shadow registers. TC3 already
-// runs continuously as the ADC master clock, so this just updates the DDS params
-// atomically (briefly masking the ISR). Tones sum and hard-clip around g_dac_offset
-// (default 512); all-off tones make the per-tick DAC write a steady DC = offset,
-// the rock-steady source the ADC self-test sweeps.
-static void adc_dac_apply(void) {
+// Latch both DDS tones + DC offset from the shadow registers. Mode-aware TC3 use:
+//  - ADC mode: TC3 runs continuously as the ADC master clock, so just update the
+//    DDS params atomically (mask the ISR) and keep it active.
+//  - MIXED / standalone bench: TC3 is NOT the sampler clock here, so it runs ONLY
+//    for a waveform — any active tone starts TC3; all-off writes a steady DC =
+//    offset and stops TC3 (no idle ISR). The DAC is a bench instrument in both
+//    modes; MIXED uses it as the controllable A0->A1 source for tests.
+// Tones sum and hard-clip around g_dac_offset (default 512).
+static void dac_apply(void) {
     if (g_dac_offset > 1023u) g_dac_offset = 1023u;
+    bool any = false;
     NVIC_DisableIRQ(TC3_IRQn);                              // mask the ISR during the update
     for (uint8_t t = 0; t < DAC_NTONES; t++) {
         if (g_dac_amp[t] > 1023u) g_dac_amp[t] = 1023u;
@@ -1673,13 +1677,67 @@ static void adc_dac_apply(void) {
         g_dds.inc[t]  = (g_dac_type[t] == DAC_TONE_SINE || g_dac_type[t] == DAC_TONE_SQUARE)
                       ? (uint32_t)(((uint64_t)f << 32) / DAC_FS_HZ) : 0u;   // off/const don't advance
         g_dds.ph[t]   = 0u;
+        if (g_dac_type[t] != DAC_TONE_OFF) any = true;
     }
     g_dds.offset = (int16_t)g_dac_offset;
-    g_dds.active = true;
-    NVIC_EnableIRQ(TC3_IRQn);
+
+    if (g_mode == MODE_ADC) {
+        g_dds.active = true;                               // TC3 is the ADC clock -> always on
+        NVIC_EnableIRQ(TC3_IRQn);
+        return;
+    }
+    if (any) {                                             // MIXED/standalone waveform -> run TC3
+        g_dds.active = true;
+        dac_init();
+        tc3_init_once();
+        tc3_start_at_period(DAC_TC3_PERIOD);               // re-enables NVIC
+    } else {                                               // pure DC -> hold offset, no ISR
+        g_dds.active = false;
+        tc3_stop();
+        DAC->DATA.reg = g_dac_offset;
+    }
 }
 
-// ADC mode-bank register access (0x10-0x25), dispatched only while MODE_ADC.
+// Shared DAC register access (tone0/1 TYPE/AMP/FREQ at 0x20-0x29, OFFSET 0x2B,
+// APPLY 0x25). The DAC is a bench tool in BOTH ADC and MIXED modes, so both banks
+// delegate here. Returns true if `reg` is a DAC register.
+static bool dac_reg_read(uint8_t reg, uint8_t* out) {
+    switch (reg) {
+    case REG_DAC_T1_TYPE:   *out = g_dac_type[0]; return true;
+    case REG_DAC_T1_AMP:    *out = (uint8_t)g_dac_amp[0]; return true;
+    case REG_DAC_T1_AMP+1u: *out = (uint8_t)(g_dac_amp[0] >> 8); return true;
+    case REG_DAC_T1_FREQ:   *out = (uint8_t)g_dac_freq[0]; return true;
+    case REG_DAC_T1_FREQ+1u:*out = (uint8_t)(g_dac_freq[0] >> 8); return true;
+    case REG_DAC_T2_TYPE:   *out = g_dac_type[1]; return true;
+    case REG_DAC_T2_AMP:    *out = (uint8_t)g_dac_amp[1]; return true;
+    case REG_DAC_T2_AMP+1u: *out = (uint8_t)(g_dac_amp[1] >> 8); return true;
+    case REG_DAC_T2_FREQ:   *out = (uint8_t)g_dac_freq[1]; return true;
+    case REG_DAC_T2_FREQ+1u:*out = (uint8_t)(g_dac_freq[1] >> 8); return true;
+    case REG_DAC_OFFSET:    *out = (uint8_t)g_dac_offset; return true;
+    case REG_DAC_OFFSET+1u: *out = (uint8_t)(g_dac_offset >> 8); return true;
+    default: return false;
+    }
+}
+static bool dac_reg_write(uint8_t reg, uint8_t val) {
+    switch (reg) {
+    case REG_DAC_T1_TYPE:   g_dac_type[0] = val; return true;
+    case REG_DAC_T1_AMP:    g_dac_amp[0]  = (uint16_t)((g_dac_amp[0]  & 0xFF00u) | val); return true;
+    case REG_DAC_T1_AMP+1u: g_dac_amp[0]  = (uint16_t)((g_dac_amp[0]  & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_T1_FREQ:   g_dac_freq[0] = (uint16_t)((g_dac_freq[0] & 0xFF00u) | val); return true;
+    case REG_DAC_T1_FREQ+1u:g_dac_freq[0] = (uint16_t)((g_dac_freq[0] & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_T2_TYPE:   g_dac_type[1] = val; return true;
+    case REG_DAC_T2_AMP:    g_dac_amp[1]  = (uint16_t)((g_dac_amp[1]  & 0xFF00u) | val); return true;
+    case REG_DAC_T2_AMP+1u: g_dac_amp[1]  = (uint16_t)((g_dac_amp[1]  & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_T2_FREQ:   g_dac_freq[1] = (uint16_t)((g_dac_freq[1] & 0xFF00u) | val); return true;
+    case REG_DAC_T2_FREQ+1u:g_dac_freq[1] = (uint16_t)((g_dac_freq[1] & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_OFFSET:    g_dac_offset  = (uint16_t)((g_dac_offset  & 0xFF00u) | val); return true;
+    case REG_DAC_OFFSET+1u: g_dac_offset  = (uint16_t)((g_dac_offset  & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_APPLY:     dac_apply(); return true;
+    default: return false;
+    }
+}
+
+// ADC mode-bank register access (0x10-0x2C), dispatched only while MODE_ADC.
 static uint8_t adc_reg_read(uint8_t reg) {
     if (reg >= REG_ADC_SEQ && reg <= REG_ADC_RMS + 1u
         && g_adc_ch_sel < ADC_NCH && g_adc_win_sel < ADC_NWIN) {
@@ -1694,39 +1752,14 @@ static uint8_t adc_reg_read(uint8_t reg) {
     case REG_ADC_WIN_SEL: return g_adc_win_sel;
     case REG_ADC_ILSTAT:  return g_adc_il_pstat;
     case REG_ADC_ILSTATE: return g_adc_il_state;
-    case REG_DAC_T1_TYPE:   return g_dac_type[0];
-    case REG_DAC_T1_AMP:    return (uint8_t)g_dac_amp[0];
-    case REG_DAC_T1_AMP+1u: return (uint8_t)(g_dac_amp[0] >> 8);
-    case REG_DAC_T1_FREQ:   return (uint8_t)g_dac_freq[0];
-    case REG_DAC_T1_FREQ+1u:return (uint8_t)(g_dac_freq[0] >> 8);
-    case REG_DAC_T2_TYPE:   return g_dac_type[1];
-    case REG_DAC_T2_AMP:    return (uint8_t)g_dac_amp[1];
-    case REG_DAC_T2_AMP+1u: return (uint8_t)(g_dac_amp[1] >> 8);
-    case REG_DAC_T2_FREQ:   return (uint8_t)g_dac_freq[1];
-    case REG_DAC_T2_FREQ+1u:return (uint8_t)(g_dac_freq[1] >> 8);
-    case REG_DAC_OFFSET:    return (uint8_t)g_dac_offset;
-    case REG_DAC_OFFSET+1u: return (uint8_t)(g_dac_offset >> 8);
-    default:               return 0xFFu;
+    default: { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }   // DAC bench regs
     }
 }
 static void adc_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case REG_ADC_CH_SEL:  if (val < ADC_NCH)  g_adc_ch_sel  = val; break;
     case REG_ADC_WIN_SEL: if (val < ADC_NWIN) g_adc_win_sel = val; break;
-    case REG_DAC_T1_TYPE:   g_dac_type[0] = val; break;
-    case REG_DAC_T1_AMP:    g_dac_amp[0]  = (uint16_t)((g_dac_amp[0]  & 0xFF00u) | val); break;
-    case REG_DAC_T1_AMP+1u: g_dac_amp[0]  = (uint16_t)((g_dac_amp[0]  & 0x00FFu) | ((uint16_t)val << 8)); break;
-    case REG_DAC_T1_FREQ:   g_dac_freq[0] = (uint16_t)((g_dac_freq[0] & 0xFF00u) | val); break;
-    case REG_DAC_T1_FREQ+1u:g_dac_freq[0] = (uint16_t)((g_dac_freq[0] & 0x00FFu) | ((uint16_t)val << 8)); break;
-    case REG_DAC_T2_TYPE:   g_dac_type[1] = val; break;
-    case REG_DAC_T2_AMP:    g_dac_amp[1]  = (uint16_t)((g_dac_amp[1]  & 0xFF00u) | val); break;
-    case REG_DAC_T2_AMP+1u: g_dac_amp[1]  = (uint16_t)((g_dac_amp[1]  & 0x00FFu) | ((uint16_t)val << 8)); break;
-    case REG_DAC_T2_FREQ:   g_dac_freq[1] = (uint16_t)((g_dac_freq[1] & 0xFF00u) | val); break;
-    case REG_DAC_T2_FREQ+1u:g_dac_freq[1] = (uint16_t)((g_dac_freq[1] & 0x00FFu) | ((uint16_t)val << 8)); break;
-    case REG_DAC_OFFSET:    g_dac_offset  = (uint16_t)((g_dac_offset  & 0xFF00u) | val); break;
-    case REG_DAC_OFFSET+1u: g_dac_offset  = (uint16_t)((g_dac_offset  & 0x00FFu) | ((uint16_t)val << 8)); break;
-    case REG_DAC_APPLY:   adc_dac_apply(); break;            // latch both tones + offset
-    default: break;
+    default: dac_reg_write(reg, val); break;                 // DAC bench regs
     }
 }
 
@@ -1968,13 +2001,13 @@ static uint8_t mixed_reg_read(uint8_t reg) {
     case REG_MIXED_GPIO_DEB: return g_mixed_gpio_deb;
     case REG_MIXED_ILSTATE:  return g_mixed_il_state;
     case REG_MIXED_ILSTAT:   return g_mixed_il_pstat;
-    default:                 return 0xFFu;
+    default: { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }   // DAC bench regs (A0->A1 source)
     }
 }
 static void mixed_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case REG_MIXED_CH_SEL: if (val < IL_MAX_INPUTS) g_mixed_ch_sel = val; break;
-    default: break;                                          // all other regs are read-only
+    default: dac_reg_write(reg, val); break;                 // DAC bench regs (test source)
     }
 }
 
@@ -2533,6 +2566,9 @@ static void mode_leave(uint8_t m) {
     } else if (m == MODE_ADC) {                     // leaving ADC
         adc_sampler_stop();                         // stop the tone-clocked sweep (TC3 + DDS off)
     } else if (m == MODE_MIXED) {                   // leaving MIXED
+        NVIC_DisableIRQ(TC3_IRQn);                  // stop any DAC waveform the bench tool ran
+        g_dds.active = false;
+        tc3_stop();
         mixed_il_disarm();                          // deassert INT, drop latch, release pins (safe)
     } else if (m == MODE_SERVO) {                   // leaving SERVO
         servo_exit();                               // stop TC4, drive all servo pins low
@@ -2557,6 +2593,14 @@ static void mode_enter(uint8_t m) {
         adc_mode_setup();                           // DIV16 sampler + window stats + DAC const
         adc_il_arm();                               // parse ilcf, claim D6 output, arm interlock
     } else if (m == MODE_MIXED) {                   // entering MIXED
+        dac_init();                                 // DAC bench source available in MIXED (A0->A1)
+        PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;    // route PA02 -> DAC (mode entry may have freed it)
+        PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
+        DAC->CTRLB.bit.EOEN = 1;
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;  // idle: no waveform
+        g_dds.active = false;
+        DAC->DATA.reg = g_dac_offset;               // idle at the DC offset
         mixed_il_arm();                             // parse interlock_cfg, claim pins, set up INT
     } else if (m == MODE_SERVO) {                   // entering SERVO
         DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)
