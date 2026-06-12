@@ -40,6 +40,7 @@ typedef struct {
     const char* text;
     uint16_t    len;
     uint16_t    pos;
+    bool        adc_mode;   // watch operands are ADC streams (auto-declared inputs)
 } parser_t;
 
 static bool at_end(const parser_t* p) {
@@ -379,6 +380,50 @@ static il_parse_status_t parse_cfg(parser_t* p, il_inst_t* inst) {
     return IL_PARSE_OK;
 }
 
+// Resolve an ADC-mode watch operand: "A1" (instantaneous) or "A1_avg_fast"
+// (stat_window) -> auto-declared IL_PIN_MODE_ADC_STREAM input. phys_id = the
+// pin's AIN; oversample_exp = stat (0 now/1 avg/2 min/3 max/4 rms); sh_cyc =
+// window (0 fast/1 mid/2 slow). No cfg claim -- the ADC sweep samples all chans.
+static il_parse_status_t resolve_adc_stream(il_inst_t* inst, const char* s,
+                                            uint8_t len, int* out_idx) {
+    uint8_t u1 = len;
+    for (uint8_t i = 0; i < len; i++) if (s[i] == '_') { u1 = i; break; }
+    const board_pin_t* bp = board_pin_lookup(s, u1);
+    if (bp == 0) return IL_PARSE_UNKNOWN_PIN;
+    uint8_t ain = bp->adc_channel, stat = 0u, win = 0u;     // default: instantaneous
+    if (u1 < len) {
+        uint8_t u2 = len;
+        for (uint8_t i = (uint8_t)(u1 + 1); i < len; i++) if (s[i] == '_') { u2 = i; break; }
+        if (u2 >= len) return IL_PARSE_UNEXPECTED_CHAR;
+        const char* ss = s + u1 + 1; uint8_t sl = (uint8_t)(u2 - u1 - 1);
+        const char* ws = s + u2 + 1; uint8_t wl = (uint8_t)(len - u2 - 1);
+        if      (ident_equals(ss, sl, "avg")) stat = 1u;
+        else if (ident_equals(ss, sl, "min")) stat = 2u;
+        else if (ident_equals(ss, sl, "max")) stat = 3u;
+        else if (ident_equals(ss, sl, "rms")) stat = 4u;
+        else return IL_PARSE_UNKNOWN_MODE;
+        if      (ident_equals(ws, wl, "fast")) win = 0u;
+        else if (ident_equals(ws, wl, "mid"))  win = 1u;
+        else if (ident_equals(ws, wl, "slow")) win = 2u;
+        else return IL_PARSE_UNKNOWN_MODE;
+    }
+    for (uint8_t i = 0; i < inst->input_count; i++) {       // dedup (ain,stat,win)
+        il_input_t* in = &inst->inputs[i];
+        if (in->mode == (uint8_t)IL_PIN_MODE_ADC_STREAM &&
+            in->phys_id == ain && in->oversample_exp == stat && in->sh_cyc == win) {
+            *out_idx = (int)i; return IL_PARSE_OK;
+        }
+    }
+    if (inst->input_count >= IL_MAX_INPUTS) return IL_PARSE_TOO_MANY_INPUTS;
+    il_input_t* in = &inst->inputs[inst->input_count];
+    in->phys_id = ain; in->mode = (uint8_t)IL_PIN_MODE_ADC_STREAM;
+    in->oversample_exp = stat; in->sh_cyc = win;
+    in->debounce_depth = 0u; in->reserved = 0u; in->hyst = 0u;
+    *out_idx = (int)inst->input_count;
+    inst->input_count++;
+    return IL_PARSE_OK;
+}
+
 // watch[D1:1,D2:1]                    — slice-2 implicit-eq form (still legal)
 // watch[A1:gt:512,A1:lt:3000]         — slice-4 3-part form: pin:op:threshold
 // watch[_t_since_m2s:gt:30]           — slice-6 virtual input; auto-declared
@@ -413,7 +458,11 @@ static il_parse_status_t parse_watch(parser_t* p, il_inst_t* inst) {
 
         uint8_t phys_id;
         int     idx;
-        if (lbl[0] == '_') {
+        if (p->adc_mode) {
+            // ADC mode: operand is an ADC stream (auto-declared), not a cfg pin.
+            il_parse_status_t rs = resolve_adc_stream(inst, lbl, llen, &idx);
+            if (rs != IL_PARSE_OK) return rs;
+        } else if (lbl[0] == '_') {
             // Virtual input — resolve to virt_id and auto-declare if first ref.
             uint8_t virt_id = virt_lookup(lbl, llen);
             if (virt_id == 0xFFu) return IL_PARSE_UNKNOWN_VIRTUAL;
@@ -492,12 +541,13 @@ static il_parse_status_t parse_out_block(parser_t* p, il_inst_t* inst, bool is_o
 // Top-level driver
 // ---------------------------------------------------------------------------
 
-il_parse_status_t il_parse(const char* text, uint16_t text_len,
-                           il_inst_t* out, uint16_t* err_offset) {
+static il_parse_status_t il_parse_impl(const char* text, uint16_t text_len,
+                                       il_inst_t* out, uint16_t* err_offset,
+                                       bool adc_mode) {
     if (text == 0 || text_len == 0 || out == 0) return IL_PARSE_EMPTY;
 
     memset(out, 0, sizeof(*out));
-    parser_t p = { .text = text, .len = text_len, .pos = 0 };
+    parser_t p = { .text = text, .len = text_len, .pos = 0, .adc_mode = adc_mode };
 
     // Name
     const char* nstart; uint8_t nlen;
@@ -567,4 +617,14 @@ il_parse_status_t il_parse(const char* text, uint16_t text_len,
 
     out->tf_state = (uint8_t)IL_TF_UNEVALUATED;
     return IL_PARSE_OK;
+}
+
+il_parse_status_t il_parse(const char* text, uint16_t text_len,
+                           il_inst_t* out, uint16_t* err_offset) {
+    return il_parse_impl(text, text_len, out, err_offset, false);
+}
+
+il_parse_status_t il_parse_adc(const char* text, uint16_t text_len,
+                               il_inst_t* out, uint16_t* err_offset) {
+    return il_parse_impl(text, text_len, out, err_offset, true);
 }

@@ -63,6 +63,8 @@ typedef enum {
     IL_PIN_MODE_OUT    = 3,
     IL_PIN_MODE_ADC    = 4,   // slice 4: 12-bit analog input
     IL_PIN_MODE_VIRTUAL = 5,  // slice 6: synthesized input (no physical claim)
+    IL_PIN_MODE_ADC_STREAM = 6, // slice 8: ADC-mode stream (phys_id=AIN; oversample_exp=
+                                // stat 0=now/1=avg/2=min/3=max/4=rms; sh_cyc=window 0/1/2)
 } il_pin_mode_t;
 
 // Virtual-input IDs. When il_input_t.mode == IL_PIN_MODE_VIRTUAL, phys_id
@@ -164,6 +166,14 @@ typedef enum {
 // text where the error was detected. *out is left in undefined state.
 il_parse_status_t il_parse(const char* text, uint16_t text_len,
                            il_inst_t* out, uint16_t* err_offset);
+
+// Same parser, but watch operands are ADC-mode streams `<pin>` (instantaneous)
+// or `<pin>_<stat>_<win>` (stat avg/min/max/rms, win fast/mid/slow). They are
+// auto-declared as IL_PIN_MODE_ADC_STREAM inputs (phys_id = the pin's AIN); no
+// cfg pin-claim, since the ADC sweep already samples every channel. Used by
+// ADC mode; pio/mixed keep using il_parse().
+il_parse_status_t il_parse_adc(const char* text, uint16_t text_len,
+                               il_inst_t* out, uint16_t* err_offset);
 
 // DNF aggregation of per-watch pass results: tf = OR over groups of (AND of
 // the clauses in that group). wpass[i] is whether watch i passed this tick;

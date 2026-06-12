@@ -1115,6 +1115,7 @@ static bool store_commit(uint8_t slot) {
 // a deferred soft reset (so the master's RESET write is ACKed before we drop).
 static void pio_il_tick(void);             // PIO-b gpio interlock eval (defined below)
 static void adc_sample_tick(void);         // ADC-a sampler (defined below)
+static void adc_il_tick(void);             // ADC-b interlock eval (defined below)
 static void mixed_tick(void);              // MIXED-a interlock eval (defined below)
 
 void i2c_store_service(void) {
@@ -1400,6 +1401,7 @@ typedef struct { uint16_t min, max; uint32_t sum; uint64_t sumsq; uint16_t count
 typedef struct { uint16_t min, max, avg, rms; } adc_stat_t;
 static adc_accum_t g_adc_acc[ADC_NCH][ADC_NWIN];
 static adc_stat_t  g_adc_stat[ADC_NCH][ADC_NWIN];
+static volatile uint16_t g_adc_latest[ADC_NCH];     // most recent raw sample (instantaneous)
 static volatile uint16_t g_adc_seq[ADC_NWIN];
 static uint8_t   g_adc_ch_sel, g_adc_win_sel;
 static uint32_t  g_adc_next_ms;
@@ -1464,6 +1466,7 @@ static void adc_sample_tick(void) {
     for (uint8_t ch = 0; ch < ADC_NCH; ch++) {
         uint16_t v = adc_convert(g_adc_ain[ch]);
         if (v > 4095u) v = 4095u;
+        g_adc_latest[ch] = v;
         for (uint8_t w = 0; w < ADC_NWIN; w++) {
             adc_accum_t *a = &g_adc_acc[ch][w];
             if (a->count == 0u) { a->min = v; a->max = v; }
@@ -1496,6 +1499,92 @@ static void adc_sample_tick(void) {
             g_adc_seq[w]++;
         }
     }
+    adc_il_tick();                                           // evaluate the ADC interlock
+}
+
+// ---- ADC mode interlock (ADC-b): DNF over ADC streams -> drive D6 -------------
+// Reuses il_parse_adc + il_dnf_result. Watch operands are ADC streams (A1 /
+// A1_avg_fast); il_input_t carries phys_id=AIN, oversample_exp=stat, sh_cyc=win.
+// The sweep already samples every channel, so the interlock just reads the named
+// stream each tick, ORs the AND-groups, and drives the out_ok/out_err pin (D6).
+#define REG_ADC_ILSTAT  0x1Cu   // r: il_parse status (0=OK/armed, 0xFF=no record)
+#define REG_ADC_ILSTATE 0x1Du   // r: bit0 tripped, bit1 cond-ok, bit2 valid/armed
+#define ADC_IL_INT_BIT  0x08u   // INT_FLAGS bit owned by the ADC interlock
+
+static il_inst_t g_adc_il;
+static bool      g_adc_il_valid, g_adc_il_tripped;
+static uint8_t   g_adc_il_pstat = 0xFFu;
+static volatile uint8_t g_adc_il_state;
+
+static uint16_t adc_stream_value(const il_input_t* in) {
+    int ch = -1;
+    for (uint8_t i = 0; i < ADC_NCH; i++) if (g_adc_ain[i] == in->phys_id) { ch = (int)i; break; }
+    if (ch < 0) return 0u;
+    uint8_t w = in->sh_cyc < ADC_NWIN ? in->sh_cyc : 0u;
+    switch (in->oversample_exp) {                            // stat selector
+    case 1:  return g_adc_stat[ch][w].avg;
+    case 2:  return g_adc_stat[ch][w].min;
+    case 3:  return g_adc_stat[ch][w].max;
+    case 4:  return g_adc_stat[ch][w].rms;
+    default: return g_adc_latest[ch];                        // 0 = instantaneous
+    }
+}
+static bool adc_watch_pass(const il_watch_t* w, uint16_t v) {
+    switch (w->op) {
+    case IL_OP_EQ: return v == w->threshold;
+    case IL_OP_NE: return v != w->threshold;
+    case IL_OP_LT: return v <  w->threshold;
+    case IL_OP_GT: return v >  w->threshold;
+    case IL_OP_LE: return v <= w->threshold;
+    case IL_OP_GE: return v >= w->threshold;
+    default:       return true;
+    }
+}
+static void adc_il_drive(bool ok) {                          // drive every output pin
+    for (uint8_t i = 0; i < g_adc_il.output_count; i++) {
+        uint8_t phys = g_adc_il.outputs[i].phys_id, g = phys >> 5, p = phys & 0x1Fu;
+        uint32_t m = 1u << p;
+        if (ok ? g_adc_il.outputs[i].ok_value : g_adc_il.outputs[i].err_value)
+            PORT->Group[g].OUTSET.reg = m;
+        else PORT->Group[g].OUTCLR.reg = m;
+        PORT->Group[g].DIRSET.reg = m;
+    }
+}
+static void adc_il_arm(void) {
+    g_adc_il_valid = false; g_adc_il_tripped = false; g_adc_il_state = 0u;
+    int ils = store_find_str("ilcf");
+    if (ils < 0) { g_adc_il_pstat = 0xFFu; return; }
+    g_adc_il_pstat = (uint8_t)il_parse_adc((const char*)g_rec_data[ils], g_rec_len[ils],
+                                           &g_adc_il, NULL);
+    if (g_adc_il_pstat != (uint8_t)IL_PARSE_OK || g_adc_il.watch_count == 0u) return;
+    for (uint8_t i = 0; i < g_adc_il.output_count; i++) {    // each output -> GPIO output
+        uint8_t phys = g_adc_il.outputs[i].phys_id, g = phys >> 5, p = phys & 0x1Fu;
+        PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
+    }
+    g_adc_il_valid = true;
+    adc_il_drive(true);                                      // start in the OK state
+}
+static void adc_il_tick(void) {
+    if (g_mode != MODE_ADC || !g_adc_il_valid) return;
+    bool wpass[IL_MAX_WATCHES];
+    for (uint8_t i = 0; i < g_adc_il.watch_count; i++) {
+        const il_watch_t* w = &g_adc_il.watches[i];
+        wpass[i] = adc_watch_pass(w, adc_stream_value(&g_adc_il.inputs[w->input_idx]));
+    }
+    bool all_pass = il_dnf_result(&g_adc_il, wpass);
+    g_adc_il_state = (uint8_t)((g_adc_il_tripped ? 1u : 0u) | (all_pass ? 2u : 0u) | 4u);
+    if (!g_adc_il_tripped && !all_pass) {                    // first failure -> latch trip
+        g_adc_il_tripped = true;
+        g_int_flags |= ADC_IL_INT_BIT;
+    }
+    adc_il_drive(!g_adc_il_tripped);                         // ok while safe, err (safe) once tripped
+}
+// Master cleared the trip bit in INT_FLAGS -> un-latch; the next tick re-trips if
+// the condition is still failing, otherwise the output resumes its ok value.
+static void adc_il_manual_reset(void) {
+    if (!g_adc_il_tripped) return;
+    g_adc_il_tripped = false;
+    adc_il_drive(true);
 }
 
 // ADC-b: latch the DAC sub-state (constant / sine / square) from MODE+LEVEL+FREQ.
@@ -1541,6 +1630,8 @@ static uint8_t adc_reg_read(uint8_t reg) {
     switch (reg) {
     case REG_ADC_CH_SEL:  return g_adc_ch_sel;
     case REG_ADC_WIN_SEL: return g_adc_win_sel;
+    case REG_ADC_ILSTAT:  return g_adc_il_pstat;
+    case REG_ADC_ILSTATE: return g_adc_il_state;
     case REG_DAC_MODE:     return g_dac_mode;
     case REG_DAC_LEVEL:    return (uint8_t)g_dac_level;
     case REG_DAC_LEVEL+1u: return (uint8_t)(g_dac_level >> 8);
@@ -2390,6 +2481,7 @@ static void mode_enter(uint8_t m) {
         pio_il_arm();                               // parse interlock_cfg, set up INT pin
     } else if (m == MODE_ADC) {                     // entering ADC
         adc_mode_setup();                           // DIV16 sampler + window stats + DAC const
+        adc_il_arm();                               // parse ilcf, claim D6 output, arm interlock
     } else if (m == MODE_MIXED) {                   // entering MIXED
         mixed_il_arm();                             // parse interlock_cfg, claim pins, set up INT
     } else if (m == MODE_SERVO) {                   // entering SERVO
@@ -2465,6 +2557,7 @@ static void i2c_reg_write(uint8_t reg, uint8_t val) {
         g_int_flags &= (uint8_t)~val;
         if (val & 0x01u) pio_il_manual_reset();           // acking the trip bit == manual reset
         if ((val & MIXED_IL_INT_BIT) && g_mode == MODE_MIXED) mixed_il_manual_reset();
+        if ((val & ADC_IL_INT_BIT) && g_mode == MODE_ADC) adc_il_manual_reset();
         break;
     case 0x0E: if (val == 0xA5u) g_reset_pending = true; break;  // RESET (magic 0xA5; deferred)
     // NOTE: SLOT-indexed legacy access path (sel = slot 0..STORE_SLOTS-1). The
