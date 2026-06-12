@@ -48,7 +48,7 @@ MODES = {
     'SERVO': 4, 'COUNTER': 5,
 }
 MODE_NAME = {0: 'IDLE', 1: 'GPIO', 2: 'ADC', 3: 'MIXED', 4: 'SERVO', 5: 'COUNTER'}
-MODES_WITH_ILCF = {1, 3}              # GPIO + MIXED carry a pin/interlock file
+MODES_WITH_ILCF = {1, 2, 3}          # GPIO, ADC, MIXED carry an interlock file
 
 IL_MAX_INPUTS = 4
 IL_MAX_WATCHES = 8
@@ -88,9 +88,17 @@ _TOKEN = re.compile(r'''
         (?P<lp>\() |
         (?P<rp>\)) |
         (?P<num>\d+(?:\.\d+)?[Vv]?) |
+        (?P<dot>\.) |
         (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
     )
 ''', re.VERBOSE)
+
+# ADC-mode interlock streams: a watch reads one of these per channel.
+ADC_STATS   = ('avg', 'min', 'max', 'rms')         # windowed stats
+ADC_WINDOWS = {'fast': 0, 'mid': 1, 'slow': 2}     # 10 Hz / 1 Hz / 0.1 Hz tumbling windows
+# Channels the ADC sweep samples (D6/A6 = interlock output, A0 = DAC -> not watchable).
+ADC_WATCH_PINS = ('A1', 'A2', 'A3', 'A7', 'A8', 'A9', 'A10',
+                  'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
 
 
 def _tokenize(text):
@@ -117,7 +125,8 @@ class _ExprParser:
     """Parses a boolean expression against a unit's declared pin roles into an
     AST of ('or'|'and', [children]) / ('not', child) / ('lit', pin, op, thr)."""
 
-    def __init__(self, toks, roles, vref):
+    def __init__(self, toks, roles, vref, adc=False):
+        self.adc = adc                # ADC mode: atoms are channel.stat.window streams
         self.toks = toks
         self.i = 0
         self.roles = roles            # label -> (base, mods)
@@ -167,10 +176,45 @@ class _ExprParser:
             return node
         if kind == 'ident':
             self._next()
+            if self.adc:
+                return self._adc_comparison(val.upper())
             # pin names are case-insensitive (d0 == D0); virtuals keep their case
             pin = val if val.startswith('_') else val.upper()
             return self._comparison(pin)
         raise DSLError("expected a pin or '(', got %r" % (val,))
+
+    def _adc_comparison(self, chan):
+        # ADC stream: <channel>[.<stat>.<window>] <op> <threshold>. Default stat =
+        # instantaneous. Emits the ilcf operand <PIN> or <PIN>_<stat>_<win>.
+        if chan not in ADC_WATCH_PINS:
+            raise DSLError("ADC channel %r not watchable (A1-A3,A7-A10; A0=DAC, A6/D6=output)" % chan)
+        operand = chan
+        if self._peek()[0] == 'dot':
+            self._next()
+            k, stat = self._next()
+            if k != 'ident' or stat.lower() not in ADC_STATS:
+                raise DSLError("expected stat avg/min/max/rms after '.', got %r" % (stat,))
+            if self._next()[0] != 'dot':
+                raise DSLError("expected .window after .%s (fast/mid/slow)" % stat)
+            k, win = self._next()
+            if k != 'ident' or win.lower() not in ADC_WINDOWS:
+                raise DSLError("expected window fast/mid/slow, got %r" % (win,))
+            operand = "%s_%s_%s" % (chan, stat.lower(), win.lower())
+        k, sym = self._peek()
+        if k != 'op':
+            raise DSLError("ADC stream %r needs a comparison (e.g. %s > 1.5V)" % (operand, chan))
+        self._next()
+        op = _OP_FROM_SYM[sym]
+        nk, nval = self._next()
+        if nk != 'num':
+            raise DSLError("expected a number after %r" % sym)
+        if nval[-1:] in ('V', 'v'):
+            thr = _volts_to_count(float(nval[:-1]), self.vref)
+        else:
+            thr = int(nval)
+            if not 0 <= thr <= ADC_FULLSCALE:
+                raise DSLError("ADC count %d out of range 0..%d" % (thr, ADC_FULLSCALE))
+        return ('lit', operand, op, thr)
 
     def _comparison(self, pin):
         if pin not in self.roles:
@@ -239,9 +283,9 @@ def _to_dnf(node):
     raise DSLError("bad AST node %r" % (node,))
 
 
-def _compile_expr(when, roles, vref):
-    """Boolean expression -> list of groups, each a list of (pin, op, thr)."""
-    ast = _ExprParser(_tokenize(when), roles, vref).parse()
+def _compile_expr(when, roles, vref, adc=False):
+    """Boolean expression -> list of groups, each a list of (operand, op, thr)."""
+    ast = _ExprParser(_tokenize(when), roles, vref, adc=adc).parse()
     groups = []
     for term in _to_dnf(_push_not(ast)):
         seen, lits = set(), []
@@ -320,10 +364,12 @@ class Unit:
             return None
         if self.il is None or not self.il[1]:
             return self.ILCF_OFF
-        if not self.roles:
-            raise DSLError("%s mode needs pins()" % MODE_NAME[self.mode])
         name, when, drive = self.il
         drive = drive or {}
+        if self.mode == MODES['ADC']:
+            return self._ilcf_adc(name, when, drive)
+        if not self.roles:
+            raise DSLError("%s mode needs pins()" % MODE_NAME[self.mode])
 
         groups = _compile_expr(when, self.roles, self.vref)
         inputs = []                           # watched input pins, first-seen order
@@ -374,6 +420,41 @@ class Unit:
     @staticmethod
     def _clause(pin, op, thr):
         return "%s:%d" % (pin, thr) if op == 'eq' else "%s:%s:%d" % (pin, op, thr)
+
+    def _ilcf_adc(self, name, when, drive):
+        """ADC-mode interlock: watches are channel streams (no cfg pin claim --
+        the sweep samples every channel), driving the output(s). Emits
+        name;cfg[(D6):out];watch[<stream>:op:thr|...];out_ok[..];out_err[..],
+        where <stream> is `A1` (instantaneous) or `A1_avg_fast` (stat_window)."""
+        if not drive:
+            raise DSLError("ADC interlock needs a drive output (e.g. drive={'D6':1})")
+        if len(drive) > IL_MAX_OUTPUTS:
+            raise DSLError("%d outputs > IL_MAX_OUTPUTS=%d" % (len(drive), IL_MAX_OUTPUTS))
+        groups = _compile_expr(when, {}, self.vref, adc=True)
+        streams = []
+        for g in groups:
+            for (operand, _, _) in g:
+                if operand not in streams:
+                    streams.append(operand)
+        if len(streams) > IL_MAX_INPUTS:
+            raise DSLError("%d watched ADC streams > IL_MAX_INPUTS=%d" % (len(streams), IL_MAX_INPUTS))
+        total = sum(len(g) for g in groups)
+        if total > IL_MAX_WATCHES:
+            raise DSLError("%d watch clauses > IL_MAX_WATCHES=%d" % (total, IL_MAX_WATCHES))
+        cfg = ",".join("(%s):out" % d.upper() for d in drive)
+        watch = "|".join(",".join(self._clause(s, op, thr) for (s, op, thr) in g) for g in groups)
+        ok, err = [], []
+        for label, v in drive.items():
+            if v not in (0, 1):
+                raise DSLError("drive value for %r must be 0 or 1" % label)
+            ok.append("%s:%d" % (label.upper(), v))
+            err.append("%s:%d" % (label.upper(), 1 - v))
+        sections = [name, "cfg[%s]" % cfg, "watch[%s]" % watch,
+                    "out_ok[%s]" % ",".join(ok), "out_err[%s]" % ",".join(err)]
+        text = sections[0] + "".join(";" + s for s in sections[1:])
+        if len(text) > IL_DSL_MAX:
+            raise DSLError("ilcf is %d bytes > IL_DSL_MAX=%d" % (len(text), IL_DSL_MAX))
+        return text
 
     def gpmp(self):
         """GPIO power-on pin map: 6 bytes [VER=2, DIR, PULLEN, OUT, OD, INTCFG].
@@ -500,10 +581,12 @@ def _selftest():
     assert u.ilcf().split(';')[3] == "out_ok[D6:0]"      # ok=0
     assert u.ilcf().split(';')[4] == "out_err[D6:1]"     # err=1-0
 
-    # 4. SERVO/COUNTER/ADC/IDLE: idnt only, no ilcf
-    for ty, m in (('SERVO', 4), ('COUNTER', 5), ('ADC', 2), ('IDLE', 0)):
+    # 4. SERVO/COUNTER/IDLE: idnt only. ADC (interlock-capable) with no interlock
+    #    emits the null ilcf, like GPIO/MIXED.
+    for ty, m in (('SERVO', 4), ('COUNTER', 5), ('IDLE', 0)):
         u = Unit(0x60, ty)
         assert u.files() == {'idnt': bytes([0x60, m])}, (ty, u.files())
+    assert Unit(0x60, 'ADC').files() == {'idnt': bytes([0x60, 2]), 'ilcf': b'off'}
 
     # 5. error cases
     for fn in (
@@ -584,6 +667,26 @@ def _selftest():
     #  OUT  D0(up) + D8,D10(od released) + D9(out:1) = bits 0,5,6,7 = 0xE1
     #  OD   D8,D10 = bits 5,7 = 0xA0
     assert g == bytes([2, 0xF0, 0x01, 0xE1, 0xA0, 0x00]), list(g)
+
+    # 11. ADC mode interlock: stream selectors (.stat.window) + default instantaneous
+    u = Unit(0x30, 'ADC')
+    u.interlock('ov', 'A1.avg.fast > 1.5V || A2.rms.mid > 0.5V', drive={'D6': 1})
+    f = u.files()
+    assert f['idnt'] == bytes([0x30, 2]), f['idnt']
+    assert set(f) == {'idnt', 'ilcf'}, set(f)               # no gpmp in ADC mode
+    exp = ("ov;cfg[(D6):out];watch[A1_avg_fast:gt:1861|A2_rms_mid:gt:620];"
+           "out_ok[D6:1];out_err[D6:0]")           # 1.5V->1861, 0.5V->620
+    assert f['ilcf'].decode() == exp, f['ilcf'].decode()
+    u2 = Unit(0x30, 'ADC'); u2.interlock('x', 'A1 > 2.0V', drive={'D6': 1})
+    assert u2.ilcf().split(';')[2] == "watch[A1:gt:2482]", u2.ilcf()   # default instantaneous
+    for bad in ('A0 > 1V', 'A1.foo.fast > 1V', 'A1.avg.turbo > 1V', 'A1 > 1V'):
+        try:
+            Unit(0x30, 'ADC').interlock('x', bad,
+                                        drive=None if bad == 'A1 > 1V' else {'D6': 1}).ilcf()
+        except DSLError:
+            pass
+        else:
+            raise AssertionError("expected DSLError: %s" % bad)
 
     print("slave_dsl self-test: PASS")
 
