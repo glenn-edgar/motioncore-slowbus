@@ -384,10 +384,10 @@ static il_parse_status_t parse_cfg(parser_t* p, il_inst_t* inst) {
     return IL_PARSE_OK;
 }
 
-// Resolve an ADC-mode watch operand: "A1" (instantaneous) or "A1_avg_fast"
+// Resolve an ADC-mode watch operand: "A1" (instantaneous) or "A1_avg_khz1"
 // (stat_window) -> auto-declared IL_PIN_MODE_ADC_STREAM input. phys_id = the
 // pin's AIN; oversample_exp = stat (0 now/1 avg/2 min/3 max/4 rms); sh_cyc =
-// window (0 fast/1 mid/2 slow). No cfg claim -- the ADC sweep samples all chans.
+// window (0 khz1 / 1 hz100 / 2 hz10). No cfg claim -- ADC mode samples the channel.
 static il_parse_status_t resolve_adc_stream(il_inst_t* inst, const char* s,
                                             uint8_t len, int* out_idx) {
     uint8_t u1 = len;
@@ -406,9 +406,9 @@ static il_parse_status_t resolve_adc_stream(il_inst_t* inst, const char* s,
         else if (ident_equals(ss, sl, "max")) stat = 3u;
         else if (ident_equals(ss, sl, "rms")) stat = 4u;
         else return IL_PARSE_UNKNOWN_MODE;
-        if      (ident_equals(ws, wl, "fast")) win = 0u;
-        else if (ident_equals(ws, wl, "mid"))  win = 1u;
-        else if (ident_equals(ws, wl, "slow")) win = 2u;
+        if      (ident_equals(ws, wl, "khz1"))  win = 0u;
+        else if (ident_equals(ws, wl, "hz100")) win = 1u;
+        else if (ident_equals(ws, wl, "hz10"))  win = 2u;
         else return IL_PARSE_UNKNOWN_MODE;
     }
     for (uint8_t i = 0; i < inst->input_count; i++) {       // dedup (ain,stat,win)

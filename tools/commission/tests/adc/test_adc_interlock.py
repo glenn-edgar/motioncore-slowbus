@@ -1,9 +1,10 @@
 """test_adc_interlock.py -- ADC interlock over streams (needs the A0->A1 jumper).
 
-Commissions ADC-mode interlocks and sweeps the DAC to move A1 across the
-threshold, checking cond-ok (the live comparison) flips where it should. Covers
-the stream selector (.stat.window + instantaneous) and DNF (AND within a group,
-OR across groups). The trip is cleared each step so cond-ok follows live.
+Commissions single-channel (A1) ADC-mode interlocks and sweeps the DAC to move A1
+across the threshold, checking cond-ok (the live comparison) flips where it should.
+Covers the stream selector (.stat.window with the khz1/hz100/hz10 downsample windows
++ default instantaneous) and DNF (AND within a group, OR across groups). The trip is
+cleared each step so cond-ok follows live.
 """
 
 from adc_harness import (R, Checker, commission, dac_const, set_dac,
@@ -32,18 +33,18 @@ def sweep(expr, cases, settle):
 
 
 def run():
-    f = WIN_SETTLE[WIN["fast"]]
+    w = WIN_SETTLE[WIN["hz100"]]
     ok = True
     print("instantaneous (default stat):")
     ok &= sweep("A1 > 2.0V", [(256, 0), (768, 1)], 0.15)
-    print("windowed average (avg.fast):")
-    ok &= sweep("A1.avg.fast > 2.0V", [(256, 0), (768, 1)], f)
-    print("window max:")
-    ok &= sweep("A1.max.fast > 2.0V", [(256, 0), (768, 1)], f)
+    print("windowed average (avg.hz100):")
+    ok &= sweep("A1.avg.hz100 > 2.0V", [(256, 0), (768, 1)], w)
+    print("window max (max.hz100):")
+    ok &= sweep("A1.max.hz100 > 2.0V", [(256, 0), (768, 1)], w)
     print("AND band (one stream, two clauses, one group):")
-    ok &= sweep("A1.avg.fast > 1.0V && A1.avg.fast < 3.0V", [(128, 0), (512, 1), (960, 0)], f)
+    ok &= sweep("A1.avg.hz100 > 1.0V && A1.avg.hz100 < 3.0V", [(128, 0), (512, 1), (960, 0)], w)
     print("OR (two DNF groups):")
-    ok &= sweep("A1.avg.fast < 1.0V || A1.avg.fast > 3.0V", [(128, 1), (512, 0), (960, 1)], f)
+    ok &= sweep("A1.avg.hz100 < 1.0V || A1.avg.hz100 > 3.0V", [(128, 1), (512, 0), (960, 1)], w)
     return ok
 
 
