@@ -114,6 +114,14 @@ def cmd_ls(args):
         print("%-4s  %d bytes" % (name, length))
 
 
+def cmd_format(args):
+    with _open(args) as dg:
+        dg.offline()                      # erase needs the offline commissioning gate
+        dg.file_format()                  # wipe the ENTIRE named-file store
+    # disconnect -> reboot; with no files the chip comes up factory-fresh (mode IDLE).
+    print("store erased: all files removed (chip reboots factory-fresh on disconnect)")
+
+
 def cmd_mode(args):
     with _open(args) as dg:
         val = dg.mode(set=args.value)
@@ -166,6 +174,9 @@ def build_parser():
 
     sub.add_parser("ls", help="list files on-chip"
                    ).set_defaults(func=cmd_ls)
+
+    sub.add_parser("format", help="erase the ENTIRE named-file store (factory-fresh)"
+                   ).set_defaults(func=cmd_format)
 
     sp = sub.add_parser("mode", help="get/set the MODE register (0x02)")
     sp.add_argument("value", nargs="?", type=_parse_int,
