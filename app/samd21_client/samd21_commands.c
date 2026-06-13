@@ -1131,7 +1131,8 @@ static void adc_il_tick(void);             // ADC-b interlock eval (defined belo
 static void adc_sampler_start(void);       // tone-clocked ADC sweep (defined below)
 static void adc_sampler_stop(void);
 static void mixed_tick(void);              // MIXED-a interlock eval (defined below)
-static void counter_bench_tick(void);      // COUNTER bench ADC oneshot service (defined below)
+static void bench_tick(void);              // shared bench ADC oneshot service (defined below)
+static void servo_tick(void);              // SERVO e-stop poll (defined below)
 
 void i2c_store_service(void) {
     if (g_commit_pending >= 0) {
@@ -1145,7 +1146,8 @@ void i2c_store_service(void) {
     pio_il_tick();                         // evaluate the gpio interlock (no-op unless armed in PIO)
     adc_sample_tick();                     // ADC interlock eval (sampling runs in the TC3 ISR)
     mixed_tick();                          // ~100 Hz mixed ADC+GPIO interlock (no-op unless MODE_MIXED)
-    counter_bench_tick();                  // serve a pending COUNTER bench ADC oneshot (no-op otherwise)
+    bench_tick();                          // serve a pending bench ADC oneshot (no-op unless active)
+    servo_tick();                          // SERVO e-stop poll (no-op unless MODE_SERVO)
 }
 
 // ---- PIO mode (PIO-a): 8-bit GPIO expander, CH0..CH7 = D0-D3, D6-D9 ---------
@@ -2014,6 +2016,161 @@ static void mixed_reg_write(uint8_t reg, uint8_t val) {
 }
 
 // ============================================================================
+// Bench tools — single-shot ADC / GPIO on the pads a mode leaves spare.
+//
+// Shared by COUNTER and SERVO. Each spare pad carries a fixed bench ROLE (gpio-in
+// / gpio-out / adc / dac), set by the mode's config at enter; the mode also
+// RESERVES the pads it owns (counters / servos / interlock), and D4/D5 (I2C) are
+// always reserved. The bench API never changes a pad's role or direction — it only
+// drives an already-output pad, reads an already-input pad, or samples an already-
+// analog pad. Each op is validated against the pad's role and reported via
+// REG_BENCH_STAT. Pads are addressed by Seeed silkscreen index (D0..D10 == A0..A10).
+// I2C is request/get (a write requests, a later read gets); the 16x ADC oneshot
+// blocks ~1 ms, so it runs in the superloop (bench_tick), never in the I2C handler
+// — the bus is not clock-stretched. The synchronous path is the USB CMD_ADC_READ.
+// ============================================================================
+#define REG_BENCH_SEL    0x15u   // w/r: Seeed pad index 0..10 (latch only, no reconfig)
+#define REG_BENCH_GPO    0x16u   // w:   0/1 -> drive selected pad (role gpio-out)
+#define REG_BENCH_GPI    0x17u   // r:   selected pad level 0/1 (role gpio-in)
+#define REG_BENCH_ADCRQ  0x18u   // w:   request 16x oneshot (role adc)
+#define REG_BENCH_ADCST  0x19u   // r:   0 = ready, 1 = conversion pending
+#define REG_BENCH_ADCV   0x1Bu   // r:   u16 last ADC result (0x1B lo, 0x1C hi)
+#define REG_BENCH_STAT   0x1Du   // r:   last bench-command status (BENCH_OK..BENCH_UNSUPPORTED)
+#define REG_BENCH_ROLE   0x1Eu   // r:   selected pad's role (BENCH_ROLE_*)
+#define REG_DAC_FIRST    0x20u   // DAC bench sub-bank span (gated on D0 role = dac)
+#define REG_DAC_LAST     0x2Cu
+#define BENCH_OVERSAMPLE 4u      // 16x (2^4) — matches MIXED-mode ADC reads
+#define BENCH_SH_CYC     5u      // sample-hold cycles (low-impedance default)
+#define BENCH_I2C_MASK   ((uint16_t)((1u << 4) | (1u << 5)))   // D4/D5 always reserved
+
+enum { BENCH_ROLE_NONE = 0u, BENCH_ROLE_GPI, BENCH_ROLE_GPO, BENCH_ROLE_ADC, BENCH_ROLE_DAC };
+enum { BENCH_OK = 0u, BENCH_BAD_PIN, BENCH_WRONG_ROLE, BENCH_UNSUPPORTED };
+
+// Bench pad table: Seeed index 0..10 -> chip (group, pin, ADC AIN). A_n aliases D_n.
+static const struct { uint8_t group, pin, ain; } g_bench_pad[11] = {
+    {0,  2,  0u}, {0,  4,  4u}, {0, 10, 18u}, {0, 11, 19u},          // D0 D1 D2 D3
+    {0,  8, 16u}, {0,  9, 17u},                                      // D4 D5 (I2C)
+    {1,  8,  2u}, {1,  9,  3u}, {0,  7,  7u}, {0,  5,  5u}, {0, 6, 6u}, // D6 D7 D8 D9 D10
+};
+static uint8_t  g_bench_role[11];                  // per Seeed-pad role (BENCH_ROLE_*)
+static uint16_t g_bench_reserved = BENCH_I2C_MASK; // Seeed-idx bits a mode owns (not benchable)
+static uint8_t  g_bench_sel = 0xFFu;               // selected Seeed pad (0xFF = none/invalid)
+static uint8_t  g_bench_stat = BENCH_OK;           // last bench-command status (REG_BENCH_STAT)
+static uint16_t g_bench_adc_val;                   // last ADC result (get)
+static volatile bool g_bench_adc_pending;          // request flag; served in bench_tick
+static bool     g_bench_active;                    // a bench-capable mode is running
+
+// -- mode setup hooks (call bench_reset() first at enter, then set_role/reserve) --
+static void bench_reset(void) {
+    g_bench_sel = 0xFFu; g_bench_stat = BENCH_OK;
+    g_bench_adc_pending = false; g_bench_adc_val = 0u;
+    g_bench_reserved = BENCH_I2C_MASK;
+    for (uint8_t i = 0; i < 11u; i++) g_bench_role[i] = BENCH_ROLE_NONE;
+}
+static void bench_set_role(uint8_t idx, uint8_t role) { if (idx < 11u) g_bench_role[idx] = role; }
+static void bench_reserve(uint8_t idx)                { if (idx < 11u) g_bench_reserved |= (uint16_t)(1u << idx); }
+
+// Apply each spare pad's fixed role to the pin, ONCE at mode enter. Reserved pads
+// (the mode's primary function + I2C) are skipped; DAC (D0) is brought up by the mode.
+static void bench_apply_roles(void) {
+    for (uint8_t idx = 0; idx < 11u; idx++) {
+        if (g_bench_reserved & (uint16_t)(1u << idx)) continue;
+        uint8_t g = g_bench_pad[idx].group, p = g_bench_pad[idx].pin;
+        switch (g_bench_role[idx]) {
+        case BENCH_ROLE_GPI:
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;    // digital input, no pull
+            break;
+        case BENCH_ROLE_GPO:
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].OUTCLR.reg = (1u << p);              // start low
+            PORT->Group[g].DIRSET.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;    // INEN for read-back
+            break;
+        case BENCH_ROLE_ADC:
+            adc_init();
+            adc_pin_config(g, p);                               // PMUX -> analog
+            break;
+        default: break;                                         // NONE / DAC -> handled by the mode
+        }
+    }
+}
+
+// -- selection + single-shot ops --
+static uint8_t bench_sel_role(void) {
+    return (g_bench_sel < 11u) ? g_bench_role[g_bench_sel] : BENCH_ROLE_NONE;
+}
+static bool bench_sel_valid(uint8_t idx) {
+    return (idx < 11u) && !(g_bench_reserved & (uint16_t)(1u << idx));
+}
+// BENCH_SEL: latch only — never reconfigure the pin (role/dir fixed at enter).
+static void bench_select(uint8_t idx) {
+    if (!bench_sel_valid(idx)) { g_bench_sel = 0xFFu; g_bench_stat = BENCH_BAD_PIN; return; }
+    g_bench_sel = idx; g_bench_stat = BENCH_OK;
+}
+static void bench_gpio_out(uint8_t level) {
+    if (bench_sel_role() != BENCH_ROLE_GPO) { g_bench_stat = BENCH_WRONG_ROLE; return; }
+    uint8_t g = g_bench_pad[g_bench_sel].group, p = g_bench_pad[g_bench_sel].pin;
+    if (level & 1u) PORT->Group[g].OUTSET.reg = (1u << p);
+    else            PORT->Group[g].OUTCLR.reg = (1u << p);
+    g_bench_stat = BENCH_OK;
+}
+static uint8_t bench_gpio_in(void) {
+    if (bench_sel_role() != BENCH_ROLE_GPI) { g_bench_stat = BENCH_WRONG_ROLE; return 0xFFu; }
+    uint8_t g = g_bench_pad[g_bench_sel].group, p = g_bench_pad[g_bench_sel].pin;
+    g_bench_stat = BENCH_OK;
+    return (PORT->Group[g].IN.reg & (1u << p)) ? 1u : 0u;
+}
+// Superloop: serve a pending ADC request (blocks ~1 ms at 16x; the pad is already
+// in analog mode from bench_apply_roles).
+static void bench_tick(void) {
+    if (!g_bench_active || !g_bench_adc_pending) return;
+    uint8_t idx = g_bench_sel;
+    if (idx < 11u)
+        g_bench_adc_val = samd21_adc_read_oneshot(g_bench_pad[idx].ain, BENCH_OVERSAMPLE, BENCH_SH_CYC);
+    g_bench_adc_pending = false;
+}
+
+// -- register dispatch (0x15-0x1E + DAC sub-bank); a mode delegates non-primary regs here --
+static uint8_t bench_reg_read(uint8_t reg) {
+    switch (reg) {
+    case REG_BENCH_SEL:       return g_bench_sel;
+    case REG_BENCH_GPI:       return bench_gpio_in();
+    case REG_BENCH_ADCST:     return g_bench_adc_pending ? 1u : 0u;
+    case REG_BENCH_ADCV:      return (uint8_t)g_bench_adc_val;
+    case REG_BENCH_ADCV + 1u: return (uint8_t)(g_bench_adc_val >> 8);
+    case REG_BENCH_STAT:      return g_bench_stat;
+    case REG_BENCH_ROLE:      return bench_sel_role();
+    default:
+        if (reg >= REG_DAC_FIRST && reg <= REG_DAC_LAST) {      // DAC sub-bank, gated on D0=dac
+            if (g_bench_role[0] != BENCH_ROLE_DAC) { g_bench_stat = BENCH_WRONG_ROLE; return 0xFFu; }
+            uint8_t v = 0xFFu;
+            if (dac_reg_read(reg, &v)) { g_bench_stat = BENCH_OK; return v; }
+        }
+        g_bench_stat = BENCH_UNSUPPORTED;
+        return 0xFFu;
+    }
+}
+static void bench_reg_write(uint8_t reg, uint8_t val) {
+    switch (reg) {
+    case REG_BENCH_SEL:   bench_select(val);   break;
+    case REG_BENCH_GPO:   bench_gpio_out(val); break;
+    case REG_BENCH_ADCRQ:
+        if (bench_sel_role() != BENCH_ROLE_ADC) { g_bench_stat = BENCH_WRONG_ROLE; break; }
+        g_bench_adc_pending = true; g_bench_stat = BENCH_OK;
+        break;
+    default:
+        if (reg >= REG_DAC_FIRST && reg <= REG_DAC_LAST) {      // DAC sub-bank, gated on D0=dac
+            if (g_bench_role[0] != BENCH_ROLE_DAC) { g_bench_stat = BENCH_WRONG_ROLE; break; }
+            if (dac_reg_write(reg, val)) { g_bench_stat = BENCH_OK; break; }
+        }
+        g_bench_stat = BENCH_UNSUPPORTED;
+        break;
+    }
+}
+
+// ============================================================================
 // SERVO mode — 9 RC servos on a SOFTWARE common-rising-edge frame.
 //
 // The 9 servo pins do NOT map to TCC waveform outputs, so we can't use hardware
@@ -2038,42 +2195,61 @@ static void mixed_reg_write(uint8_t reg, uint8_t val) {
 //   0x10 CH_SEL   (w)   channel 0..8 selected for the WIDTH window
 //   0x11 WIDTH_L  (rw)  pulse width µs lo byte (staged)
 //   0x12 WIDTH_H  (rw)  pulse width µs hi byte; WRITE latches+clamps+servo_build()
-//   0x13 ENABLE_L (rw)  enable mask bits 0..7 (CH0..CH7)
-//   0x14 ENABLE_H (rw)  enable mask bit 0 = CH8; write -> servo_build()
+//   0x13 ENABLE_L (rw)  enable mask bits 0..7 (CH0..CH7); only declared-servo pads
+//   0x14 ENABLE_H (rw)  reserved (CH8 = D6 is the e-stop, never a servo)
+//   0x1A CTRL     (w)   1 = start/run (only if e-stop clear), 0 = stop (limp)
+//   0x1F STATE    (r)   bit0 running, bit1 e-stop latched, bit2 e-stop line low now
+//   0x15-0x2C bench tools on the spare pads (shared bench module)
+//
+// Pads are configured by the `srvo` file: each of the 8 non-D6 bank pads is a
+// `servo` channel or a bench role (gpio-in/out/adc/dac). D6 is ALWAYS the e-stop
+// interlock: an input with pull-up, active-low (external open-drain nodes pull the
+// shared line low). A low D6 stops all servos (outputs go limp) and LATCHES; the
+// servos resume only when D6 is high again AND a START (CTRL=1) is commanded.
 // ============================================================================
-#define SERVO_CH_COUNT      9u
-#define SERVO_FRAME_US      20000u           // 50 Hz frame
-#define SERVO_US_MIN        500u             // pulse clamp lo
-#define SERVO_US_MAX        2500u            // pulse clamp hi
-#define SERVO_US_DEFAULT    1500u            // center
-#define SERVO_ENABLE_MASK   0x1FFu           // 9 valid channel bits
+#define SERVO_CH_COUNT      9u                // 8 servo channels + CH8 (D6) = e-stop
+#define SERVO_ESTOP_CH      8u                // CH8 = D6 = the interlock pad
+#define SERVO_FRAME_US      20000u            // 50 Hz frame
+#define SERVO_US_MIN        500u              // pulse clamp lo
+#define SERVO_US_MAX        2500u             // pulse clamp hi
+#define SERVO_US_DEFAULT    1500u             // center
+#define SERVO_ENABLE_MASK   0x0FFu            // 8 servo channel bits (CH0..CH7; D6 excluded)
+#define SRVO_VERSION        1u
+#define SRVO_ROLE_SERVO     5u                // `srvo` byte role value for a servo channel
 
 #define REG_SERVO_CH_SEL    0x10u
 #define REG_SERVO_WIDTH_L   0x11u
 #define REG_SERVO_WIDTH_H   0x12u
 #define REG_SERVO_ENABLE_L  0x13u
 #define REG_SERVO_ENABLE_H  0x14u
+#define REG_SERVO_CTRL      0x1Au             // w: 1=start, 0=stop
+#define REG_SERVO_STATE     0x1Fu             // r: bit0 run, bit1 latched, bit2 estop-low
 
 // us -> TC4 ticks at 750 kHz (1.333 µs/tick). Exact for the 3/4 ratio.
 #define SERVO_US_TO_TICKS(us)  ((uint16_t)((uint32_t)(us) * 3u / 4u))
 
 // Channel index -> (port group, pin). 7 on PORT A (group 0), 2 on PORT B (group 1).
 // CH0 D0 PA02  CH1 D1 PA04  CH2 D2 PA10  CH3 D3 PA11  CH4 D7 PB09
-// CH5 D8 PA07  CH6 D9 PA05  CH7 D10 PA06  CH8 D6 PB08
+// CH5 D8 PA07  CH6 D9 PA05  CH7 D10 PA06  CH8 D6 PB08 (= e-stop, not a servo)
 typedef struct { uint8_t group; uint8_t pin; } servo_pad_t;
 static const servo_pad_t g_servo_pad[SERVO_CH_COUNT] = {
     {0,  2}, {0,  4}, {0, 10}, {0, 11}, {1,  9},
     {0,  7}, {0,  5}, {0,  6}, {1,  8},
 };
+// Servo channel (CH0..CH7) -> shared-bench Seeed pad index. CH8/D6 is the e-stop.
+static const uint8_t g_servo_ch_to_bench[SERVO_ESTOP_CH] = { 0u, 1u, 2u, 3u, 7u, 8u, 9u, 10u };
 
 static uint16_t g_servo_us[SERVO_CH_COUNT] = {
     SERVO_US_DEFAULT, SERVO_US_DEFAULT, SERVO_US_DEFAULT,
     SERVO_US_DEFAULT, SERVO_US_DEFAULT, SERVO_US_DEFAULT,
     SERVO_US_DEFAULT, SERVO_US_DEFAULT, SERVO_US_DEFAULT,
 };
-static uint16_t g_servo_enable;              // 9-bit enable mask (default 0 -> silent)
+static uint16_t g_servo_enable;              // runtime enable mask (ANDed with declared)
+static uint16_t g_servo_declared;            // pads declared as servo channels (CH0..CH7)
 static uint8_t  g_servo_ch_sel;              // selected channel for the WIDTH window
 static uint16_t g_servo_width_stage;         // WIDTH_L/H accumulator (latched on WIDTH_H write)
+static volatile bool g_servo_run;            // master run/stop (false = limp; START-gated)
+static volatile bool g_servo_estop_latched;  // e-stop tripped and not yet cleared+restarted
 
 // Built schedule (recomputed by servo_build()). The ISR consumes raise masks at
 // the frame boundary and walks the sorted/merged drop events.
@@ -2134,8 +2310,8 @@ static void servo_build(void) {
     struct { uint16_t t; uint32_t clr_a, clr_b; } evt[SERVO_CH_COUNT];
     uint8_t n = 0u;
 
-    for (uint8_t ch = 0; ch < SERVO_CH_COUNT; ch++) {
-        if (!(g_servo_enable & (1u << ch))) continue;
+    for (uint8_t ch = 0; ch < SERVO_ESTOP_CH; ch++) {       // CH0..CH7 (D6 is the e-stop)
+        if (!(g_servo_enable & g_servo_declared & (1u << ch))) continue;
         uint16_t us = g_servo_us[ch];
         if (us < SERVO_US_MIN) us = SERVO_US_MIN;
         if (us > SERVO_US_MAX) us = SERVO_US_MAX;
@@ -2171,33 +2347,104 @@ static void servo_build(void) {
     if (g_servo_tc_initialized) NVIC_EnableIRQ(TC4_IRQn);
 }
 
-// Configure all 9 servo pins as GPIO outputs driven low. Mirrors cmd_gpio_config's
-// output path (clear PMUXEN, clear INEN/PULLEN, OUTCLR, DIRSET).
-static void servo_pins_output_low(void) {
-    for (uint8_t ch = 0; ch < SERVO_CH_COUNT; ch++) {
+// Drive all 8 servo pads low (limp — no pulse). Used on stop / e-stop / exit.
+static void servo_all_low(void) {
+    for (uint8_t ch = 0; ch < SERVO_ESTOP_CH; ch++)
+        PORT->Group[g_servo_pad[ch].group].OUTCLR.reg = (1u << g_servo_pad[ch].pin);
+}
+
+// D6 (CH8) = e-stop input: pull-up, active-low (external open-drain nodes pull the
+// shared line low). On SAMD21 the pull direction is OUT (1=up) with PULLEN set.
+static void servo_estop_pin_init(void) {
+    uint8_t g = g_servo_pad[SERVO_ESTOP_CH].group, p = g_servo_pad[SERVO_ESTOP_CH].pin;
+    PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+    PORT->Group[g].DIRCLR.reg = (1u << p);                  // input
+    PORT->Group[g].OUTSET.reg = (1u << p);                  // OUT=1 -> pull-UP direction
+    PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+}
+static inline bool servo_estop_active(void) {              // line low = e-stop asserted
+    uint8_t g = g_servo_pad[SERVO_ESTOP_CH].group, p = g_servo_pad[SERVO_ESTOP_CH].pin;
+    return !(PORT->Group[g].IN.reg & (1u << p));
+}
+
+// Apply the commissioned `srvo` file: each non-D6 bank pad is a servo channel or a
+// bench role; D6 is always the e-stop. [VER, role(CH0)..role(CH7)]; role 5=servo,
+// 1..4 = bench (gpio-in/out/adc/dac), 0 = none. Configures servo pads as outputs
+// low, sets spare-pad bench roles + reserves, and brings up the D6 e-stop input.
+static void servo_apply_cfg(void) {
+    g_servo_declared = 0u;
+    int s = store_find_str("srvo");
+    if (s >= 0 && g_rec_len[s] >= 1u && g_rec_data[s][0] == SRVO_VERSION) {
+        const uint8_t* d = g_rec_data[s];
+        uint16_t len = g_rec_len[s];
+        for (uint8_t ch = 0; ch < SERVO_ESTOP_CH && (1u + ch) < len; ch++) {
+            uint8_t role = d[1u + ch];
+            uint8_t idx  = g_servo_ch_to_bench[ch];
+            if (role == SRVO_ROLE_SERVO) {
+                g_servo_declared |= (uint16_t)(1u << ch);
+                bench_reserve(idx);                         // a servo pad is not benchable
+            } else if (role >= BENCH_ROLE_GPI && role <= BENCH_ROLE_DAC) {
+                bench_set_role(idx, role);                  // spare bench pad
+            }                                               // role NONE -> left safe, ops error
+        }
+    }
+    for (uint8_t ch = 0; ch < SERVO_ESTOP_CH; ch++) {       // declared servo pads -> output low
+        if (!(g_servo_declared & (uint16_t)(1u << ch))) continue;
         uint8_t g = g_servo_pad[ch].group, p = g_servo_pad[ch].pin;
-        uint32_t m = (1u << p);
         PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
         PORT->Group[g].PINCFG[p].bit.INEN   = 0;
         PORT->Group[g].PINCFG[p].bit.PULLEN = 0;
-        PORT->Group[g].OUTCLR.reg = m;
-        PORT->Group[g].DIRSET.reg = m;
+        PORT->Group[g].OUTCLR.reg = (1u << p);
+        PORT->Group[g].DIRSET.reg = (1u << p);
+    }
+    bench_reserve(6u);                                      // D6 (Seeed idx 6) = e-stop, never benchable
+    servo_estop_pin_init();
+}
+
+// Start (run) only if the e-stop is clear; that clears the latch. Stop -> limp.
+static void servo_set_run(bool run) {
+    if (run) {
+        if (servo_estop_active()) return;                  // cannot start into a fault
+        g_servo_estop_latched = false;
+        g_servo_run = true;
+    } else {
+        g_servo_run = false;
+        servo_all_low();
     }
 }
 
-// Entering MODE_SERVO: pins -> GPIO outputs low, build the schedule, start TC4.
+// Superloop poll (sub-ms): a low e-stop line latches the stop and drives servos
+// limp immediately. The latch clears only on a START while the line is high.
+static void servo_tick(void) {
+    if (g_mode != MODE_SERVO) return;
+    if (servo_estop_active()) {
+        g_servo_estop_latched = true;
+        if (g_servo_run) { g_servo_run = false; servo_all_low(); }
+    }
+}
+
+// Entering MODE_SERVO: parse srvo (servo pads + bench roles + D6 e-stop), apply
+// bench roles, build the (empty) schedule, start TC4. Servos start STOPPED — the
+// master must enable channels and command START (CTRL=1) once the e-stop is clear.
 static void servo_enter(void) {
     servo_tc_init_once();
-    servo_pins_output_low();
+    bench_reset();
+    servo_apply_cfg();
+    bench_apply_roles();                                    // gpio/adc spare pads
+    g_bench_active = true;
+    g_servo_enable = 0u;
+    g_servo_run = false;
+    g_servo_estop_latched = false;
     servo_build();
     servo_tc_start();
 }
 
-// Leaving MODE_SERVO: stop TC4 (masks IRQ), drive all 9 pins low (safe).
+// Leaving MODE_SERVO: stop TC4 (masks IRQ), drive all servo pins low (safe).
 static void servo_exit(void) {
     servo_tc_stop();
-    for (uint8_t ch = 0; ch < SERVO_CH_COUNT; ch++)
-        PORT->Group[g_servo_pad[ch].group].OUTCLR.reg = (1u << g_servo_pad[ch].pin);
+    servo_all_low();
+    g_bench_active = false;
+    g_servo_run = false;
 }
 
 // TC4 ISR. MC0 = frame boundary (raise all enabled, schedule first drop);
@@ -2206,6 +2453,10 @@ static void servo_exit(void) {
 void TC4_Handler(void) {
     if (TC4->COUNT16.INTFLAG.bit.MC0) {                  // frame boundary (CC0 wrap)
         TC4->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
+        if (!g_servo_run) {                              // stopped / e-stopped -> no pulse (limp)
+            TC4->COUNT16.INTENCLR.reg = TC_INTENCLR_MC1;
+            return;
+        }
         PORT->Group[0].OUTSET.reg = g_servo_raise_a;     // raise all enabled servos together
         PORT->Group[1].OUTSET.reg = g_servo_raise_b;
         g_servo_evt_idx = 0u;
@@ -2235,22 +2486,26 @@ void TC4_Handler(void) {
     }
 }
 
-// SERVO mode-bank register access (0x10-0x14), dispatched only while MODE_SERVO.
+// SERVO mode-bank register access. Primary regs 0x10-0x14 + CTRL 0x1A + STATE 0x1F;
+// everything else delegates to the shared bench (0x15-0x1E + DAC sub-bank).
 static uint8_t servo_reg_read(uint8_t reg) {
-    uint8_t sel = (g_servo_ch_sel < SERVO_CH_COUNT) ? g_servo_ch_sel : 0u;
+    uint8_t sel = (g_servo_ch_sel < SERVO_ESTOP_CH) ? g_servo_ch_sel : 0u;
     switch (reg) {
     case REG_SERVO_CH_SEL:   return g_servo_ch_sel;
     case REG_SERVO_WIDTH_L:  return (uint8_t)g_servo_us[sel];
     case REG_SERVO_WIDTH_H:  return (uint8_t)(g_servo_us[sel] >> 8);
     case REG_SERVO_ENABLE_L: return (uint8_t)g_servo_enable;
     case REG_SERVO_ENABLE_H: return (uint8_t)(g_servo_enable >> 8);
-    default:                 return 0xFFu;
+    case REG_SERVO_STATE:    return (uint8_t)((g_servo_run ? 0x01u : 0u)
+                                            | (g_servo_estop_latched ? 0x02u : 0u)
+                                            | (servo_estop_active() ? 0x04u : 0u));
+    default:                 return bench_reg_read(reg);
     }
 }
 static void servo_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case REG_SERVO_CH_SEL:
-        if (val < SERVO_CH_COUNT) g_servo_ch_sel = val;  // out-of-range clamped (ignored)
+        if (val < SERVO_ESTOP_CH) g_servo_ch_sel = val;  // CH0..CH7 only (D6 = e-stop)
         break;
     case REG_SERVO_WIDTH_L:                              // stage lo byte; WIDTH_H write latches
         g_servo_width_stage = (uint16_t)((g_servo_width_stage & 0xFF00u) | val);
@@ -2259,21 +2514,19 @@ static void servo_reg_write(uint8_t reg, uint8_t val) {
         uint16_t us = (uint16_t)(((uint16_t)val << 8) | (g_servo_width_stage & 0x00FFu));
         if (us < SERVO_US_MIN) us = SERVO_US_MIN;
         if (us > SERVO_US_MAX) us = SERVO_US_MAX;
-        uint8_t sel = (g_servo_ch_sel < SERVO_CH_COUNT) ? g_servo_ch_sel : 0u;
+        uint8_t sel = (g_servo_ch_sel < SERVO_ESTOP_CH) ? g_servo_ch_sel : 0u;
         g_servo_us[sel] = us;
         g_servo_width_stage = us;                        // reflect the clamped value back
         servo_build();
         break;
     }
-    case REG_SERVO_ENABLE_L:
-        g_servo_enable = (uint16_t)((g_servo_enable & 0x0100u) | val) & SERVO_ENABLE_MASK;
+    case REG_SERVO_ENABLE_L:                             // only declared servo pads can enable
+        g_servo_enable = (uint16_t)(val & g_servo_declared) & SERVO_ENABLE_MASK;
         servo_build();
         break;
-    case REG_SERVO_ENABLE_H:
-        g_servo_enable = (uint16_t)((g_servo_enable & 0x00FFu) | ((uint16_t)val << 8)) & SERVO_ENABLE_MASK;
-        servo_build();
-        break;
-    default: break;                                     // unimplemented regs ignored
+    case REG_SERVO_ENABLE_H: break;                      // CH8 = D6 = e-stop, not a servo
+    case REG_SERVO_CTRL:     servo_set_run(val != 0u); break;   // 1 = start, 0 = stop
+    default: bench_reg_write(reg, val); break;           // bench bank 0x15-0x1E + DAC
     }
 }
 
@@ -2316,38 +2569,9 @@ static void servo_reg_write(uint8_t reg, uint8_t val) {
 #define REG_COUNTER_ENABLE      0x13u   // 0x13 lo, 0x14 hi
 #define REG_COUNTER_CLEAR       0x1Au
 
-// ---- COUNTER bench tools: single-shot ADC / GPIO on the non-counter pads -------
-// The pads NOT enabled as counters carry a fixed bench ROLE (gpio-in / gpio-out /
-// adc / dac / none), declared in the `cntr` config and applied ONCE on COUNTER
-// enter. The bench API never changes a pad's role or direction: it only drives an
-// already-output pad, reads an already-input pad, or samples an already-analog pad.
-// Each op is validated against the pad's role; a mismatch (e.g. GPI on an ADC pad)
-// or an unknown bench register is reported via REG_COUNTER_BENCH_STAT.
-//
-// Pads are addressed by Seeed silkscreen index (D0..D10 == A0..A10 — the "A" name
-// is the analog alias of the same physical pad). Over I2C these are request/get: a
-// WRITE issues the request, a later READ fetches the result. The 16x ADC oneshot
-// blocks ~1 ms, so it runs in the superloop (counter_bench_tick), never in the I2C
-// handler — the bus is not clock-stretched. The synchronous "do it and reply now"
-// path is the USB shell command CMD_ADC_READ.
-#define REG_COUNTER_BENCH_SEL   0x15u   // w/r: Seeed pad index 0..10 (latch only, no reconfig)
-#define REG_COUNTER_BENCH_GPO   0x16u   // w:   0/1 -> drive selected pad (role must be gpio-out)
-#define REG_COUNTER_BENCH_GPI   0x17u   // r:   selected pad level 0/1 (role must be gpio-in)
-#define REG_COUNTER_BENCH_ADCRQ 0x18u   // w:   request 16x oneshot (role must be adc)
-#define REG_COUNTER_BENCH_ADCST 0x19u   // r:   0 = ready, 1 = conversion pending
-#define REG_COUNTER_BENCH_ADCV  0x1Bu   // r:   u16 last ADC result (0x1B lo, 0x1C hi)
-#define REG_COUNTER_BENCH_STAT  0x1Du   // r:   last bench-command status (BENCH_OK..BENCH_UNSUPPORTED)
-#define REG_COUNTER_BENCH_ROLE  0x1Eu   // r:   selected pad's commissioned role (BENCH_ROLE_*)
-#define REG_DAC_FIRST           0x20u   // DAC bench sub-bank span (gated on D0 role = dac)
-#define REG_DAC_LAST            0x2Cu
-#define COUNTER_BENCH_OVERSAMPLE 4u     // 16x (2^4) — matches MIXED-mode ADC reads
-#define COUNTER_BENCH_SH_CYC     5u     // sample-hold cycles (low-impedance default)
-
-// Bench roles, encoded in bits1-3 of a non-counter pad's `cntr` byte (enable bit 0
-// clear). Backward-compatible: an old file's zero byte -> NONE -> every op errors.
-enum { BENCH_ROLE_NONE = 0u, BENCH_ROLE_GPI, BENCH_ROLE_GPO, BENCH_ROLE_ADC, BENCH_ROLE_DAC };
-// Bench command status (REG_COUNTER_BENCH_STAT).
-enum { BENCH_OK = 0u, BENCH_BAD_PIN, BENCH_WRONG_ROLE, BENCH_UNSUPPORTED };
+// The spare (non-counter) pads carry bench roles (see the shared bench module
+// above). A non-counter `cntr` byte (enable bit 0 clear) encodes the pad's role in
+// bits1-3 (BENCH_ROLE_*); an old file's zero byte -> role NONE -> every op errors.
 
 // Channel index -> (port group, pin). SAME pins as the servo bank.
 // CH0 D0 PA02  CH1 D1 PA04  CH2 D2 PA10  CH3 D3 PA11  CH4 D7 PB09
@@ -2367,104 +2591,8 @@ static uint16_t g_counter_cc0 = 750u;                   // TC5 period (= 750000/
 
 static bool g_counter_tc_initialized;                   // TC5 GCLK/APBC wired once
 
-// Bench pad table: Seeed index 0..10 -> chip (group, pin, ADC AIN). D4/D5 are the
-// I2C bus (never benched — guarded via g_bench_to_ch). A_n aliases D_n.
-static const struct { uint8_t group, pin, ain; } g_bench_pad[11] = {
-    {0,  2,  0u}, {0,  4,  4u}, {0, 10, 18u}, {0, 11, 19u},          // D0 D1 D2 D3
-    {0,  8, 16u}, {0,  9, 17u},                                      // D4 D5 (I2C)
-    {1,  8,  2u}, {1,  9,  3u}, {0,  7,  7u}, {0,  5,  5u}, {0, 6, 6u}, // D6 D7 D8 D9 D10
-};
-// Seeed index -> counter channel (0xFF = not a counter pad: D4/D5 = I2C bus).
-static const uint8_t g_bench_to_ch[11] = {
-    0u, 1u, 2u, 3u, 0xFFu, 0xFFu, 8u, 4u, 5u, 6u, 7u,
-};
-static uint8_t  g_bench_role[COUNTER_CH_COUNT];  // per counter-channel bench role (non-counter pads)
-static uint8_t  g_bench_sel = 0xFFu;        // selected Seeed pad (0xFF = none/invalid)
-static uint8_t  g_bench_stat = BENCH_OK;    // last bench-command status (REG_..._STAT)
-static uint16_t g_bench_adc_val;            // last ADC result (get)
-static volatile bool g_bench_adc_pending;   // request flag; served in counter_bench_tick
-
-// Role of the selected pad (BENCH_ROLE_NONE if nothing/invalid selected). A live
-// counter pad can never be selected, so its channel's g_bench_role is irrelevant.
-static uint8_t bench_sel_role(void) {
-    if (g_bench_sel >= 11u) return BENCH_ROLE_NONE;
-    uint8_t ch = g_bench_to_ch[g_bench_sel];
-    return (ch == 0xFFu) ? BENCH_ROLE_NONE : g_bench_role[ch];
-}
-
-// A pad is benchable if it exists, is not the I2C bus, and is not a live counter.
-static bool bench_sel_valid(uint8_t idx) {
-    if (idx >= 11u) return false;
-    uint8_t ch = g_bench_to_ch[idx];
-    if (ch == 0xFFu) return false;                              // D4/D5 = I2C bus
-    return !(g_counter_enabled & (uint16_t)(1u << ch));         // not a live counter
-}
-
-// BENCH_SEL: latch the selected pad ONLY — never reconfigure the pin (its role and
-// direction are fixed at COUNTER enter). Invalid select -> BAD_PIN, sel cleared.
-static void bench_select(uint8_t idx) {
-    if (!bench_sel_valid(idx)) { g_bench_sel = 0xFFu; g_bench_stat = BENCH_BAD_PIN; return; }
-    g_bench_sel = idx;
-    g_bench_stat = BENCH_OK;
-}
-// GPO: drive the selected pad (role must be gpio-out). Only the OUT level changes;
-// DIR/PINCFG were set at enter, so the bench does not alter the pin's role.
-static void bench_gpio_out(uint8_t level) {
-    if (bench_sel_role() != BENCH_ROLE_GPO) { g_bench_stat = BENCH_WRONG_ROLE; return; }
-    uint8_t g = g_bench_pad[g_bench_sel].group, p = g_bench_pad[g_bench_sel].pin;
-    if (level & 1u) PORT->Group[g].OUTSET.reg = (1u << p);
-    else            PORT->Group[g].OUTCLR.reg = (1u << p);
-    g_bench_stat = BENCH_OK;
-}
-// GPI: read the selected pad (role must be gpio-in). Wrong role -> 0xFF + WRONG_ROLE.
-static uint8_t bench_gpio_in(void) {
-    if (bench_sel_role() != BENCH_ROLE_GPI) { g_bench_stat = BENCH_WRONG_ROLE; return 0xFFu; }
-    uint8_t g = g_bench_pad[g_bench_sel].group, p = g_bench_pad[g_bench_sel].pin;
-    g_bench_stat = BENCH_OK;
-    return (PORT->Group[g].IN.reg & (1u << p)) ? 1u : 0u;
-}
-
-// Serve a pending bench ADC request from the superloop (blocks ~1 ms at 16x; never
-// run inside the I2C handler). The pad is already in analog mode (set at enter).
-static void counter_bench_tick(void) {
-    if (g_mode != MODE_COUNTER || !g_bench_adc_pending) return;
-    uint8_t idx = g_bench_sel;
-    if (idx < 11u)
-        g_bench_adc_val = samd21_adc_read_oneshot(g_bench_pad[idx].ain,
-                                                  COUNTER_BENCH_OVERSAMPLE,
-                                                  COUNTER_BENCH_SH_CYC);
-    g_bench_adc_pending = false;
-}
-
-// Apply each non-counter pad's fixed bench role to the pin, ONCE at COUNTER enter.
-// Live counter pads and the I2C bus (D4/D5) are skipped. DAC (D0 only) is brought
-// up by counter_enter's dedicated block, not here.
-static void counter_bench_apply_roles(void) {
-    for (uint8_t idx = 0; idx < 11u; idx++) {
-        uint8_t ch = g_bench_to_ch[idx];
-        if (ch == 0xFFu) continue;                              // D4/D5 = I2C bus
-        if (g_counter_enabled & (uint16_t)(1u << ch)) continue; // live counter pad
-        uint8_t g = g_bench_pad[idx].group, p = g_bench_pad[idx].pin;
-        switch (g_bench_role[ch]) {
-        case BENCH_ROLE_GPI:
-            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
-            PORT->Group[g].DIRCLR.reg = (1u << p);
-            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;    // digital input, no pull
-            break;
-        case BENCH_ROLE_GPO:
-            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
-            PORT->Group[g].OUTCLR.reg = (1u << p);              // start low
-            PORT->Group[g].DIRSET.reg = (1u << p);
-            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;    // INEN for read-back
-            break;
-        case BENCH_ROLE_ADC:
-            adc_init();
-            adc_pin_config(g, p);                               // PMUX -> analog
-            break;
-        default: break;                                         // NONE / DAC -> leave to caller
-        }
-    }
-}
+// Counter channel -> shared-bench Seeed pad index (D0,D1,D2,D3,D7,D8,D9,D10,D6).
+static const uint8_t g_ch_to_bench[COUNTER_CH_COUNT] = { 0u, 1u, 2u, 3u, 7u, 8u, 9u, 10u, 6u };
 
 // Read the live 9-bit level bitmap: bit ch = current level of channel ch's pin.
 static inline uint16_t counter_sample_now(void) {
@@ -2531,13 +2659,13 @@ static void counter_pin_input(uint8_t g, uint8_t p, uint8_t pull) {
 // short/bad file -> safe default (all 9 enabled, no pull, rising, 1 kHz, no roles).
 // Each `cntr` channel byte: bit0 enable. If a counter (bit0=1): bits1-2 pull,
 // bits3-4 edge. If NOT a counter (bit0=0): bits1-3 bench role (BENCH_ROLE_*).
-// Only ENABLED pads are driven as inputs here; role pads are applied separately by
-// counter_bench_apply_roles().
+// Only ENABLED pads are driven as inputs here; spare-pad roles are set into the
+// shared bench (bench_set_role / bench_reserve) and applied by bench_apply_roles().
 static void counter_apply_cfg(void) {
     g_counter_enabled = 0x1FFu;
     uint16_t rate = 1000u;
     uint8_t  pull[COUNTER_CH_COUNT] = {0};
-    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) { g_counter_edge[ch] = 0u; g_bench_role[ch] = BENCH_ROLE_NONE; }
+    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) g_counter_edge[ch] = 0u;
 
     int s = store_find_str("cntr");
     if (s >= 0 && g_rec_len[s] >= 3u && g_rec_data[s][0] == CNTR_VERSION) {
@@ -2551,14 +2679,16 @@ static void counter_apply_cfg(void) {
                 g_counter_enabled |= (uint16_t)(1u << ch);
                 pull[ch]           = (uint8_t)((b >> 1) & 3u);
                 g_counter_edge[ch] = (uint8_t)((b >> 3) & 3u);
-            } else {                                            // bench-role pad
-                g_bench_role[ch] = (uint8_t)((b >> 1) & 7u);
+            } else {                                            // spare pad -> shared bench role
+                bench_set_role(g_ch_to_bench[ch], (uint8_t)((b >> 1) & 7u));
             }
         }
     }
     for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
-        if (g_counter_enabled & (uint16_t)(1u << ch))
+        if (g_counter_enabled & (uint16_t)(1u << ch)) {
             counter_pin_input(g_counter_pad[ch].group, g_counter_pad[ch].pin, pull[ch]);
+            bench_reserve(g_ch_to_bench[ch]);                   // a live counter pad is not benchable
+        }
     }
     if (rate < COUNTER_RATE_MIN) rate = COUNTER_RATE_MIN;
     if (rate > COUNTER_RATE_MAX) rate = COUNTER_RATE_MAX;
@@ -2574,19 +2704,17 @@ static void counter_apply_cfg(void) {
 // role is dac, then start TC5.
 static void counter_enter(void) {
     counter_tc_init_once();
-    counter_apply_cfg();
+    bench_reset();                                               // clear roles/reserved before cfg
+    counter_apply_cfg();                                         // sets bench roles + reserves counters
     g_counter_last = counter_sample_now();                       // seed: no edge on first tick
     for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
         g_counter[ch]        = 0u;
         g_counter_shadow[ch] = 0u;
     }
     g_counter_data_idx = 0u;
-    g_bench_sel = 0xFFu;                                         // bench: nothing selected yet
-    g_bench_stat = BENCH_OK;
-    g_bench_adc_pending = false;
-    g_bench_adc_val = 0u;
-    counter_bench_apply_roles();                                 // gpio-in/out + adc pads
-    if (g_bench_role[0] == BENCH_ROLE_DAC && !(g_counter_enabled & 0x1u)) {  // D0/A0 -> DAC
+    bench_apply_roles();                                         // gpio-in/out + adc spare pads
+    g_bench_active = true;
+    if (g_bench_role[0] == BENCH_ROLE_DAC) {                     // D0/A0 -> DAC stimulus
         dac_init();
         PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;                 // route PA02 -> DAC
         PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
@@ -2605,9 +2733,8 @@ static void counter_exit(void) {
     NVIC_DisableIRQ(TC3_IRQn);
     g_dds.active = false;
     tc3_stop();
-    g_bench_adc_pending = false;                                 // drop any unserved bench request
-    g_bench_sel = 0xFFu;
-    g_bench_stat = BENCH_OK;
+    g_bench_active = false;                                      // bench off; pending request dropped
+    g_bench_adc_pending = false;
 }
 
 // TC5 ISR — the 1 kHz sampler. Reads all 9 pins, detects edges vs the previous
@@ -2658,22 +2785,7 @@ static uint8_t counter_reg_read(uint8_t reg) {
     }
     case REG_COUNTER_ENABLE:      return (uint8_t)g_counter_enabled;
     case REG_COUNTER_ENABLE + 1u: return (uint8_t)(g_counter_enabled >> 8);
-    case REG_COUNTER_BENCH_SEL:   return g_bench_sel;
-    case REG_COUNTER_BENCH_GPI:   return bench_gpio_in();
-    case REG_COUNTER_BENCH_ADCST: return g_bench_adc_pending ? 1u : 0u;
-    case REG_COUNTER_BENCH_ADCV:      return (uint8_t)g_bench_adc_val;
-    case REG_COUNTER_BENCH_ADCV + 1u: return (uint8_t)(g_bench_adc_val >> 8);
-    case REG_COUNTER_BENCH_STAT:  return g_bench_stat;
-    case REG_COUNTER_BENCH_ROLE:  return bench_sel_role();
-    default:
-        // DAC bench sub-bank — gated on D0 being commissioned as the DAC role.
-        if (reg >= REG_DAC_FIRST && reg <= REG_DAC_LAST) {
-            if (g_bench_role[0] != BENCH_ROLE_DAC) { g_bench_stat = BENCH_WRONG_ROLE; return 0xFFu; }
-            uint8_t v = 0xFFu;
-            if (dac_reg_read(reg, &v)) { g_bench_stat = BENCH_OK; return v; }
-        }
-        g_bench_stat = BENCH_UNSUPPORTED;
-        return 0xFFu;
+    default: return bench_reg_read(reg);                          // bench bank 0x15-0x1E + DAC
     }
 }
 static void counter_reg_write(uint8_t reg, uint8_t val) {
@@ -2687,21 +2799,7 @@ static void counter_reg_write(uint8_t reg, uint8_t val) {
             if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
         }
         break;
-    case REG_COUNTER_BENCH_SEL:   bench_select(val);   break;    // latch the selection
-    case REG_COUNTER_BENCH_GPO:   bench_gpio_out(val); break;    // drive selected pad (role-gated)
-    case REG_COUNTER_BENCH_ADCRQ:                                 // request 16x oneshot (role-gated)
-        if (bench_sel_role() != BENCH_ROLE_ADC) { g_bench_stat = BENCH_WRONG_ROLE; break; }
-        g_bench_adc_pending = true;
-        g_bench_stat = BENCH_OK;
-        break;
-    default:
-        // DAC bench sub-bank — gated on D0 being commissioned as the DAC role.
-        if (reg >= REG_DAC_FIRST && reg <= REG_DAC_LAST) {
-            if (g_bench_role[0] != BENCH_ROLE_DAC) { g_bench_stat = BENCH_WRONG_ROLE; break; }
-            if (dac_reg_write(reg, val)) { g_bench_stat = BENCH_OK; break; }
-        }
-        g_bench_stat = BENCH_UNSUPPORTED;
-        break;
+    default: bench_reg_write(reg, val); break;                   // bench bank 0x15-0x1E + DAC
     }
 }
 
