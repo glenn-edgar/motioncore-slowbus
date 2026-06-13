@@ -1125,7 +1125,7 @@ static bool store_commit(uint8_t slot) {
 
 // Called from the main superloop: service a pending commit (flash write ~ms) or
 // a deferred soft reset (so the master's RESET write is ACKed before we drop).
-static void pio_il_tick(void);             // PIO-b gpio interlock eval (defined below)
+static void pio_tick(void);                // PIO 1 kHz sampler + gpio interlock eval (defined below)
 static void adc_sample_tick(void);         // ADC-a sampler (defined below)
 static void adc_il_tick(void);             // ADC-b interlock eval (defined below)
 static void adc_sampler_start(void);       // tone-clocked ADC sweep (defined below)
@@ -1143,7 +1143,7 @@ void i2c_store_service(void) {
         g_commit_pending = -1;
     }
     if (g_reset_pending) NVIC_SystemReset();
-    pio_il_tick();                         // evaluate the gpio interlock (no-op unless armed in PIO)
+    pio_tick();                            // 1 kHz GPIO sample + interlock eval (no-op unless MODE_PIO)
     adc_sample_tick();                     // ADC interlock eval (sampling runs in the TC3 ISR)
     mixed_tick();                          // ~100 Hz mixed ADC+GPIO interlock (no-op unless MODE_MIXED)
     bench_tick();                          // serve a pending bench ADC oneshot (no-op unless active)
@@ -1207,11 +1207,13 @@ static void pio_apply_ch(uint8_t ch) {
     }
 }
 static void pio_apply_all(void) { for (uint8_t i = 0; i < 8; i++) pio_apply_ch(i); }
+static void pio_sample_inputs(void);                    // 1 kHz shadow sampler (defined below)
 static void pio_update_outputs(void) {                  // OLAT change: just the output pins
     for (uint8_t i = 0; i < 8; i++) {
         if (g_pio_iodir & (1u << i)) continue;
         pio_drive_ch_out(i);                            // od-aware
     }
+    pio_sample_inputs();                                // refresh read-back immediately (no 1 ms lag)
 }
 static void pio_safe_all(void) {                        // leaving PIO: all inputs, no pull
     g_pio_iodir = 0xFFu; g_pio_olat = 0u; g_pio_gppu = 0u; g_pio_gppd = 0u; g_pio_od = 0u;
@@ -1221,13 +1223,21 @@ static void pio_safe_all(void) {                        // leaving PIO: all inpu
         PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
     }
 }
-static uint8_t pio_read_gpio(void) {
+// 8-channel level bitmap, sampled by the 1 kHz pio_tick (the value GPIO/bench reads
+// return — this is a SAMPLED super-expander, not a live on-demand read). Outputs
+// keep INEN, so the sample reflects the driven level too (read-back).
+static uint8_t g_pio_in_shadow;
+
+static void pio_sample_inputs(void) {
     uint8_t v = 0u;
     for (uint8_t i = 0; i < 8; i++) {
         uint8_t g = g_pio_ch[i].group, p = g_pio_ch[i].pin;
         if (PORT->Group[g].IN.reg & (1u << p)) v |= (uint8_t)(1u << i);
     }
-    return (uint8_t)(v ^ g_pio_ipol);                   // input polarity invert
+    g_pio_in_shadow = v;
+}
+static uint8_t pio_read_gpio(void) {
+    return (uint8_t)(g_pio_in_shadow ^ g_pio_ipol);     // 1 kHz sample, input-polarity invert
 }
 
 // Apply the commissioned GPIO power-on pin map ("gpmp") to the channel shadow
@@ -1267,6 +1277,7 @@ static bool      g_pio_il_valid;        // a DSL parsed OK and has >=1 watch
 static bool      g_pio_il_tripped;      // latched trip state
 static uint8_t   g_pio_il_pstat = 0xFFu; // il_parse_status_t (0xFF = no record yet)
 static volatile uint8_t g_pio_il_state;  // tick snapshot: bit0 tripped, bit1 cond-ok, bit2 valid
+static uint32_t  g_pio_il_next_ms;       // 1 kHz sampler gate (board_millis)
 
 static uint8_t pio_phys_read(uint8_t phys) {
     return (PORT->Group[phys >> 5].IN.reg & (1u << (phys & 0x1Fu))) ? 1u : 0u;
@@ -1404,8 +1415,16 @@ static void pio_il_disarm(void) {           // leaving PIO mode
     g_pio_il_valid = false; g_pio_il_tripped = false;
     pio_int_assert(false);
 }
-static void pio_il_tick(void) {             // run from i2c_store_service (superloop)
-    if (g_mode != MODE_PIO || !g_pio_il_valid) return;
+// 1 kHz super-expander tick: sample the 8 inputs into the shadow, then (if an
+// interlock is armed) evaluate it + drive the D6 interrupt. Runs in MODE_PIO
+// whether or not an interlock exists, so GPIO + interrupt sample at a steady 1 kHz.
+static void pio_tick(void) {
+    if (g_mode != MODE_PIO) return;
+    uint32_t now = board_millis();
+    if ((int32_t)(now - g_pio_il_next_ms) < 0) return;   // 1 kHz sample gate (1 ms)
+    g_pio_il_next_ms = now + 1u;
+    pio_sample_inputs();
+    if (!g_pio_il_valid) return;                         // no interlock -> just sampled
     bool wpass[IL_MAX_WATCHES] = {0};
     for (uint8_t i = 0; i < g_pio_il.watch_count; i++)
         wpass[i] = pio_watch_pass(&g_pio_il.watches[i]);
@@ -3002,6 +3021,7 @@ static void mode_enter(uint8_t m) {
         while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
         gpmp_apply();                               // load the commissioned power-on pin map
         pio_apply_all();                            // claim + configure the 8 channels
+        pio_sample_inputs();                        // seed the 1 kHz read shadow
         pio_il_arm();                               // parse interlock_cfg, set up INT pin
     } else if (m == MODE_ADC) {                     // entering ADC
         adc_mode_setup();                           // DIV16 sampler + window stats + DAC const
