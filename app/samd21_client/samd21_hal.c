@@ -5,6 +5,7 @@
 
 #include "samd21_hal.h"
 #include "samd21.h"
+#include "samd21_sync.h"            // BOUNDED_SPIN -- bounded peripheral waits
 
 // ---------------------------------------------------------------------------
 // Watchdog Timer
@@ -21,29 +22,29 @@ void hal_wdt_init(void)
 
     // 2. GCLK5 generator: OSCULP32K, exponential divide /32.
     GCLK->GENDIV.reg = GCLK_GENDIV_ID(5) | GCLK_GENDIV_DIV(4);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
 
     GCLK->GENCTRL.reg = GCLK_GENCTRL_ID(5)
                       | GCLK_GENCTRL_SRC_OSCULP32K
                       | GCLK_GENCTRL_DIVSEL
                       | GCLK_GENCTRL_GENEN;
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
 
     // 3. Route GCLK5 to WDT clock channel.
     GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_WDT
                       | GCLK_CLKCTRL_GEN_GCLK5
                       | GCLK_CLKCTRL_CLKEN;
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
 
     // 4. Configure WDT in normal (non-windowed) mode, PER=4096 cycles.
     WDT->CTRL.reg = 0;  // disable so CONFIG is writable
-    while (WDT->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(WDT->STATUS.bit.SYNCBUSY);
 
     WDT->CONFIG.reg = WDT_CONFIG_PER_4K;
     WDT->EWCTRL.reg = 0;  // disable early-warning interrupt
 
     WDT->CTRL.reg = WDT_CTRL_ENABLE;
-    while (WDT->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(WDT->STATUS.bit.SYNCBUSY);
 
     // 5. First refresh.
     hal_wdt_pet();

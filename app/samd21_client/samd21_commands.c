@@ -21,6 +21,7 @@
 #include "shell_commands.h"
 #include "vendor/libcomm/opcodes.h"   // SHELL_STATUS_*
 #include "samd21.h"
+#include "samd21_sync.h"            // BOUNDED_SPIN -- bounded peripheral waits
 #include "bsp/board_api.h"           // board_millis()
 #include "samd21_adc.h"              // samd21_adc_read_oneshot public API
 #include "samd21_pin_table.h"        // board-label -> AIN + reserved-pin guard (dac_follow)
@@ -151,11 +152,11 @@ static void dac_init(void) {
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(DAC_GCLK_ID)
                                  | GCLK_CLKCTRL_GEN_GCLK0
                                  | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
 
     // 3. Reset DAC peripheral.
     DAC->CTRLA.bit.SWRST = 1;
-    while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
     while (DAC->CTRLA.bit.SWRST)     { /* spin */ }
 
     // 4. Reference AVCC (3.3V) + external output buffer enabled.
@@ -168,7 +169,7 @@ static void dac_init(void) {
 
     // 6. Enable DAC.
     DAC->CTRLA.bit.ENABLE = 1;
-    while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
 
     g_dac_initialized = true;
 }
@@ -266,7 +267,7 @@ static void tc3_init_once(void) {
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(TC3_GCLK_ID)
                                  | GCLK_CLKCTRL_GEN_GCLK0
                                  | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
     g_tc3_initialized = true;
 }
 
@@ -274,13 +275,13 @@ static void tc3_stop(void) {
     NVIC_DisableIRQ(TC3_IRQn);
     TC3->COUNT16.INTENCLR.reg = TC_INTENCLR_MC0;
     TC3->COUNT16.CTRLA.bit.ENABLE = 0;
-    while (TC3->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC3->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
 static void tc3_start_at_period(uint16_t period) {
     // Reset.
     TC3->COUNT16.CTRLA.bit.SWRST = 1;
-    while (TC3->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC3->COUNT16.STATUS.bit.SYNCBUSY);
     while (TC3->COUNT16.CTRLA.bit.SWRST)     { /* spin */ }
 
     // 16-bit count, MFRQ wavegen (CC0=TOP and resets counter), prescaler 1.
@@ -288,7 +289,7 @@ static void tc3_start_at_period(uint16_t period) {
                            | TC_CTRLA_WAVEGEN_MFRQ
                            | TC_CTRLA_PRESCALER_DIV1;
     TC3->COUNT16.CC[0].reg = period;
-    while (TC3->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC3->COUNT16.STATUS.bit.SYNCBUSY);
 
     TC3->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;     // clear stale
     TC3->COUNT16.INTENSET.reg = TC_INTENSET_MC0;
@@ -300,7 +301,7 @@ static void tc3_start_at_period(uint16_t period) {
     NVIC_EnableIRQ(TC3_IRQn);
 
     TC3->COUNT16.CTRLA.bit.ENABLE = 1;
-    while (TC3->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC3->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
 static void adc_isr_service(void);   // ADC step, keyed off this tone clock (defined below)
@@ -425,7 +426,7 @@ static uint8_t cmd_dac_write(shell_reader_t* args, shell_writer_t* result) {
     }
 
     DAC->DATA.reg = value;
-    while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
     return SHELL_STATUS_OK;
 }
 
@@ -456,11 +457,11 @@ static void adc_init(void) {
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(ADC_GCLK_ID)
                                  | GCLK_CLKCTRL_GEN_GCLK0
                                  | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
 
     // 3. Reset peripheral.
     ADC->CTRLA.bit.SWRST = 1;
-    while (ADC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
     while (ADC->CTRLA.bit.SWRST)     { /* spin */ }
 
     // 4. Load factory calibration (NVMCTRL software-cal row) — required by
@@ -484,20 +485,20 @@ static void adc_init(void) {
     //    /512 default while staying well below the 2.1 MHz max ADC clock.
     //    RESSEL toggled to 16BIT per-call when oversample > 0.
     ADC->CTRLB.reg = ADC_CTRLB_PRESCALER_DIV256 | ADC_CTRLB_RESSEL_12BIT;
-    while (ADC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
 
     // 8. INPUTCTRL: GAIN=DIV2, MUXNEG=GND (single-ended), MUXPOS set per-read.
     ADC->INPUTCTRL.reg = ADC_INPUTCTRL_GAIN_DIV2 | ADC_INPUTCTRL_MUXNEG_GND;
-    while (ADC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
 
     // 9. Enable.
     ADC->CTRLA.bit.ENABLE = 1;
-    while (ADC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
 
     // 10. Throw away the first conversion (per datasheet — first sample after
     //     enable is unreliable). MUXPOS=0 is fine for this dummy.
     ADC->SWTRIG.bit.START = 1;
-    while (!ADC->INTFLAG.bit.RESRDY) { /* spin */ }
+    BOUNDED_SPIN(!ADC->INTFLAG.bit.RESRDY);
     (void)ADC->RESULT.reg;
     ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
 
@@ -564,7 +565,7 @@ static uint8_t adc_apply_avg_hold(uint8_t oversample_exp, uint8_t sample_hold_cy
     ctrlb |= (oversample_exp == 0u) ? ADC_CTRLB_RESSEL_12BIT
                                     : ADC_CTRLB_RESSEL_16BIT;
     ADC->CTRLB.reg = (uint16_t)ctrlb;
-    while (ADC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
     return SHELL_STATUS_OK;
 }
 
@@ -597,10 +598,10 @@ uint16_t samd21_adc_read_oneshot(uint8_t channel,
     }
 
     ADC->INPUTCTRL.bit.MUXPOS = channel;
-    while (ADC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
     ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
     ADC->SWTRIG.bit.START = 1;
-    while (!ADC->INTFLAG.bit.RESRDY) { /* spin */ }
+    BOUNDED_SPIN(!ADC->INTFLAG.bit.RESRDY);
     uint16_t value = (uint16_t)ADC->RESULT.reg;
     ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
     return value;
@@ -679,7 +680,7 @@ static uint8_t cmd_dac_follow_start(shell_reader_t* args, shell_writer_t* result
     ain_to_pad_t pad = g_ain_to_pad[p->adc_channel];
     if (pad.port != 0xFFu) adc_pin_config(pad.port, pad.pin);
     ADC->INPUTCTRL.bit.MUXPOS = p->adc_channel;
-    while (ADC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
     ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
     ADC->SWTRIG.bit.START = 1;                    // kick the first conversion
 
@@ -788,10 +789,10 @@ static uint8_t cmd_adc_capture(shell_reader_t* args, shell_writer_t* result) {
 
         for (uint8_t c = 0; c < num_channels; c++) {
             ADC->INPUTCTRL.bit.MUXPOS = channels[c];
-            while (ADC->STATUS.bit.SYNCBUSY) { /* spin */ }
+            BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
             ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
             ADC->SWTRIG.bit.START = 1;
-            while (!ADC->INTFLAG.bit.RESRDY) { /* spin */ }
+            BOUNDED_SPIN(!ADC->INTFLAG.bit.RESRDY);
             uint16_t v = (uint16_t)ADC->RESULT.reg;
             ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
             sw_u16(result, v);
@@ -835,15 +836,15 @@ static void i2c_init(void) {
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(I2C_GCLK_ID_CORE)
                                  | GCLK_CLKCTRL_GEN_GCLK0
                                  | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(I2C_GCLK_ID_SLOW)
                                  | GCLK_CLKCTRL_GEN_GCLK0
                                  | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
 
     // 3. Reset SERCOM2.
     I2C_SERCOM->I2CM.CTRLA.bit.SWRST = 1;
-    while (I2C_SERCOM->I2CM.SYNCBUSY.bit.SWRST) { /* spin */ }
+    BOUNDED_SPIN(I2C_SERCOM->I2CM.SYNCBUSY.bit.SWRST);
 
     // 4. Configure as I2C master, 300 ns SDA hold, smart mode OFF.
     I2C_SERCOM->I2CM.CTRLA.reg =
@@ -861,12 +862,12 @@ static void i2c_init(void) {
 
     // 7. Enable.
     I2C_SERCOM->I2CM.CTRLA.bit.ENABLE = 1;
-    while (I2C_SERCOM->I2CM.SYNCBUSY.bit.ENABLE) { /* spin */ }
+    BOUNDED_SPIN(I2C_SERCOM->I2CM.SYNCBUSY.bit.ENABLE);
 
     // 8. Force bus state to IDLE (1). On power-up the controller reports
     //    UNKNOWN (0) and refuses transactions until told the bus is idle.
     I2C_SERCOM->I2CM.STATUS.bit.BUSSTATE = 1;
-    while (I2C_SERCOM->I2CM.SYNCBUSY.bit.SYSOP) { /* spin */ }
+    BOUNDED_SPIN(I2C_SERCOM->I2CM.SYNCBUSY.bit.SYSOP);
 }
 
 #ifdef I2C_CLIENT
@@ -988,7 +989,7 @@ static uint8_t  g_file_off;                              // read cursor into the
 static uint8_t  g_file_list_i;                           // LIST iterator cursor over slots
 
 // NVM primitives (PAGE=64, ROW=256, ADDR = byte/2). Mirrors flash_storage.c.
-static void cs_nvm_wait(void) { while (NVMCTRL->INTFLAG.bit.READY == 0) { /* spin */ } }
+static void cs_nvm_wait(void) { BOUNDED_SPIN(NVMCTRL->INTFLAG.bit.READY == 0); }
 static void cs_nvm_erase_row(uint32_t addr) {
     cs_nvm_wait();
     NVMCTRL->ADDR.reg = addr / 2u;
@@ -1586,10 +1587,10 @@ static void adc_mode_setup(void) {
     // budget. NO per-sample oversample: the downsample window average IS the noise
     // reduction. AVGCTRL=1 keeps the result 12-bit (0..4095) directly.
     ADC->CTRLB.reg = ADC_CTRLB_PRESCALER_DIV16 | ADC_CTRLB_RESSEL_12BIT;
-    while (ADC->STATUS.bit.SYNCBUSY) { }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
     ADC->AVGCTRL.reg = ADC_AVGCTRL_SAMPLENUM_1 | ADC_AVGCTRL_ADJRES(0);
     ADC->SAMPCTRL.reg = 3u;                                 // short sample-hold (low-Z sources)
-    while (ADC->STATUS.bit.SYNCBUSY) { }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
     for (uint8_t ch = 0; ch < ADC_NCH; ch++) {
         ain_to_pad_t pad = g_ain_to_pad[g_adc_ain[ch]];
         if (pad.port != 0xFFu) adc_pin_config(pad.port, pad.pin);
@@ -1601,7 +1602,7 @@ static void adc_mode_setup(void) {
     PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;                // re-route PA02 to the DAC (PIO mode may
     PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;  // have left it a GPIO; dac_init is 1-shot)
     DAC->CTRLB.bit.EOEN = 1;
-    while (DAC->STATUS.bit.SYNCBUSY) { }
+    BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
     DAC->DATA.reg = g_dac_offset;
     adc_sampler_start();                                    // launch the IRQ-driven sweep
 }
@@ -1687,7 +1688,7 @@ static void adc_sampler_start(void) {
     g_adc_overrun = 0u;
     ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;                 // clear stale (we POLL it, no ADC IRQ)
     ADC->INPUTCTRL.bit.MUXPOS = g_adc_ain[0];              // fixed single channel (A1)
-    while (ADC->STATUS.bit.SYNCBUSY) { }
+    BOUNDED_SPIN(ADC->STATUS.bit.SYNCBUSY);
     g_adc_running = true;
     ADC->SWTRIG.bit.START = 1;                             // launch the first conversion
     // DDS engine: tones off (DC at offset) until a waveform is applied.
@@ -1939,6 +1940,7 @@ static void adc_reg_write(uint8_t reg, uint8_t val) {
 // either — the claim is purely for single-owner reservation + auto-release on exit.
 #define MIXED_IL_SLOT       7u
 _Static_assert(MIXED_IL_SLOT >= INTERLOCK_MAX_SLOTS, "MIXED_IL_SLOT collides with framework slots");
+_Static_assert(MIXED_IL_SLOT < 8, "slot index must fit in the uint8_t hal_pin slot_mask");
 
 static il_inst_t g_mixed_il;
 static bool      g_mixed_il_valid;          // a DSL parsed OK and has >=1 watch
@@ -2466,7 +2468,7 @@ static void servo_tc_init_once(void) {
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(TC4_GCLK_ID)   // TC4_GCLK_ID == TC5_GCLK_ID (28)
                                  | GCLK_CLKCTRL_GEN_GCLK0
                                  | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
     g_servo_tc_initialized = true;
 }
 
@@ -2474,13 +2476,13 @@ static void servo_tc_stop(void) {
     NVIC_DisableIRQ(TC4_IRQn);
     TC4->COUNT16.INTENCLR.reg = TC_INTENCLR_MC0 | TC_INTENCLR_MC1;
     TC4->COUNT16.CTRLA.bit.ENABLE = 0;
-    while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC4->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
 static void servo_tc_start(void) {
     // Reset.
     TC4->COUNT16.CTRLA.bit.SWRST = 1;
-    while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC4->COUNT16.STATUS.bit.SYNCBUSY);
     while (TC4->COUNT16.CTRLA.bit.SWRST)     { /* spin */ }
 
     // 16-bit count, MFRQ wavegen (CC0=TOP and resets the counter), /64 prescaler.
@@ -2489,14 +2491,14 @@ static void servo_tc_start(void) {
                            | TC_CTRLA_PRESCALER_DIV64;
     TC4->COUNT16.CC[0].reg = SERVO_US_TO_TICKS(SERVO_FRAME_US);   // 15000 ticks = 20 ms
     TC4->COUNT16.CC[1].reg = 0;
-    while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC4->COUNT16.STATUS.bit.SYNCBUSY);
 
     TC4->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0 | TC_INTFLAG_MC1;   // clear stale
     TC4->COUNT16.INTENSET.reg = TC_INTENSET_MC0;                  // frame boundary; MC1 armed per-frame
     NVIC_EnableIRQ(TC4_IRQn);
 
     TC4->COUNT16.CTRLA.bit.ENABLE = 1;
-    while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC4->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
 // Recompute the raise masks + sorted/merged drop events from the current
@@ -2660,7 +2662,7 @@ void TC4_Handler(void) {
         g_servo_evt_idx = 0u;
         if (g_servo_evt_n > 0u) {
             TC4->COUNT16.CC[1].reg = g_servo_evt[0].t;
-            while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+            BOUNDED_SPIN(TC4->COUNT16.STATUS.bit.SYNCBUSY);
             TC4->COUNT16.INTENSET.reg = TC_INTENSET_MC1;
         } else {
             TC4->COUNT16.INTENCLR.reg = TC_INTENCLR_MC1;
@@ -2676,7 +2678,7 @@ void TC4_Handler(void) {
         g_servo_evt_idx = idx;
         if (idx < g_servo_evt_n) {                       // next time is strictly larger -> safe
             TC4->COUNT16.CC[1].reg = g_servo_evt[idx].t;
-            while (TC4->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+            BOUNDED_SPIN(TC4->COUNT16.STATUS.bit.SYNCBUSY);
         } else {
             TC4->COUNT16.INTENCLR.reg = TC_INTENCLR_MC1; // done this frame
         }
@@ -2808,7 +2810,7 @@ static void counter_tc_init_once(void) {
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(TC5_GCLK_ID)   // TC5_GCLK_ID == TC4_GCLK_ID (28)
                                  | GCLK_CLKCTRL_GEN_GCLK0
                                  | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
     g_counter_tc_initialized = true;
 }
 
@@ -2816,13 +2818,13 @@ static void counter_tc_stop(void) {
     NVIC_DisableIRQ(TC5_IRQn);
     TC5->COUNT16.INTENCLR.reg = TC_INTENCLR_MC0;
     TC5->COUNT16.CTRLA.bit.ENABLE = 0;
-    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC5->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
 static void counter_tc_start(void) {
     // Reset.
     TC5->COUNT16.CTRLA.bit.SWRST = 1;
-    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC5->COUNT16.STATUS.bit.SYNCBUSY);
     while (TC5->COUNT16.CTRLA.bit.SWRST)     { /* spin */ }
 
     // 16-bit count, MFRQ wavegen (CC0=TOP and resets the counter), /64 prescaler.
@@ -2831,14 +2833,14 @@ static void counter_tc_start(void) {
                            | TC_CTRLA_WAVEGEN_MFRQ
                            | TC_CTRLA_PRESCALER_DIV64;
     TC5->COUNT16.CC[0].reg = g_counter_cc0;                       // CC0 = 750000/rate
-    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC5->COUNT16.STATUS.bit.SYNCBUSY);
 
     TC5->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;                    // clear stale
     TC5->COUNT16.INTENSET.reg = TC_INTENSET_MC0;                  // 1 kHz sampler tick
     NVIC_EnableIRQ(TC5_IRQn);
 
     TC5->COUNT16.CTRLA.bit.ENABLE = 1;
-    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(TC5->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
 // Configure one counter pad as a GPIO input with the requested pull (0 none, 1
@@ -2917,7 +2919,7 @@ static void counter_enter(void) {
         PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;                 // route PA02 -> DAC
         PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
         DAC->CTRLB.bit.EOEN = 1;
-        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
         for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;
         g_dds.active = false;
         DAC->DATA.reg = g_dac_offset;
@@ -3090,7 +3092,7 @@ static void mode_leave(uint8_t m) {
         pio_il_disarm();                            // deassert INT, drop the latch
         pio_safe_all();                             // pins safe (inputs)
         DAC->CTRLB.bit.EOEN = 1;                    // restore DAC output buffer on PA02
-        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
     } else if (m == MODE_ADC) {                     // leaving ADC
         adc_sampler_stop();                         // stop the tone-clocked sweep (TC3 + DDS off)
     } else if (m == MODE_MIXED) {                   // leaving MIXED
@@ -3101,11 +3103,11 @@ static void mode_leave(uint8_t m) {
     } else if (m == MODE_SERVO) {                   // leaving SERVO
         servo_exit();                               // stop TC4, drive all servo pins low
         DAC->CTRLB.bit.EOEN = 1;                    // restore DAC output buffer on PA02 (CH0)
-        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
     } else if (m == MODE_COUNTER) {                 // leaving COUNTER
         counter_exit();                             // stop TC5 (pins stay inputs, safe)
         DAC->CTRLB.bit.EOEN = 1;                    // restore DAC output buffer on PA02 (CH0)
-        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
     }
 }
 
@@ -3113,7 +3115,7 @@ static void mode_leave(uint8_t m) {
 static void mode_enter(uint8_t m) {
     if (m == MODE_PIO) {                            // entering PIO
         DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)
-        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
         gpmp_apply();                               // load the commissioned power-on pin map
         pio_apply_all();                            // claim + configure the 8 channels
         pio_sample_inputs();                        // seed the 1 kHz read shadow
@@ -3126,18 +3128,18 @@ static void mode_enter(uint8_t m) {
         PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;    // route PA02 -> DAC (mode entry may have freed it)
         PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
         DAC->CTRLB.bit.EOEN = 1;
-        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
         for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;  // idle: no waveform
         g_dds.active = false;
         DAC->DATA.reg = g_dac_offset;               // idle at the DC offset
         mixed_il_arm();                             // parse interlock_cfg, claim pins, set up INT
     } else if (m == MODE_SERVO) {                   // entering SERVO
         DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)
-        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
         servo_enter();                              // pins->GPIO low, build schedule, start TC4
     } else if (m == MODE_COUNTER) {                 // entering COUNTER
         DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC so it reads as input
-        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
         counter_enter();                            // pins->GPIO inputs, seed last, zero, start TC5
     }
 }
@@ -3171,7 +3173,7 @@ void mode_go_offline(void) {
     }
 
     DAC->CTRLB.bit.EOEN = 0;                         // release A0/PA02 from the DAC (Hi-Z input)
-    while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
 
     servo_tc_stop();                                 // stop TC4 (idempotent)
     counter_tc_stop();                               // stop TC5 (idempotent)
@@ -3294,14 +3296,14 @@ static void i2c_slave_init(void) {
     // 2. SERCOM2 core + slow clocks -> GCLK0 (48 MHz).
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(I2C_GCLK_ID_CORE)
                                  | GCLK_CLKCTRL_GEN_GCLK0 | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
     GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_ID(I2C_GCLK_ID_SLOW)
                                  | GCLK_CLKCTRL_GEN_GCLK0 | GCLK_CLKCTRL_CLKEN);
-    while (GCLK->STATUS.bit.SYNCBUSY) { /* spin */ }
+    BOUNDED_SPIN(GCLK->STATUS.bit.SYNCBUSY);
 
     // 3. Reset SERCOM2.
     I2C_SERCOM->I2CS.CTRLA.bit.SWRST = 1;
-    while (I2C_SERCOM->I2CS.SYNCBUSY.bit.SWRST) { /* spin */ }
+    BOUNDED_SPIN(I2C_SERCOM->I2CS.SYNCBUSY.bit.SWRST);
 
     // 4. I2C slave mode, 300 ns SDA hold, SCLSM = stretch SCL after the ACK bit
     //    (gives the ISR time to load the read byte — required for slave transmit).
@@ -3333,7 +3335,7 @@ static void i2c_slave_init(void) {
 
     // 8. Enable.
     I2C_SERCOM->I2CS.CTRLA.bit.ENABLE = 1;
-    while (I2C_SERCOM->I2CS.SYNCBUSY.bit.ENABLE) { /* spin */ }
+    BOUNDED_SPIN(I2C_SERCOM->I2CS.SYNCBUSY.bit.ENABLE);
 }
 
 void SERCOM2_Handler(void) {
@@ -3541,7 +3543,7 @@ static bool i2c_bus_error(void) {
 
 static void i2c_stop(void) {
     I2C_SERCOM->I2CM.CTRLB.bit.CMD = 3;  // STOP
-    while (I2C_SERCOM->I2CM.SYNCBUSY.bit.SYSOP) { /* spin */ }
+    BOUNDED_SPIN(I2C_SERCOM->I2CM.SYNCBUSY.bit.SYSOP);
 }
 
 // START + addr, write or read direction. Returns true if address ACKed.
@@ -3567,12 +3569,12 @@ static bool i2c_write_byte(uint8_t data) {
 static uint8_t i2c_read_byte(bool is_last) {
     // ACKACT must be set BEFORE reading DATA (reading DATA triggers next byte).
     I2C_SERCOM->I2CM.CTRLB.bit.ACKACT = is_last ? 1 : 0;
-    while (I2C_SERCOM->I2CM.SYNCBUSY.bit.SYSOP) { /* spin */ }
+    BOUNDED_SPIN(I2C_SERCOM->I2CM.SYNCBUSY.bit.SYSOP);
     uint8_t data = (uint8_t)I2C_SERCOM->I2CM.DATA.reg;
     if (!is_last) {
         // Trigger next byte read (CMD=2 = read).
         I2C_SERCOM->I2CM.CTRLB.bit.CMD = 2;
-        while (I2C_SERCOM->I2CM.SYNCBUSY.bit.SYSOP) { /* spin */ }
+        BOUNDED_SPIN(I2C_SERCOM->I2CM.SYNCBUSY.bit.SYSOP);
         i2c_wait_complete();
     }
     return data;
