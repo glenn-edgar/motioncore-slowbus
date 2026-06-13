@@ -42,7 +42,8 @@
 // v5 (slice 6): grows il_input_t to 8 B with debounce_depth + hyst for ADC/virtual.
 // v6 (slice 7): grows il_watch_t with a `group` field (DNF OR-groups) + bumps
 //               IL_MAX_WATCHES 4 -> 8 so non-trivial boolean expressions fit.
-#define INTERLOCK_PERSIST_VERSION    6u
+// v7: grows il_output_t with `open_drain` (open-collector `oc` / `oc:up` outputs).
+#define INTERLOCK_PERSIST_VERSION    7u
 
 // ---- Slice 2: DSL-driven interlock instance ------------------------------
 
@@ -112,6 +113,7 @@ typedef struct {
     uint8_t  phys_id;
     uint8_t  ok_value;            // 0 or 1
     uint8_t  err_value;           // 0 or 1
+    uint8_t  open_drain;          // slice: 0 = push-pull, 1 = oc, 2 = oc:up (internal pull-up)
 } il_output_t;
 
 typedef struct {
