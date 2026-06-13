@@ -928,7 +928,7 @@ extern uint8_t crc8_autosar_update(uint8_t crc, uint8_t byte);   // libcomm
 #define STORE_ENTRY_MAGIC 0x10C0FFEEu
 #define STORE_NAME_LEN    4u
 #define STORE_DATA_MAX    240u
-#define STORE_SLOTS       16u    // RAM-shadow cap: at most 16 distinct names live
+#define STORE_SLOTS       32u    // RAM-shadow cap: at most 32 distinct names live (~253 B/slot)
 
 // store-window register addresses
 #define REG_REC_SEL    0x40u
