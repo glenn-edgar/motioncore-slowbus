@@ -69,14 +69,22 @@ IL_NAME_MAX = 16
 MIXED_TICK_MS = 10
 DEBOUNCE_DEPTH_MIN, DEBOUNCE_DEPTH_MAX = 2, 15
 
-# COUNTER mode: a `cntr` config file [VER=1, rate_lo, rate_hi, ch0..ch8]; each ch
-# byte = bit0 enable, bits1-2 pull (0 none/1 up/2 down), bits3-4 edge (0 rise/
-# 1 fall/2 both). Pad order (bit 0..8): D0,D1,D2,D3,D7,D8,D9,D10,D6 (= servo bank).
+# COUNTER mode: a `cntr` config file [VER=1, rate_lo, rate_hi, ch0..ch8]. Each ch
+# byte: bit0 enable. If a counter (bit0=1): bits1-2 pull (0 none/1 up/2 down),
+# bits3-4 edge (0 rise/1 fall/2 both). If NOT a counter (bit0=0): bits1-3 = bench
+# role for that spare pad (firmware BENCH_ROLE_*: 0 none,1 gpio-in,2 gpio-out,3 adc,
+# 4 dac). Pad order (bit 0..8): D0,D1,D2,D3,D7,D8,D9,D10,D6 (= servo bank).
 CNTR_VERSION = 1
 COUNTER_PINS = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10', 'D6')
 COUNTER_PIN_IDX = {p: i for i, p in enumerate(COUNTER_PINS)}
+# A-labels alias the same physical pad (A0==D0, ...); accepted in counter()/pins().
+COUNTER_PIN_ALIAS = {'A0': 'D0', 'A1': 'D1', 'A2': 'D2', 'A3': 'D3', 'A6': 'D6',
+                     'A7': 'D7', 'A8': 'D8', 'A9': 'D9', 'A10': 'D10'}
 COUNTER_PULLS = {'none': 0, 'up': 1, 'down': 2}
 COUNTER_EDGES = {'rising': 0, 'falling': 1, 'both': 2}
+# Bench roles for spare (non-counter) pads -> firmware BENCH_ROLE_* value. The byte
+# stores (role << 1) with the enable bit clear. `dac` is hardware-limited to D0/A0.
+COUNTER_BENCH_ROLES = {'in': 1, 'out': 2, 'adc': 3, 'dac': 4}
 COUNTER_RATE_MIN, COUNTER_RATE_MAX = 50, 10000   # Hz; max countable ~ rate/2
 
 ADC_FULLSCALE = 4095
@@ -91,7 +99,7 @@ _OP_FROM_SYM = {'>': 'gt', '<': 'lt', '>=': 'ge', '<=': 'le', '==': 'eq', '!=': 
 _OP_INVERT = {'gt': 'le', 'le': 'gt', 'lt': 'ge', 'ge': 'lt', 'eq': 'ne', 'ne': 'eq'}
 
 _PULL_MODS = {'up', 'down'}
-_ROLE_BASES = {'in', 'out', 'adc', 'count'}
+_ROLE_BASES = {'in', 'out', 'adc', 'dac', 'count'}
 
 
 class DSLError(Exception):
@@ -565,27 +573,39 @@ class Unit:
 
     def cntr(self):
         """COUNTER config file: [VER, rate_lo, rate_hi, ch0..ch8]. Each declared
-        `count` pad becomes a counter (pull up/down/none, edge rising/falling/both);
-        undeclared pads stay free for the bench tools (DAC on A0/D0)."""
+        `count` pad becomes a counter (pull up/down/none, edge rising/falling/both).
+        A spare pad may instead carry a bench role for the COUNTER bench tools:
+        `in` (gpio read), `out` (gpio write), `adc` (16x oneshot), or `dac` (D0/A0
+        only). Undeclared pads default to no role (every bench op on them errors)."""
         if self.mode != MODES['COUNTER']:
             return None
         chbytes = [0] * len(COUNTER_PINS)
         for label, (base, mods) in self.roles.items():
-            if base != 'count':
-                raise DSLError("COUNTER pin %s must be 'count', got %r" % (label, base))
-            if label not in COUNTER_PIN_IDX:
-                raise DSLError("COUNTER pin %s is not a counter pad %s" % (label, COUNTER_PINS))
-            pull, edge = 'none', 'rising'
-            for m in mods:
-                if m in COUNTER_PULLS:
-                    pull = m
-                elif m in COUNTER_EDGES:
-                    edge = m
-                else:
-                    raise DSLError("counter %s: bad modifier %r (pull up/down/none, "
-                                   "edge rising/falling/both)" % (label, m))
-            chbytes[COUNTER_PIN_IDX[label]] = (1 | (COUNTER_PULLS[pull] << 1)
-                                               | (COUNTER_EDGES[edge] << 3))
+            pin = COUNTER_PIN_ALIAS.get(label, label)        # A0->D0, ...
+            if pin not in COUNTER_PIN_IDX:
+                raise DSLError("COUNTER pin %s is not a usable pad %s" % (label, COUNTER_PINS))
+            idx = COUNTER_PIN_IDX[pin]
+            if base == 'count':
+                pull, edge = 'none', 'rising'
+                for m in mods:
+                    if m in COUNTER_PULLS:
+                        pull = m
+                    elif m in COUNTER_EDGES:
+                        edge = m
+                    else:
+                        raise DSLError("counter %s: bad modifier %r (pull up/down/none, "
+                                       "edge rising/falling/both)" % (label, m))
+                chbytes[idx] = (1 | (COUNTER_PULLS[pull] << 1) | (COUNTER_EDGES[edge] << 3))
+            elif base in COUNTER_BENCH_ROLES:
+                if mods:
+                    raise DSLError("COUNTER bench pin %s: role %r takes no modifiers, got %r"
+                                   % (label, base, mods))
+                if base == 'dac' and pin != 'D0':
+                    raise DSLError("COUNTER pin %s: dac role is only on D0/A0 (the DAC pad)" % label)
+                chbytes[idx] = (COUNTER_BENCH_ROLES[base] << 1)   # enable bit 0 left clear
+            else:
+                raise DSLError("COUNTER pin %s: role %r must be count or a bench role %s"
+                               % (label, base, sorted(COUNTER_BENCH_ROLES)))
         r = self.cntr_rate
         return bytes([CNTR_VERSION, r & 0xFF, (r >> 8) & 0xFF] + chbytes)
 
