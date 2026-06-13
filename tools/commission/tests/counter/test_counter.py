@@ -43,10 +43,16 @@ def run():
     c.eq("square -> D1 counts (>0)", cnt[1] > 0, True)
     c.eq("disabled channels stay 0", sum(cnt) - cnt[1], 0)
 
-    # 4. READ_CLR zeroes; READ does not
+    # 4. READ_CLR zeroes (stop the stimulus first so no edges accrue between the
+    #    two clear-reads — at the full DAC rate ~400 edges/s a continuous source
+    #    adds several edges in the inter-read gap, which is correct behaviour).
+    dac_dc(dg, 900)                         # DC -> no edges
+    time.sleep(0.05)
     read_all(dg, clear=True)                # zero
-    a = read_all(dg, clear=True)[1]         # immediately after clear -> ~0 (few stray edges ok)
+    a = read_all(dg, clear=True)[1]         # source stopped -> stays ~0
     c.eq("READ_CLR zeroes (D1<5)", a < 5, True)
+    # 5. READ (no clear) does not reset, and the count grows with the square back on
+    dac_square(dg, freq=200, amp=511, offset=512)
     time.sleep(0.3)
     b1 = read_all(dg)[1]                    # READ (no clear)
     b2 = read_all(dg)[1]                    # READ again -> not reset, >= previous
