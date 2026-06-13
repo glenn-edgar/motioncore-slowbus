@@ -1309,6 +1309,27 @@ static void pio_phys_drive(uint8_t phys, uint8_t v) {
     else   PORT->Group[grp].OUTCLR.reg = m;
     PORT->Group[grp].DIRSET.reg = m;                    // ensure driven (od low / push-pull)
 }
+
+// Drive an interlock output honoring its commissioned open_drain. Used by MIXED/ADC,
+// whose outputs (often D6) aren't g_pio_ch channels, so the gpmp g_pio_od path can't
+// reach them. od 0 = push-pull (drive `value`); od 1/2 = open-collector: value 1 ->
+// release (Hi-Z, or input+pull-up when od==2), value 0 -> drive low. INEN stays on so
+// the pin is always readable (the OUT_LIVE snapshot read-back).
+static void il_drive_output(uint8_t phys, uint8_t value, uint8_t od) {
+    uint8_t grp = phys >> 5, pin = phys & 0x1Fu;
+    uint32_t m = 1u << pin;
+    if (od && value) {                                  // open-collector release
+        PORT->Group[grp].DIRCLR.reg = m;                // Hi-Z first (no high glitch)
+        if (od == 2u) PORT->Group[grp].OUTSET.reg = m;  // OUT=1 -> pull-up direction
+        PORT->Group[grp].PINCFG[pin].reg = (uint8_t)(PORT_PINCFG_INEN |
+                                           (od == 2u ? PORT_PINCFG_PULLEN : 0u));
+    } else {                                            // push-pull level, or oc value 0 = low
+        PORT->Group[grp].PINCFG[pin].reg = PORT_PINCFG_INEN;   // INEN on, drop any pull-up
+        if (value) PORT->Group[grp].OUTSET.reg = m;
+        else       PORT->Group[grp].OUTCLR.reg = m;
+        PORT->Group[grp].DIRSET.reg = m;
+    }
+}
 // INT (D6) is open-drain, active-low: asserted -> actively drive 0; released ->
 // Hi-Z (pin to input), so several chips can wire-OR onto one shared INT line
 // (external pull-up holds it high when nobody is tripped).
@@ -1334,6 +1355,9 @@ static void pio_int_assert(bool on) {
 //   0x30 VALID (r)   0x31 N_IN (r)   0x32 N_OUT (r)   0x33 SEL (w/r index)
 //   0x34 IN_ROLE (r 1=gpio 2=adc)    0x35/0x36 IN_VAL (r u16)
 //   0x37 OUT_PHYS (r)                0x38 OUT_VAL (r safe value driven)
+//   0x39 OUT_LIVE (r): the selected output pin's LIVE physical level (read-back).
+//        Open-collector outputs keep INEN on, so this confirms what is actually on
+//        the pin (e.g. an `oc` D6 driven low on trip reads 0) -- no jumper needed.
 #define REG_ILSNAP_VALID    0x30u
 #define REG_ILSNAP_NIN      0x31u
 #define REG_ILSNAP_NOUT     0x32u
@@ -1342,6 +1366,7 @@ static void pio_int_assert(bool on) {
 #define REG_ILSNAP_IN_VAL   0x35u   // 0x35 lo, 0x36 hi
 #define REG_ILSNAP_OUT_PHYS 0x37u
 #define REG_ILSNAP_OUT_VAL  0x38u
+#define REG_ILSNAP_OUT_LIVE 0x39u
 
 static struct {
     bool     valid;
@@ -1384,6 +1409,7 @@ static uint8_t il_snap_reg_read(uint8_t reg) {
     case REG_ILSNAP_IN_VAL+1u:return (s < g_il_snap.n_in) ? (uint8_t)(g_il_snap.in[s] >> 8) : 0xFFu;
     case REG_ILSNAP_OUT_PHYS: return (s < g_il_snap.n_out) ? g_il_snap.out_phys[s] : 0xFFu;
     case REG_ILSNAP_OUT_VAL:  return (s < g_il_snap.n_out) ? g_il_snap.out_val[s] : 0xFFu;
+    case REG_ILSNAP_OUT_LIVE: return (s < g_il_snap.n_out) ? pio_phys_read(g_il_snap.out_phys[s]) : 0xFFu;
     default:                  return 0xFFu;
     }
 }
@@ -1719,14 +1745,10 @@ static bool adc_watch_pass(const il_watch_t* w, uint16_t v) {
     default:       return true;
     }
 }
-static void adc_il_drive(bool ok) {                          // drive every output pin
+static void adc_il_drive(bool ok) {                          // drive every output pin (od-aware)
     for (uint8_t i = 0; i < g_adc_il.output_count; i++) {
-        uint8_t phys = g_adc_il.outputs[i].phys_id, g = phys >> 5, p = phys & 0x1Fu;
-        uint32_t m = 1u << p;
-        if (ok ? g_adc_il.outputs[i].ok_value : g_adc_il.outputs[i].err_value)
-            PORT->Group[g].OUTSET.reg = m;
-        else PORT->Group[g].OUTCLR.reg = m;
-        PORT->Group[g].DIRSET.reg = m;
+        const il_output_t* o = &g_adc_il.outputs[i];
+        il_drive_output(o->phys_id, ok ? o->ok_value : o->err_value, o->open_drain);
     }
 }
 static void adc_il_arm(void) {
@@ -1944,10 +1966,20 @@ static bool mixed_watch_pass(const il_watch_t* w, uint16_t v) {
     }
 }
 
-// Force out_err pins to their safe value (override whatever drove them before).
+// Drive out pins to their safe (err) / normal (ok) value -- od-aware. MIXED drives
+// its own outputs directly (its slot is unmanaged by hal_pin_drive_outputs), so it
+// must assert BOTH states itself, not just the safe one.
 static void mixed_il_drive_safe(void) {
-    for (uint8_t i = 0; i < g_mixed_il.output_count; i++)
-        pio_phys_drive(g_mixed_il.outputs[i].phys_id, g_mixed_il.outputs[i].err_value);
+    for (uint8_t i = 0; i < g_mixed_il.output_count; i++) {
+        const il_output_t* o = &g_mixed_il.outputs[i];
+        il_drive_output(o->phys_id, o->err_value, o->open_drain);
+    }
+}
+static void mixed_il_drive_ok(void) {
+    for (uint8_t i = 0; i < g_mixed_il.output_count; i++) {
+        const il_output_t* o = &g_mixed_il.outputs[i];
+        il_drive_output(o->phys_id, o->ok_value, o->open_drain);
+    }
 }
 
 // Claim each declared input/output pin under MIXED_IL_SLOT, following
@@ -2032,8 +2064,10 @@ static void mixed_il_manual_reset(void) {
     il_snap_clear();                        // drop the trip freeze-frame
     pio_int_assert(false);
     // Restore each output to its ok value (drop the safe override).
-    for (uint8_t i = 0; i < g_mixed_il.output_count; i++)
-        pio_phys_drive(g_mixed_il.outputs[i].phys_id, g_mixed_il.outputs[i].ok_value);
+    for (uint8_t i = 0; i < g_mixed_il.output_count; i++) {
+        const il_output_t* o = &g_mixed_il.outputs[i];
+        il_drive_output(o->phys_id, o->ok_value, o->open_drain);   // od-aware
+    }
 }
 
 // Run from i2c_store_service (superloop), gated to ~100 Hz (10 ms) like adc_sample_tick.
@@ -2094,6 +2128,8 @@ static void mixed_tick(void) {
             il_snap_capture(&g_mixed_il, vals);              // freeze inputs + outputs
             mixed_il_drive_safe();
             pio_int_assert(true);
+        } else {
+            mixed_il_drive_ok();           // condition holds -> assert the normal (ok) output
         }
     } else {
         mixed_il_drive_safe();              // hold the safe outputs each tick

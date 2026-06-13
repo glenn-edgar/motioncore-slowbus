@@ -37,6 +37,9 @@ R = {
     "DAC_APPLY":   0x25,
     "DAC_T2_TYPE": 0x26, "DAC_T2_AMP": 0x27, "DAC_T2_FREQ": 0x29,  # tone 1
     "DAC_OFF_LO":  0x2B, "DAC_OFF_HI": 0x2C,                       # DC offset (u16)
+    # shared interlock trip freeze-frame (latched at trip, cleared on reset)
+    "SNAP_VALID": 0x30, "SNAP_NOUT": 0x32, "SNAP_SEL": 0x33,
+    "SNAP_OUT_PHYS": 0x37, "SNAP_OUT_VAL": 0x38, "SNAP_OUT_LIVE": 0x39,
 }
 # tone types
 T_OFF, T_CONST, T_SINE, T_SQUARE = 0, 1, 2, 3
@@ -122,6 +125,19 @@ def clear_trip(dg):
 def ilstate(dg):
     st = dg.reg_read(R["ILSTATE"])
     return {"tripped": st & 1, "cond_ok": (st >> 1) & 1, "armed": (st >> 2) & 1}
+
+
+def snapshot(dg):
+    """Interlock trip freeze-frame outputs -> {valid, outputs:[{phys,val,live}]}."""
+    if not dg.reg_read(R["SNAP_VALID"]):
+        return {"valid": 0, "outputs": []}
+    outs = []
+    for i in range(dg.reg_read(R["SNAP_NOUT"])):
+        dg.reg_write(R["SNAP_SEL"], i)
+        outs.append({"phys": dg.reg_read(R["SNAP_OUT_PHYS"]),
+                     "val":  dg.reg_read(R["SNAP_OUT_VAL"]),
+                     "live": dg.reg_read(R["SNAP_OUT_LIVE"])})
+    return {"valid": 1, "outputs": outs}
 
 
 def volts_to_count(v):

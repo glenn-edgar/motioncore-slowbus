@@ -105,10 +105,13 @@ bool                   hal_pin_check_consistency(void);
 // pin isn't claimed or isn't configured as an input.
 uint8_t                hal_pin_read    (uint8_t phys_id);
 
-// Drive every claimed OUTPUT pin per OR-of-vetoes:
-//   - if (claim.slot_mask & veto_mask) != 0 → drive err_value
-//   - else                                  → drive ok_value
-// `veto_mask` bit i = "slot i is currently vetoing" (TF=F). Slots that are
-// EMPTY/POISONED/non-DSL have no claims and don't participate. Always
-// re-asserts (idempotent), so transient PORT corruption self-heals.
-void                   hal_pin_drive_outputs(uint8_t veto_mask);
+// Drive each claimed OUTPUT pin owned by a MANAGED slot per OR-of-vetoes:
+//   - if (claim.slot_mask & veto_mask)   != 0 → drive err_value
+//   - else                                    → drive ok_value
+// `managed_mask` bit i = "slot i is driven by the framework here". Pins owned by
+// UNMANAGED slots (e.g. the mode interlocks MIXED/PIO/ADC on their dedicated slots,
+// which drive their own outputs directly) are skipped, so the framework's "drive
+// ok when un-vetoed" default can't override their direct trip-drive.
+// `veto_mask` bit i = "slot i is currently vetoing" (TF=F). Always re-asserts
+// (idempotent), so transient PORT corruption self-heals.
+void                   hal_pin_drive_outputs(uint8_t veto_mask, uint8_t managed_mask);

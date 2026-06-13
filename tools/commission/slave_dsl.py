@@ -454,7 +454,21 @@ class Unit:
             return "(%s):in%s" % (pin, sfx)
         if base == 'out':
             return "(%s):out" % pin          # interlock drives it; init lives in gpmp
+        if base == 'oc':                     # open-collector output: oc / oc:up
+            return self._out_cfg_token(pin)
         raise DSLError("pin %s: bad role base %r" % (pin, base))
+
+    def _out_cfg_token(self, pin):
+        """cfg token for an interlock OUTPUT pin: `oc`/`oc,up` if the pin is declared
+        open-collector, else push-pull `out` (the default when undeclared)."""
+        base, mods = self.roles.get(pin, ('out', []))
+        if base == 'oc':
+            if mods == ['up']:
+                return "(%s):oc,up" % pin
+            if mods:
+                raise DSLError("oc on %s: only the :up modifier is allowed, got %r" % (pin, mods))
+            return "(%s):oc" % pin
+        return "(%s):out" % pin
 
     # An inert ilcf: a name with no watch section -> il_parse OK but the firmware
     # won't arm it (needs >=1 watch). Emitted when a GPIO/MIXED unit has no
@@ -483,7 +497,7 @@ class Unit:
                 if p not in inputs:
                     inputs.append(p)
         for p in inputs:
-            if p not in self.roles or self.roles[p][0] == 'out':
+            if p not in self.roles or self.roles[p][0] in ('out', 'oc'):
                 raise DSLError("watched pin %r is not a declared input" % p)
         if len(inputs) > IL_MAX_INPUTS:
             raise DSLError("%d watched inputs > IL_MAX_INPUTS=%d" % (len(inputs), IL_MAX_INPUTS))
@@ -494,8 +508,8 @@ class Unit:
         if len(drive) > IL_MAX_OUTPUTS:
             raise DSLError("%d outputs > IL_MAX_OUTPUTS=%d" % (len(drive), IL_MAX_OUTPUTS))
         for label in drive:
-            if self.roles.get(label, (None,))[0] != 'out':
-                raise DSLError("drive pin %r not declared as 'out'" % label)
+            if self.roles.get(label, (None,))[0] not in ('out', 'oc'):
+                raise DSLError("drive pin %r not declared as 'out' or 'oc'" % label)
 
         # MIXED's cfg declares every channel (the mode samples them all); GPIO's
         # cfg declares only the interlock's pins (all 8 live in gpmp, can't fit).
@@ -546,7 +560,7 @@ class Unit:
         total = sum(len(g) for g in groups)
         if total > IL_MAX_WATCHES:
             raise DSLError("%d watch clauses > IL_MAX_WATCHES=%d" % (total, IL_MAX_WATCHES))
-        cfg = ",".join("(%s):out" % d.upper() for d in drive)
+        cfg = ",".join(self._out_cfg_token(d.upper()) for d in drive)
         watch = "|".join(",".join(self._clause(s, op, thr) for (s, op, thr) in g) for g in groups)
         ok, err = [], []
         for label, v in drive.items():
