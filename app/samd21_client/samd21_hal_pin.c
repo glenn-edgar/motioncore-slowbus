@@ -267,12 +267,13 @@ uint8_t hal_pin_read(uint8_t phys_id) {
     return (PORT->Group[port].IN.reg & (1u << pin)) ? 1u : 0u;
 }
 
-void hal_pin_drive_outputs(uint8_t veto_mask) {
+void hal_pin_drive_outputs(uint8_t veto_mask, uint8_t managed_mask) {
     ensure_initialised();
     for (uint8_t id = 0; id < HAL_PIN_TABLE_SIZE; id++) {
         const hal_pin_claim_record_t* c = &g_claims[id];
         if (c->slot_mask == 0u) continue;
         if (c->mode != (uint8_t)HAL_PIN_MODE_GPIO_OUT) continue;
+        if ((c->slot_mask & managed_mask) == 0u) continue;   // unmanaged slot drives itself
         uint8_t val = (c->slot_mask & veto_mask) ? c->err_value : c->ok_value;
         uint8_t port = BOARD_PHYS_PIN_PORT(id);
         uint8_t pin  = BOARD_PHYS_PIN_PIN(id);

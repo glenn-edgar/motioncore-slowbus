@@ -43,7 +43,7 @@ R = {
     # shared interlock trip freeze-frame (latched at trip, cleared on reset)
     "SNAP_VALID": 0x30, "SNAP_NIN": 0x31, "SNAP_NOUT": 0x32, "SNAP_SEL": 0x33,
     "SNAP_IN_ROLE": 0x34, "SNAP_IN_VAL": 0x35,  # 0x35 lo, 0x36 hi
-    "SNAP_OUT_PHYS": 0x37, "SNAP_OUT_VAL": 0x38,
+    "SNAP_OUT_PHYS": 0x37, "SNAP_OUT_VAL": 0x38, "SNAP_OUT_LIVE": 0x39,
 }
 MIXED_INT_BIT = 0x02
 T_OFF = 0
@@ -111,7 +111,9 @@ def snapshot(dg):
         ins.append({"role": dg.reg_read(R["SNAP_IN_ROLE"]), "val": val})
     for i in range(nout):
         dg.reg_write(R["SNAP_SEL"], i)
-        outs.append({"phys": dg.reg_read(R["SNAP_OUT_PHYS"]), "val": dg.reg_read(R["SNAP_OUT_VAL"])})
+        outs.append({"phys": dg.reg_read(R["SNAP_OUT_PHYS"]),
+                     "val":  dg.reg_read(R["SNAP_OUT_VAL"]),
+                     "live": dg.reg_read(R["SNAP_OUT_LIVE"])})   # actual pin level (read-back)
     return {"valid": 1, "inputs": ins, "outputs": outs}
 
 
