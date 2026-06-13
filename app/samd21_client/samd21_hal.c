@@ -53,7 +53,18 @@ void hal_wdt_pet(void)
 {
     // Writing the 0xA5 key clears the WDT count. Any other value triggers
     // immediate system reset, so do NOT write any other constant here.
-    WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+    //
+    // CRITICAL: WDT->CLEAR is write-synchronized to the 1 kHz WDT clock. Writing
+    // it while a previous CLEAR is still synchronizing STALLS the APB bus (and
+    // thus the CPU, with all interrupts held off) for milliseconds. Petting every
+    // main-loop pass therefore blocked SysTick / TC timer ISRs ~89% of the time —
+    // the root cause of the long-misdiagnosed "9x slow clock" (board_millis and
+    // DAC/ADC/counter rates). Only write when the sync is idle: the loop runs
+    // thousands of times/sec, far more often than the ~4 s timeout needs, so the
+    // WDT is still refreshed promptly without ever stalling.
+    if (!WDT->STATUS.bit.SYNCBUSY) {
+        WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+    }
 }
 
 // ---------------------------------------------------------------------------
