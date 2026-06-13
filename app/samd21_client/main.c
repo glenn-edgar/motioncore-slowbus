@@ -64,6 +64,7 @@ extern char _sbss[];         // start of .bss in RAM
 extern char _ebss[];         // end   of .bss in RAM
 extern char _sstack[];       // start of stack region in RAM
 extern char _estack[];       // top of stack
+extern char _snoinit[];      // start of .noinit (must sit ABOVE the stack)
 
 #define SAMD21G18A_FLASH_TOTAL_KB  256u
 #define SAMD21G18A_RAM_TOTAL_KB    32u
@@ -152,6 +153,8 @@ static void stack_paint_and_canary(void) {
 //   5. HAL pin claim table has no duplicate non-shared owners
 //   6. Crash record self-consistency (if last_pc != 0 then last_crashed_slot
 //      must be 0xFF (no-slot) OR < INTERLOCK_MAX_SLOTS)
+//   7. Linker section order bss <= stack < noinit (technique #3) — the
+//      assumption the whole stack-protection scheme rests on.
 // ----------------------------------------------------------------------------
 
 extern interlock_persist_t g_interlock_persist;   // declared in samd21_interlocks.h
@@ -188,6 +191,17 @@ static void system_self_check(void) {
         if (has_crash && !slot_ok) {
             panic(PANIC_CRASH_RECORD_BAD, cr->last_crashed_slot);
         }
+    }
+    // 7. Linker layout invariant (defensive technique #3). The entire stack-
+    //    protection scheme — canary at _sstack, overflow-spills-into-bss, noinit
+    //    survives — assumes the section order bss <= stack < noinit. Nothing
+    //    else verifies it, so a future .ld edit that reorders sections (the
+    //    exact regression that caused the original stack->noinit corruption)
+    //    would silently guard the wrong boundary. Catch it at boot instead.
+    if (!((uintptr_t)_ebss   <= (uintptr_t)_sstack &&
+          (uintptr_t)_sstack <  (uintptr_t)_estack &&
+          (uintptr_t)_estack <= (uintptr_t)_snoinit)) {
+        panic(PANIC_LAYOUT_BAD, (uint32_t)(uintptr_t)_sstack);
     }
 }
 
