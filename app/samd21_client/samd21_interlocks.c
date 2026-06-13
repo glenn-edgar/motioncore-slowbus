@@ -695,7 +695,9 @@ void interlock_tick_all(void) {
             veto_mask |= (uint8_t)(1u << slot);
         }
     }
-    hal_pin_drive_outputs(veto_mask);
+    // Manage only the framework slots (0..INTERLOCK_MAX_SLOTS-1). Pins claimed by
+    // the mode interlocks (MIXED/PIO/ADC on dedicated higher slots) drive themselves.
+    hal_pin_drive_outputs(veto_mask, (uint8_t)((1u << INTERLOCK_MAX_SLOTS) - 1u));
 
     // Phase 3 — populate status buffer + emit OP_EVENT on slot transitions.
     // Compare new slot snapshots against the previous tick's status buffer

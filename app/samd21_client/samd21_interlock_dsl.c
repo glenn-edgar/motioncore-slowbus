@@ -282,8 +282,10 @@ static il_parse_status_t parse_cfg(parser_t* p, il_inst_t* inst) {
         il_pin_mode_t mode;
         bool is_input = false;
         bool is_adc   = false;
+        uint8_t out_od = 0;   // output open-drain: 0 push-pull, 1 oc, 2 oc:up
         if      (ident_equals(mod_strs[0], mod_lens[0], "in"))  { mode = IL_PIN_MODE_IN;  is_input = true;  }
         else if (ident_equals(mod_strs[0], mod_lens[0], "out")) { mode = IL_PIN_MODE_OUT; is_input = false; }
+        else if (ident_equals(mod_strs[0], mod_lens[0], "oc"))  { mode = IL_PIN_MODE_OUT; is_input = false; out_od = 1; }
         else if (ident_equals(mod_strs[0], mod_lens[0], "adc")) { mode = IL_PIN_MODE_ADC; is_input = true; is_adc = true; }
         else return IL_PARSE_UNKNOWN_MODE;
 
@@ -336,12 +338,13 @@ static il_parse_status_t parse_cfg(parser_t* p, il_inst_t* inst) {
                     return IL_PARSE_MODIFIER_ON_GPIO;
                 else return IL_PARSE_UNKNOWN_MODE;
             } else {
-                // out doesn't take any modifiers
-                if (is_param_mod(ms, ml, "hyst_"))     return IL_PARSE_HYST_NOT_ON_ADC;
-                if (is_param_mod(ms, ml, "debounce_")) return IL_PARSE_DEBOUNCE_NOT_ON_GPIO;
-                if (is_param_mod(ms, ml, "oversample_") || is_param_mod(ms, ml, "sh_"))
+                // output: `out` takes no modifiers; `oc` takes an optional `up`.
+                if (out_od && ident_equals(ms, ml, "up")) { out_od = 2u; }   // oc:up
+                else if (is_param_mod(ms, ml, "hyst_"))     return IL_PARSE_HYST_NOT_ON_ADC;
+                else if (is_param_mod(ms, ml, "debounce_")) return IL_PARSE_DEBOUNCE_NOT_ON_GPIO;
+                else if (is_param_mod(ms, ml, "oversample_") || is_param_mod(ms, ml, "sh_"))
                     return IL_PARSE_MODIFIER_ON_GPIO;
-                return IL_PARSE_UNKNOWN_MODE;
+                else return IL_PARSE_UNKNOWN_MODE;
             }
         }
 
@@ -367,9 +370,10 @@ static il_parse_status_t parse_cfg(parser_t* p, il_inst_t* inst) {
                 if (find_input_idx(inst, phys_id)  >= 0) return IL_PARSE_DUPLICATE_PIN;
                 if (find_output_idx(inst, phys_id) >= 0) return IL_PARSE_DUPLICATE_PIN;
                 if (inst->output_count >= IL_MAX_OUTPUTS) return IL_PARSE_TOO_MANY_OUTPUTS;
-                inst->outputs[inst->output_count].phys_id   = phys_id;
-                inst->outputs[inst->output_count].ok_value  = 0;   // populated by out_ok
-                inst->outputs[inst->output_count].err_value = 0;
+                inst->outputs[inst->output_count].phys_id    = phys_id;
+                inst->outputs[inst->output_count].ok_value   = 0;   // populated by out_ok
+                inst->outputs[inst->output_count].err_value  = 0;
+                inst->outputs[inst->output_count].open_drain = out_od;
                 inst->output_count++;
             }
         }
