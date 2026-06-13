@@ -20,7 +20,8 @@ WIN = 1.0   # accumulate window
 def run():
     c = Checker()
     u = slave_dsl.Unit(0x55, "COUNTER").counter(rate=1000)
-    u.pins(D1="count:none:both")            # D1 counts both edges; D0 free for the DAC
+    u.pins(D1="count:none:both",            # D1 counts both edges
+           A0="dac")                        # D0/A0 = DAC square-wave stimulus (jumper A0->A1=D1)
     dg, _ = commission(u)
     c.eq("MODE (5=COUNTER)", dg.reg_read(R["MODE"]), 5)
     c.eq("ENABLE bitmap (D1=bit1)", enable_bitmap(dg), 0b10)

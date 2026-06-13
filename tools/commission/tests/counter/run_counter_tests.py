@@ -10,7 +10,7 @@ REQUIRES the A0->A1 jumper (A1 = AIN4 = D1, so it's the DAC -> D1 stimulus path)
 import importlib
 import sys
 
-TESTS = ["test_counter"]
+TESTS = ["test_counter", "test_counter_bench"]
 
 
 def main():
