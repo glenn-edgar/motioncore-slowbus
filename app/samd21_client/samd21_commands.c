@@ -189,8 +189,10 @@ static void dac_init(void) {
 #define DAC_WF_PHASE_STEPS  64u                       // sine LUT length (top-6-bit index)
 #define DAC_WF_FREQ_MIN     50u
 #define DAC_WF_FREQ_MAX     2000u
-#define DAC_FS_HZ           32000u                    // fixed DDS sample rate / ADC master clock
-#define DAC_TC3_PERIOD      (48000000u / DAC_FS_HZ)   // = 1500
+#define DAC_FS_HZ           48000u                    // DDS tone sample rate (48 kHz ISR)
+#define DAC_TC3_PERIOD      (48000000u / DAC_FS_HZ)   // = 1000
+#define ADC_DECIMATE        3u                        // 48 kHz tone / 3 = 16 kHz ADC launch
+#define ADC_SAMPLE_HZ       (DAC_FS_HZ / ADC_DECIMATE)  // = 16 kHz signal-channel sample rate
 
 #define DAC_NTONES          2u
 #define DAC_TONE_OFF        0u
@@ -1534,15 +1536,16 @@ static void pio_reg_write(uint8_t reg, uint8_t val) {
 // labels, which assumed an unachieved 1 kHz.) On window-fill they snapshot
 // min/max/avg/AC-rms into a readable block and bump a per-window seq id (freshness
 // + seqlock). DAC sub-state is constant-only here; ADC-b adds waves.
-#define ADC_NCH   8u
+#define ADC_NCH   1u                     // signal-processing mode: ONE channel (A1) at 16 kHz
 #define ADC_NWIN  3u
-#define REG_ADC_CH_SEL  0x10u            // w: channel 0..7
-#define REG_ADC_WIN_SEL 0x11u            // w: window 0=fast(~0.8s) 1=mid(~8s) 2=slow(~80s)
+#define REG_ADC_OVERRUN 0x10u            // r: u8 saturating count of 16 kHz slots a conversion overran (~0)
+#define REG_ADC_WIN_SEL 0x11u            // w: downsample window 0=1kHz 1=100Hz 2=10Hz
 #define REG_ADC_SEQ     0x12u            // r: u16 window snapshot counter
 #define REG_ADC_MIN     0x14u            // r: u16  (block 0x12..0x1B = seq,min,max,avg,rms)
 #define REG_ADC_MAX     0x16u
 #define REG_ADC_AVG     0x18u
 #define REG_ADC_RMS     0x1Au
+#define REG_ADC_LATEST  0x1Eu            // r: u16 most recent raw 16 kHz sample (instantaneous)
 // Two-tone DDS bench generator. Tone 0 keeps the legacy 0x20/0x21/0x23 slots;
 // tone 1 + global offset follow APPLY at 0x26+. type 0=off 1=const 2=sine 3=square.
 #define REG_DAC_T1_TYPE 0x20u            // w: tone0 type
@@ -1554,8 +1557,9 @@ static void pio_reg_write(uint8_t reg, uint8_t val) {
 #define REG_DAC_T2_FREQ 0x29u            // w: u16 tone1 Hz (50..2000)
 #define REG_DAC_OFFSET  0x2Bu            // w: u16 DC center 0..1023 (default 512)
 
-static const uint8_t  g_adc_ain[ADC_NCH]     = { 4u, 18u, 19u, 2u, 3u, 7u, 5u, 6u }; // D1,D2,D3,D6,D7,D8,D9,D10
-static const uint16_t g_adc_win_len[ADC_NWIN] = { 100u, 1000u, 10000u };             // ~0.8/8/80 s @ ~125 Hz/ch
+static const uint8_t  g_adc_ain[ADC_NCH]     = { 4u };                  // A1 = AIN4 (the signal input)
+// Downsample windows: 16 kHz / N samples -> 1 kHz, 100 Hz, 10 Hz output rates.
+static const uint16_t g_adc_win_len[ADC_NWIN] = { 16u, 160u, 1600u };
 
 typedef struct { uint16_t min, max; uint32_t sum; uint64_t sumsq; uint16_t count; } adc_accum_t;
 typedef struct { uint16_t min, max, avg, rms; } adc_stat_t;
@@ -1563,7 +1567,7 @@ static adc_accum_t g_adc_acc[ADC_NCH][ADC_NWIN];
 static adc_stat_t  g_adc_stat[ADC_NCH][ADC_NWIN];
 static volatile uint16_t g_adc_latest[ADC_NCH];     // most recent raw sample (instantaneous)
 static volatile uint16_t g_adc_seq[ADC_NWIN];
-static uint8_t   g_adc_ch_sel, g_adc_win_sel;
+static uint8_t   g_adc_win_sel;          // single channel -> only the window is selectable
 static uint8_t   g_dac_type[DAC_NTONES]; // per-tone off/const/sine/square (host shadow)
 static uint16_t  g_dac_amp[DAC_NTONES];  // per-tone peak 0..1023
 static uint16_t  g_dac_freq[DAC_NTONES]; // per-tone Hz
@@ -1578,9 +1582,12 @@ static uint32_t isqrt32(uint32_t x) {    // integer sqrt for AC-rms
 
 static void adc_mode_setup(void) {
     adc_init();                                              // idempotent (leaves DIV256)
-    ADC->CTRLB.reg = ADC_CTRLB_PRESCALER_DIV16 | ADC_CTRLB_RESSEL_16BIT;   // 3 MHz + averaging mode
+    // Single 12-bit conversion at DIV16 (3 MHz) -> ~3-4 us << the 62.5 us 16 kHz
+    // budget. NO per-sample oversample: the downsample window average IS the noise
+    // reduction. AVGCTRL=1 keeps the result 12-bit (0..4095) directly.
+    ADC->CTRLB.reg = ADC_CTRLB_PRESCALER_DIV16 | ADC_CTRLB_RESSEL_12BIT;
     while (ADC->STATUS.bit.SYNCBUSY) { }
-    ADC->AVGCTRL.reg = ADC_AVGCTRL_SAMPLENUM_16 | ADC_AVGCTRL_ADJRES(4);   // 16x, ADJRES quirk
+    ADC->AVGCTRL.reg = ADC_AVGCTRL_SAMPLENUM_1 | ADC_AVGCTRL_ADJRES(0);
     ADC->SAMPCTRL.reg = 3u;                                 // short sample-hold (low-Z sources)
     while (ADC->STATUS.bit.SYNCBUSY) { }
     for (uint8_t ch = 0; ch < ADC_NCH; ch++) {
@@ -1608,9 +1615,9 @@ static void adc_mode_setup(void) {
 // That is only safe because the host command path is now fast (libcomm reads
 // what's available instead of a fixed 256 B, so a reply returns in ~ms not ~1 s);
 // a few hundred microseconds of snapshot work in the ISR no longer stalls CDC.
-static volatile uint8_t g_adc_cur_ch;       // channel currently converting
-static volatile bool    g_adc_throwaway;    // next RESRDY is the post-mux throwaway
-static volatile bool    g_adc_running;      // sampler active
+static volatile bool     g_adc_running;     // sampler active
+static volatile uint8_t  g_adc_div;         // 48 kHz -> 16 kHz decimation counter
+static volatile uint32_t g_adc_overrun;     // conversions not finished before their 16 kHz slot
 
 static void adc_accum(uint8_t ch, uint16_t v) {
     if (v > 4095u) v = 4095u;
@@ -1654,36 +1661,35 @@ static void adc_snapshot_full(void) {
 // One ADC step, called from TC3_Handler (the tone clock) every tick. Flag-guarded:
 // a new conversion is scheduled only after the current one's RESRDY is handled, so
 // the tone ISR and the ADC stay in lockstep without ever spinning.
+// Called every 48 kHz TC3 tick. Decimates to 16 kHz (every 3rd tick): read the
+// conversion launched on the previous slot, fold it into the three downsample
+// windows, and relaunch. The RESRDY check guarantees a conversion always finishes
+// before the next is scheduled (it can't, at ~3.7 us << 62.5 us); an overrun just
+// defers one sample and bumps a counter. Single channel -> no mux switch, no
+// throwaway. All result processing happens here, in the ISR.
 static void adc_isr_service(void) {
     if (!g_adc_running) return;
-    if (!ADC->INTFLAG.bit.RESRDY) return;       // still converting -> service on a later tick
+    if (++g_adc_div < ADC_DECIMATE) return;     // 48 kHz / 3 = 16 kHz
+    g_adc_div = 0u;
+    if (!ADC->INTFLAG.bit.RESRDY) { g_adc_overrun++; return; }   // not done -> retry next slot
     uint16_t v = (uint16_t)ADC->RESULT.reg;
     ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
-    if (g_adc_throwaway) {                       // discard the post-mux settle conversion
-        g_adc_throwaway = false;
-        ADC->SWTRIG.bit.START = 1;              // launch the real (settled) conversion
-        return;
-    }
-    uint8_t ch = g_adc_cur_ch;
-    adc_accum(ch, v);
-    if (ch == ADC_NCH - 1u) adc_snapshot_full();           // sweep complete -> close windows
-    ch = (uint8_t)((ch + 1u) % ADC_NCH);                   // advance + kick the next channel
-    g_adc_cur_ch    = ch;
-    g_adc_throwaway = true;
-    ADC->INPUTCTRL.bit.MUXPOS = g_adc_ain[ch];             // throwaway absorbs mux-settle (no spin)
-    ADC->SWTRIG.bit.START = 1;
+    adc_accum(0u, v);
+    adc_snapshot_full();                        // closes each window when it fills (1k/100/10 Hz)
+    ADC->SWTRIG.bit.START = 1;                  // launch the next 16 kHz conversion
 }
 
 // Start the tone-clocked ADC engine. TC3 runs continuously in ADC mode (it is the
 // master sample clock); the DAC DDS rides the same ISR — with no waveform the DDS
 // just holds g_dac_offset each tick.
 static void adc_sampler_start(void) {
-    g_adc_cur_ch    = 0u;
-    g_adc_throwaway = true;
+    g_adc_div     = 0u;
+    g_adc_overrun = 0u;
     ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;                 // clear stale (we POLL it, no ADC IRQ)
-    ADC->INPUTCTRL.bit.MUXPOS = g_adc_ain[0];
+    ADC->INPUTCTRL.bit.MUXPOS = g_adc_ain[0];              // fixed single channel (A1)
+    while (ADC->STATUS.bit.SYNCBUSY) { }
     g_adc_running = true;
-    ADC->SWTRIG.bit.START = 1;                             // first conversion (throwaway)
+    ADC->SWTRIG.bit.START = 1;                             // launch the first conversion
     // DDS engine: tones off (DC at offset) until a waveform is applied.
     for (uint8_t t = 0; t < DAC_NTONES; t++) { g_dds.type[t] = DAC_TONE_OFF; g_dds.inc[t] = 0u; g_dds.ph[t] = 0u; }
     g_dds.offset         = (int16_t)g_dac_offset;
@@ -1691,7 +1697,7 @@ static void adc_sampler_start(void) {
     g_dds.active         = true;
     dac_init();
     tc3_init_once();
-    tc3_start_at_period(DAC_TC3_PERIOD);                   // 32 kHz master clock for DAC + ADC
+    tc3_start_at_period(DAC_TC3_PERIOD);                   // 48 kHz tone clock (DAC + the 16 kHz ADC decimation)
 }
 
 static void adc_sampler_stop(void) {
@@ -1878,25 +1884,25 @@ static bool dac_reg_write(uint8_t reg, uint8_t val) {
 
 // ADC mode-bank register access (0x10-0x2C), dispatched only while MODE_ADC.
 static uint8_t adc_reg_read(uint8_t reg) {
-    if (reg >= REG_ADC_SEQ && reg <= REG_ADC_RMS + 1u
-        && g_adc_ch_sel < ADC_NCH && g_adc_win_sel < ADC_NWIN) {
+    if (reg >= REG_ADC_SEQ && reg <= REG_ADC_RMS + 1u && g_adc_win_sel < ADC_NWIN) {
         uint8_t off = (uint8_t)(reg - REG_ADC_SEQ);          // 0..9 -> seq,min,max,avg,rms (5x u16)
-        const adc_stat_t *st = &g_adc_stat[g_adc_ch_sel][g_adc_win_sel];
+        const adc_stat_t *st = &g_adc_stat[0][g_adc_win_sel];  // single channel
         uint16_t blk[5] = { g_adc_seq[g_adc_win_sel], st->min, st->max, st->avg, st->rms };
         uint16_t v = blk[off >> 1];
         return (off & 1u) ? (uint8_t)(v >> 8) : (uint8_t)v;
     }
     switch (reg) {
-    case REG_ADC_CH_SEL:  return g_adc_ch_sel;
-    case REG_ADC_WIN_SEL: return g_adc_win_sel;
-    case REG_ADC_ILSTAT:  return g_adc_il_pstat;
-    case REG_ADC_ILSTATE: return g_adc_il_state;
+    case REG_ADC_OVERRUN:    return (uint8_t)(g_adc_overrun > 0xFFu ? 0xFFu : g_adc_overrun);
+    case REG_ADC_WIN_SEL:    return g_adc_win_sel;
+    case REG_ADC_LATEST:     return (uint8_t)g_adc_latest[0];
+    case REG_ADC_LATEST+1u:  return (uint8_t)(g_adc_latest[0] >> 8);
+    case REG_ADC_ILSTAT:     return g_adc_il_pstat;
+    case REG_ADC_ILSTATE:    return g_adc_il_state;
     default: { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }   // DAC bench regs
     }
 }
 static void adc_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
-    case REG_ADC_CH_SEL:  if (val < ADC_NCH)  g_adc_ch_sel  = val; break;
     case REG_ADC_WIN_SEL: if (val < ADC_NWIN) g_adc_win_sel = val; break;
     default: dac_reg_write(reg, val); break;                 // DAC bench regs
     }

@@ -152,12 +152,13 @@ _TOKEN = re.compile(r'''
     )
 ''', re.VERBOSE)
 
-# ADC-mode interlock streams: a watch reads one of these per channel.
-ADC_STATS   = ('avg', 'min', 'max', 'rms')         # windowed stats
-ADC_WINDOWS = {'fast': 0, 'mid': 1, 'slow': 2}     # 100/1000/10000-sample windows (~0.8/8/80 s @ ~125 Hz/ch)
-# Channels the ADC sweep samples (D6/A6 = interlock output, A0 = DAC -> not watchable).
-ADC_WATCH_PINS = ('A1', 'A2', 'A3', 'A7', 'A8', 'A9', 'A10',
-                  'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
+# ADC-mode interlock streams. ADC mode is a single-channel (A1) signal-processing
+# mode sampled at 16 kHz; the three downsample windows produce min/max/avg/AC-rms at
+# 1 kHz / 100 Hz / 10 Hz output rates.
+ADC_STATS   = ('avg', 'min', 'max', 'rms')          # windowed stats (rms = AC-rms)
+ADC_WINDOWS = {'khz1': 0, 'hz100': 1, 'hz10': 2}    # downsample windows: 1 kHz / 100 Hz / 10 Hz
+# The single sampled channel is A1 (= AIN4 = D1). A0 = DAC, D6 = interrupt.
+ADC_WATCH_PINS = ('A1', 'D1')
 
 
 def _tokenize(text):
@@ -246,7 +247,7 @@ class _ExprParser:
         # ADC stream: <channel>[.<stat>.<window>] <op> <threshold>. Default stat =
         # instantaneous. Emits the ilcf operand <PIN> or <PIN>_<stat>_<win>.
         if chan not in ADC_WATCH_PINS:
-            raise DSLError("ADC channel %r not watchable (A1-A3,A7-A10; A0=DAC, A6/D6=output)" % chan)
+            raise DSLError("ADC channel %r not watchable (only A1/D1; A0=DAC, D6=interrupt)" % chan)
         operand = chan
         if self._peek()[0] == 'dot':
             self._next()
@@ -254,10 +255,10 @@ class _ExprParser:
             if k != 'ident' or stat.lower() not in ADC_STATS:
                 raise DSLError("expected stat avg/min/max/rms after '.', got %r" % (stat,))
             if self._next()[0] != 'dot':
-                raise DSLError("expected .window after .%s (fast/mid/slow)" % stat)
+                raise DSLError("expected .window after .%s (khz1/hz100/hz10)" % stat)
             k, win = self._next()
             if k != 'ident' or win.lower() not in ADC_WINDOWS:
-                raise DSLError("expected window fast/mid/slow, got %r" % (win,))
+                raise DSLError("expected window khz1/hz100/hz10, got %r" % (win,))
             operand = "%s_%s_%s" % (chan, stat.lower(), win.lower())
         k, sym = self._peek()
         if k != 'op':
@@ -908,18 +909,19 @@ def _selftest():
     #  OD   D8,D10 = bits 5,7 = 0xA0
     assert g == bytes([2, 0xF0, 0x81, 0xE1, 0xA0, 0x00]), list(g)
 
-    # 11. ADC mode interlock: stream selectors (.stat.window) + default instantaneous
+    # 11. ADC mode interlock: single-channel (A1) stream selectors (.stat.window)
+    #     with the khz1/hz100/hz10 downsample windows + default instantaneous.
     u = Unit(0x30, 'ADC')
-    u.interlock('ov', 'A1.avg.fast > 1.5V || A2.rms.mid > 0.5V', drive={'D6': 1})
+    u.interlock('ov', 'A1.avg.khz1 > 1.5V || A1.rms.hz100 > 0.5V', drive={'D6': 1})
     f = u.files()
     assert f['idnt'] == bytes([0x30, 2]), f['idnt']
     assert set(f) == {'idnt', 'ilcf'}, set(f)               # no gpmp in ADC mode
-    exp = ("ov;cfg[(D6):out];watch[A1_avg_fast:gt:1861|A2_rms_mid:gt:620];"
+    exp = ("ov;cfg[(D6):out];watch[A1_avg_khz1:gt:1861|A1_rms_hz100:gt:620];"
            "out_ok[D6:1];out_err[D6:0]")           # 1.5V->1861, 0.5V->620
     assert f['ilcf'].decode() == exp, f['ilcf'].decode()
     u2 = Unit(0x30, 'ADC'); u2.interlock('x', 'A1 > 2.0V', drive={'D6': 1})
     assert u2.ilcf().split(';')[2] == "watch[A1:gt:2482]", u2.ilcf()   # default instantaneous
-    for bad in ('A0 > 1V', 'A1.foo.fast > 1V', 'A1.avg.turbo > 1V', 'A1 > 1V'):
+    for bad in ('A0 > 1V', 'A1.foo.khz1 > 1V', 'A1.avg.turbo > 1V', 'A1 > 1V'):
         try:
             Unit(0x30, 'ADC').interlock('x', bad,
                                         drive=None if bad == 'A1 > 1V' else {'D6': 1}).ilcf()
