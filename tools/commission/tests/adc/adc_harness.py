@@ -59,10 +59,12 @@ def find_port():
     return ds[0]["port"]
 
 
-def commission(unit, settle=9.0):
+def commission(unit, settle=9.0, erase=True):
     files = unit.files()
     dg = Dongle(find_port())
     dg.offline()
+    if erase:
+        dg.file_format()          # discrete clean-slate: wipe the whole store first
     for name, blob in files.items():
         dg.file_put(name, blob)
     dg.close()
