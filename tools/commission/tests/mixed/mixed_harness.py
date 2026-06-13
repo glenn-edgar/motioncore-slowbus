@@ -40,6 +40,10 @@ R = {
     # DAC bench tool (same regs as ADC mode; available in MIXED as the A1 source)
     "DAC_T1_TYPE": 0x20, "DAC_T2_TYPE": 0x26,
     "DAC_OFF_LO":  0x2B, "DAC_OFF_HI": 0x2C, "DAC_APPLY": 0x25,
+    # shared interlock trip freeze-frame (latched at trip, cleared on reset)
+    "SNAP_VALID": 0x30, "SNAP_NIN": 0x31, "SNAP_NOUT": 0x32, "SNAP_SEL": 0x33,
+    "SNAP_IN_ROLE": 0x34, "SNAP_IN_VAL": 0x35,  # 0x35 lo, 0x36 hi
+    "SNAP_OUT_PHYS": 0x37, "SNAP_OUT_VAL": 0x38,
 }
 MIXED_INT_BIT = 0x02
 T_OFF = 0
@@ -89,6 +93,26 @@ def adc_val(dg, idx):
 
 def gpio_deb(dg):
     return dg.reg_read(R["GPIO_DEB"])
+
+
+def int_flags(dg):
+    return dg.reg_read(R["INT_FLAGS"])
+
+
+def snapshot(dg):
+    """Read the interlock trip freeze-frame -> {valid, inputs:[{role,val}], outputs:[{phys,val}]}."""
+    if not dg.reg_read(R["SNAP_VALID"]):
+        return {"valid": 0, "inputs": [], "outputs": []}
+    nin, nout = dg.reg_read(R["SNAP_NIN"]), dg.reg_read(R["SNAP_NOUT"])
+    ins, outs = [], []
+    for i in range(nin):
+        dg.reg_write(R["SNAP_SEL"], i)
+        val = dg.reg_read(R["SNAP_IN_VAL"]) | (dg.reg_read(R["SNAP_IN_VAL"] + 1) << 8)
+        ins.append({"role": dg.reg_read(R["SNAP_IN_ROLE"]), "val": val})
+    for i in range(nout):
+        dg.reg_write(R["SNAP_SEL"], i)
+        outs.append({"phys": dg.reg_read(R["SNAP_OUT_PHYS"]), "val": dg.reg_read(R["SNAP_OUT_VAL"])})
+    return {"valid": 1, "inputs": ins, "outputs": outs}
 
 
 def volts_to_count(v):
