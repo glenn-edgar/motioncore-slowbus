@@ -30,7 +30,7 @@ robot:/tmp/commission/tests/gpio/`.
 | `test_gpio_pinmap.py` | `gpmp` applied at boot: direction, pull up/down/none, output-init, open-drain mask; **config registers read-only** at runtime |
 | `test_gpio_outputs.py` | output **values** (the only runtime-writable thing): push-pull drive + open-drain drive-low |
 | `test_gpio_interlock.py` | interlock arm / cond-ok / **trip** / `INT_FLAGS` |
-| `test_gpio_wired_or.py` | open-drain **wired-OR** with a manual jumper (D8 `out:od` pulls a line read by D0 `in:up`) |
+| `test_gpio_wired_or.py` | open-drain **wired-OR** with a manual jumper (D8 `oc` pulls a line read by D0 `in:up`) |
 
 ## Notes that bit us (so they don't bite you)
 
