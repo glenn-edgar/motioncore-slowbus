@@ -87,6 +87,17 @@ COUNTER_EDGES = {'rising': 0, 'falling': 1, 'both': 2}
 COUNTER_BENCH_ROLES = {'in': 1, 'out': 2, 'adc': 3, 'dac': 4}
 COUNTER_RATE_MIN, COUNTER_RATE_MAX = 50, 10000   # Hz; max countable ~ rate/2
 
+# SERVO mode: a `srvo` config file [VER=1, role(CH0)..role(CH7)]; one role byte per
+# non-D6 bank pad. D6 is ALWAYS the e-stop interlock (input, pull-up, active-low) and
+# is not declarable. Role byte = firmware BENCH_ROLE_* (1 gpio-in, 2 gpio-out, 3 adc,
+# 4 dac) or SERVO=5 for a servo channel; 0 = none. Pad order: D0,D1,D2,D3,D7,D8,D9,D10.
+SRVO_VERSION = 1
+SERVO_PINS = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
+SERVO_PIN_IDX = {p: i for i, p in enumerate(SERVO_PINS)}
+SERVO_PIN_ALIAS = {'A0': 'D0', 'A1': 'D1', 'A2': 'D2', 'A3': 'D3',
+                   'A7': 'D7', 'A8': 'D8', 'A9': 'D9', 'A10': 'D10'}
+SERVO_ROLES = {'in': 1, 'out': 2, 'adc': 3, 'dac': 4, 'servo': 5}
+
 ADC_FULLSCALE = 4095
 VREF_DEFAULT = 3.3                    # full-scale volts (INTVCC1 ref + GAIN=DIV2)
 
@@ -99,7 +110,7 @@ _OP_FROM_SYM = {'>': 'gt', '<': 'lt', '>=': 'ge', '<=': 'le', '==': 'eq', '!=': 
 _OP_INVERT = {'gt': 'le', 'le': 'gt', 'lt': 'ge', 'ge': 'lt', 'eq': 'ne', 'ne': 'eq'}
 
 _PULL_MODS = {'up', 'down'}
-_ROLE_BASES = {'in', 'out', 'adc', 'dac', 'count'}
+_ROLE_BASES = {'in', 'out', 'adc', 'dac', 'count', 'servo'}
 
 
 class DSLError(Exception):
@@ -359,6 +370,13 @@ class Unit:
         self.cntr_rate = rate
         return self
 
+    def servo(self):
+        """SERVO mode marker; pads are declared via pins(D0='servo', D8='adc', ...).
+        D6 is always the e-stop interlock and cannot be declared. See srvo()."""
+        if self.mode != MODES['SERVO']:
+            raise DSLError("servo() is SERVO-mode only")
+        return self
+
     def pins(self, **roles):
         for label, spec in roles.items():
             parts = str(spec).split(':')
@@ -609,6 +627,29 @@ class Unit:
         r = self.cntr_rate
         return bytes([CNTR_VERSION, r & 0xFF, (r >> 8) & 0xFF] + chbytes)
 
+    def srvo(self):
+        """SERVO config file: [VER, role(CH0)..role(CH7)]. Each declared pad is a
+        `servo` channel or a bench role (in/out/adc/dac; dac on D0/A0 only). D6 is
+        always the e-stop interlock and may not be declared. Undeclared pads = none."""
+        if self.mode != MODES['SERVO']:
+            return None
+        rolebytes = [0] * len(SERVO_PINS)
+        for label, (base, mods) in self.roles.items():
+            pin = SERVO_PIN_ALIAS.get(label, label)          # A0->D0, ...
+            if pin in ('D6', 'A6'):
+                raise DSLError("SERVO pin %s is the e-stop interlock; it can't be declared" % label)
+            if pin not in SERVO_PIN_IDX:
+                raise DSLError("SERVO pin %s is not a usable pad %s" % (label, SERVO_PINS))
+            if base not in SERVO_ROLES:
+                raise DSLError("SERVO pin %s: role %r must be one of %s"
+                               % (label, base, sorted(SERVO_ROLES)))
+            if mods:
+                raise DSLError("SERVO pin %s: role %r takes no modifiers, got %r" % (label, base, mods))
+            if base == 'dac' and pin != 'D0':
+                raise DSLError("SERVO pin %s: dac role is only on D0/A0 (the DAC pad)" % label)
+            rolebytes[SERVO_PIN_IDX[pin]] = SERVO_ROLES[base]
+        return bytes([SRVO_VERSION] + rolebytes)
+
     def files(self):
         """Return {name: bytes} ready for the commission tool to write."""
         out = {'idnt': self.idnt()}
@@ -618,6 +659,9 @@ class Unit:
         cntr = self.cntr()
         if cntr is not None:
             out['cntr'] = cntr
+        srvo = self.srvo()
+        if srvo is not None:
+            out['srvo'] = srvo
         ilcf = self.ilcf()
         if ilcf is not None:
             out['ilcf'] = ilcf.encode('ascii')
@@ -703,12 +747,18 @@ def _selftest():
     u.interlock('s', when='D8', drive={'D6': 1})
     assert u.ilcf().split(';')[1] == "cfg[(D8):in,debounce_2,(D6):out]", u.ilcf()
 
-    # 4. SERVO/IDLE: idnt only. ADC (interlock-capable) with no interlock emits the
-    #    null ilcf, like GPIO/MIXED. COUNTER carries a `cntr` config file.
-    for ty, m in (('SERVO', 4), ('IDLE', 0)):
-        u = Unit(0x60, ty)
-        assert u.files() == {'idnt': bytes([0x60, m])}, (ty, u.files())
+    # 4. IDLE: idnt only. ADC (interlock-capable) with no interlock emits the null
+    #    ilcf, like GPIO/MIXED. COUNTER/SERVO carry a config file (`cntr`/`srvo`).
+    assert Unit(0x60, 'IDLE').files() == {'idnt': bytes([0x60, 0])}, Unit(0x60, 'IDLE').files()
     assert Unit(0x60, 'ADC').files() == {'idnt': bytes([0x60, 2]), 'ilcf': b'off'}
+    # bare SERVO -> srvo with all 8 pads role 0 (D6 = e-stop, implicit)
+    assert Unit(0x60, 'SERVO').files() == {'idnt': bytes([0x60, 4]),
+                                           'srvo': bytes([1] + [0] * 8)}, Unit(0x60, 'SERVO').files()
+    # SERVO with declared pads: D0/D1 servo, D8 adc, D9 out; role byte per pad.
+    #   order D0,D1,D2,D3,D7,D8,D9,D10 -> [5,5,0,0,0,3,2,0]
+    u = Unit(0x55, 'SERVO').servo()
+    u.pins(D0='servo', D1='servo', D8='adc', D9='out')
+    assert u.srvo() == bytes([1, 5, 5, 0, 0, 0, 3, 2, 0]), list(u.srvo())
 
     # 4b. COUNTER cntr: D1 up/rising + D2 down/both at 2 kHz; D0 free (DAC pad).
     #     ch byte = bit0 enable | pull<<1 | edge<<3. D1=idx1: 1|1<<1=0x03;
