@@ -56,7 +56,7 @@ def find_port():
     return ds[0]["port"]
 
 
-def commission(unit, settle=9.0):
+def commission(unit, settle=9.0, erase=True):
     """Write a slave_dsl.Unit's files and reboot into the new config.
 
     Returns (Dongle, files). The Dongle is freshly opened after the reboot
@@ -65,6 +65,8 @@ def commission(unit, settle=9.0):
     files = unit.files()
     dg = Dongle(find_port())
     dg.offline()                              # commissioning gate: writes need offline
+    if erase:
+        dg.file_format()                      # discrete clean-slate: wipe the whole store first
     for name, blob in files.items():
         dg.file_put(name, blob)
     dg.close()                                # disconnect -> reboot -> apply config
