@@ -16,7 +16,7 @@ import slave_dsl
 def build():
     u = slave_dsl.Unit(0x20, "GPIO")
     u.pins(D0="in:none", D1="in:none", D2="in:none", D3="in:none",
-           D7="out:0", D8="out:1", D9="out:od", D10="out:0")
+           D7="out:0", D8="out:1", D9="oc", D10="out:0")
     return u
 
 
