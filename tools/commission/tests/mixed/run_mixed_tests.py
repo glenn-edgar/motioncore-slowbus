@@ -1,16 +1,16 @@
-"""run_adc_tests.py -- run the ADC-mode serial tests, summarize.
+"""run_mixed_tests.py -- run the MIXED-mode serial tests, summarize.
 
-REQUIRES the A0->A1 DAC self-test jumper.
+REQUIRES the A0->A1 DAC jumper (the DAC is the controllable ADC source).
 
     ssh robot
-    cd /tmp/commission/tests/adc
-    python3 run_adc_tests.py
+    cd /tmp/commission/tests/mixed   # (staged: harness + tests + ../../{libcomm,slave_dsl}.py)
+    python3 run_mixed_tests.py
 """
 
 import importlib
 import sys
 
-TESTS = ["test_adc_selftest", "test_adc_interlock", "test_adc_twotone"]
+TESTS = ["test_mixed_interlock"]
 
 
 def main():

@@ -1,16 +1,16 @@
-"""run_adc_tests.py -- run the ADC-mode serial tests, summarize.
+"""run_counter_tests.py -- run the COUNTER-mode serial tests, summarize.
 
-REQUIRES the A0->A1 DAC self-test jumper.
+REQUIRES the A0->A1 jumper (A1 = AIN4 = D1, so it's the DAC -> D1 stimulus path).
 
     ssh robot
-    cd /tmp/commission/tests/adc
-    python3 run_adc_tests.py
+    cd /tmp/commission/tests/counter
+    python3 run_counter_tests.py
 """
 
 import importlib
 import sys
 
-TESTS = ["test_adc_selftest", "test_adc_interlock", "test_adc_twotone"]
+TESTS = ["test_counter"]
 
 
 def main():
