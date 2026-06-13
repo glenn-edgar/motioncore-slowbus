@@ -127,6 +127,15 @@ typedef struct {
     il_output_t outputs[IL_MAX_OUTPUTS];
 } il_inst_t;
 
+// Compile-time invariants (defensive technique #10: prefer a build error over a
+// runtime surprise). These structs are stamped into the .noinit persist record
+// and INTERLOCK_MAX_SLOTS-wide bitmasks; a field added without a deliberate
+// version bump, or one slot too many, would otherwise corrupt silently.
+_Static_assert(sizeof(il_input_t)  == 8,  "il_input_t layout changed -- bump persist version");
+_Static_assert(sizeof(il_watch_t)  == 8,  "il_watch_t layout changed -- bump persist version");
+_Static_assert(sizeof(il_output_t) == 4,  "il_output_t layout changed -- bump persist version");
+_Static_assert(INTERLOCK_MAX_SLOTS <= 8,  "slot bitmasks (hal_pin slot_mask, veto/managed) are uint8_t");
+
 // ---- Parser status codes -------------------------------------------------
 
 typedef enum {
@@ -236,6 +245,8 @@ typedef enum {
     PANIC_HAL_PIN_DUPLICATE     = 5,  // pin-claim table has duplicate non-shared entry
     PANIC_INIT_CANARY_BAD       = 6,  // stack canary failed at end of init
     PANIC_CRASH_RECORD_BAD      = 7,  // crash record self-inconsistent at boot
+    PANIC_PERIPHERAL_TIMEOUT    = 8,  // bounded peripheral wait expired (arg = __LINE__)
+    PANIC_LAYOUT_BAD            = 9,  // linker section order violates bss<stack<noinit
     /* extend per slice */
 } panic_code_t;
 
