@@ -3453,6 +3453,30 @@ static uint8_t cmd_file_list(shell_reader_t* args, shell_writer_t* result) {
     return result->overflow ? SHELL_STATUS_RESULT_TOO_BIG : SHELL_STATUS_OK;
 }
 
+// ---------- CMD_FILE_FORMAT ----------------------------------------------
+// args: (none)  result: empty  status: OK / BUSY(online) / BAD_ARGS
+// Factory-wipe of the named-file store: erase every non-blank row in the store
+// region and reset the RAM shadow to empty. OFFLINE-gated (a commissioning op).
+// Use at the start of a re-commission to drop ALL stale/leftover files at once
+// (there is no per-file delete). Whole-block erase is slow (~ms/row); skipping
+// already-blank rows keeps it well under the watchdog window and avoids needless
+// erase-wear on blank rows. The host should allow a few seconds for the reply.
+static uint8_t cmd_file_format(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    if (!g_offline) return SHELL_STATUS_BUSY;            // online: refuse the wipe
+    if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
+    g_status |= 0x01u;                                   // flash-busy
+    for (uint16_t r = 0; r < STORE_ROWS; r++) {
+        uint32_t addr = STORE_BASE + (uint32_t)r * STORE_ROW_SIZE;
+        if (*(const volatile uint32_t*)(uintptr_t)addr != 0xFFFFFFFFu)
+            cs_nvm_erase_row(addr);                      // skip already-blank rows
+    }
+    g_status &= (uint8_t)~0x01u;
+    store_load();                                        // RAM shadow -> empty
+    g_file_wr_slot = -1;                                 // drop any open BEGIN
+    return SHELL_STATUS_OK;
+}
+
 // ---------- CMD_REG_READ / CMD_REG_WRITE / CMD_REG_READN -----------------
 // USB->I2C-register bridge: proxy the SAME i2c_reg_read/i2c_reg_write the I2C
 // slave ISR uses, so a Python host on ttyACM can drive every mode bank + the
@@ -3760,6 +3784,7 @@ static const shell_cmd_entry_t g_chip_commands[] = {
     { CMD_FILE_DATA,           "file_data",          cmd_file_data          },
     { CMD_FILE_COMMIT,         "file_commit",        cmd_file_commit        },
     { CMD_FILE_LIST,           "file_list",          cmd_file_list          },
+    { CMD_FILE_FORMAT,         "file_format",        cmd_file_format        },
     { CMD_REG_READ,            "reg_read",           cmd_reg_read           },
     { CMD_REG_WRITE,           "reg_write",          cmd_reg_write          },
     { CMD_REG_READN,           "reg_readn",          cmd_reg_readn          },

@@ -44,6 +44,7 @@ CMD_REG_READ = 0x0127
 CMD_REG_WRITE = 0x0128
 CMD_REG_READN = 0x0129
 CMD_OFFLINE = 0x012A   # enter commissioning offline state (tri-state outputs, allow writes)
+CMD_FILE_FORMAT = 0x012B   # OFFLINE-gated: erase the whole named-file store
 
 # Sizing
 COMM_PAYLOAD_MAX = 128
@@ -369,6 +370,20 @@ class Dongle:
             raw = bytes(name)
         raw = raw[:4]
         return raw + b" " * (4 - len(raw))
+
+    def file_format(self) -> None:
+        """Erase the ENTIRE named-file store (all files) and reset the shadow.
+        OFFLINE-gated -- call after offline(), before writing the new files, to
+        drop all stale/leftover files at once. The whole-block erase is slow, so
+        this uses an extended reply timeout."""
+        old = self.timeout
+        self.timeout = max(old, 5.0)
+        try:
+            status, _ = self.shell_exec(CMD_FILE_FORMAT, b"")
+        finally:
+            self.timeout = old
+        if status != SHELL_STATUS_OK:
+            raise IOError("FILE_FORMAT status %d" % status)
 
     def file_put(self, name, data: bytes) -> None:
         """Upload `data` under 4-char `name`: BEGIN -> DATA chunks -> COMMIT."""

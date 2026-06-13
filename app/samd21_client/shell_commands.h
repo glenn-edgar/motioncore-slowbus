@@ -125,11 +125,17 @@ const shell_cmd_entry_t* shell_find_cmd(uint16_t command_id);
 //   CMD_FILE_DATA   args: chunk bytes    -> append to the staged file
 //   CMD_FILE_COMMIT args: (none)         -> finalize + queue flash commit
 //   CMD_FILE_LIST   args: (none) -> result: count:u8 then per file {name[4], len:u8}
+//   CMD_FILE_FORMAT args: (none) -> erase the ENTIRE store (all files), reset shadow
 // Files >~120 B must be sent in multiple CMD_FILE_DATA chunks (COMM_PAYLOAD_MAX).
 #define CMD_FILE_BEGIN        ((uint16_t)0x0123)
 #define CMD_FILE_DATA         ((uint16_t)0x0124)
 #define CMD_FILE_COMMIT       ((uint16_t)0x0125)
 #define CMD_FILE_LIST         ((uint16_t)0x0126)
+// CMD_FILE_FORMAT: OFFLINE-gated factory-wipe of the named-file store -- erases
+// every non-blank row + empties the RAM shadow. Use at the start of a re-commission
+// to drop ALL stale/leftover files at once (there is no per-file delete). Slow
+// (whole-block erase); the host should allow a few seconds for the reply.
+#define CMD_FILE_FORMAT       ((uint16_t)0x012B)
 // USB->I2C-register bridge (test harness): proxy i2c_reg_read/write so a Python
 // host on ttyACM drives every mode bank + FILE/store windows over USB.
 //   CMD_REG_READ   [reg:u8]          -> [val:u8]
