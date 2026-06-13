@@ -1175,13 +1175,18 @@ static uint8_t g_pio_ipol;
 static uint8_t g_pio_olat;
 
 // Drive output channel ch to its g_pio_olat value, honoring open-drain (g_pio_od):
-// push-pull -> drive the level; open-drain -> value 0 = drive low, value 1 = Hi-Z
-// (released), so several chips can wire-OR a shared line.
+// push-pull -> drive the level; open-drain -> value 0 = drive low, value 1 = release
+// (Hi-Z, or input+internal pull-up when g_pio_gppu is set = `oc:up`), so several
+// chips can wire-OR a shared line.
 static void pio_drive_ch_out(uint8_t ch) {
     uint8_t g = g_pio_ch[ch].group, p = g_pio_ch[ch].pin, bit = (uint8_t)(1u << ch);
     uint32_t m = 1u << p;
     if ((g_pio_od & bit) && (g_pio_olat & bit)) {       // open-drain, value 1 -> release
         PORT->Group[g].DIRCLR.reg = m;                  // Hi-Z
+        if (g_pio_gppu & bit) {                         // oc:up -> input + internal pull-up
+            PORT->Group[g].OUTSET.reg = m;
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+        }
     } else {                                            // drive (push-pull, or od value 0 = low)
         if (g_pio_olat & bit) PORT->Group[g].OUTSET.reg = m;
         else                  PORT->Group[g].OUTCLR.reg = m;
@@ -1285,10 +1290,18 @@ static uint8_t pio_phys_read(uint8_t phys) {
 static void pio_phys_drive(uint8_t phys, uint8_t v) {
     uint8_t grp = phys >> 5, pin = phys & 0x1Fu;
     uint32_t m = 1u << pin;
-    // Open-drain if this phys is a channel flagged in g_pio_od: value 1 -> release.
+    // Open-drain if this phys is a channel flagged in g_pio_od: value 1 -> release
+    // (Hi-Z, or input + internal pull-up when g_pio_gppu is set = `oc:up`).
     for (uint8_t ch = 0; ch < 8; ch++) {
         if (g_pio_ch[ch].group == grp && g_pio_ch[ch].pin == pin) {
-            if ((g_pio_od & (1u << ch)) && v) { PORT->Group[grp].DIRCLR.reg = m; return; }
+            if ((g_pio_od & (1u << ch)) && v) {
+                PORT->Group[grp].DIRCLR.reg = m;
+                if (g_pio_gppu & (1u << ch)) {
+                    PORT->Group[grp].OUTSET.reg = m;
+                    PORT->Group[grp].PINCFG[pin].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+                }
+                return;
+            }
             break;
         }
     }
@@ -2146,7 +2159,12 @@ static void mixed_reg_write(uint8_t reg, uint8_t val) {
 #define BENCH_SH_CYC     5u      // sample-hold cycles (low-impedance default)
 #define BENCH_I2C_MASK   ((uint16_t)((1u << 4) | (1u << 5)))   // D4/D5 always reserved
 
-enum { BENCH_ROLE_NONE = 0u, BENCH_ROLE_GPI, BENCH_ROLE_GPO, BENCH_ROLE_ADC, BENCH_ROLE_DAC };
+// Roles 0..4 + open-collector 6/7 (5 is reserved as SERVO's servo-channel marker
+// in the srvo file). `oc` = bidirectional open-collector (read + drive-low/release);
+// `oc:up` adds the internal pull-up on release (else bare Hi-Z + external pull-up).
+enum { BENCH_ROLE_NONE = 0u, BENCH_ROLE_GPI, BENCH_ROLE_GPO, BENCH_ROLE_ADC,
+       BENCH_ROLE_DAC, BENCH_ROLE_OC = 6u, BENCH_ROLE_OC_PU = 7u };
+#define BENCH_IS_OC(r)  ((r) == BENCH_ROLE_OC || (r) == BENCH_ROLE_OC_PU)
 enum { BENCH_OK = 0u, BENCH_BAD_PIN, BENCH_WRONG_ROLE, BENCH_UNSUPPORTED };
 
 // Bench pad table: Seeed index 0..10 -> chip (group, pin, ADC AIN). A_n aliases D_n.
@@ -2195,6 +2213,17 @@ static void bench_apply_roles(void) {
             adc_init();
             adc_pin_config(g, p);                               // PMUX -> analog
             break;
+        case BENCH_ROLE_OC:
+        case BENCH_ROLE_OC_PU:                                  // start released (Hi-Z), readable
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            if (g_bench_role[idx] == BENCH_ROLE_OC_PU) {
+                PORT->Group[g].OUTSET.reg = (1u << p);          // OUT=1 -> pull-up direction
+                PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+            } else {
+                PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN; // bare Hi-Z (external pull-up)
+            }
+            break;
         default: break;                                         // NONE / DAC -> handled by the mode
         }
     }
@@ -2212,18 +2241,42 @@ static void bench_select(uint8_t idx) {
     if (!bench_sel_valid(idx)) { g_bench_sel = 0xFFu; g_bench_stat = BENCH_BAD_PIN; return; }
     g_bench_sel = idx; g_bench_stat = BENCH_OK;
 }
+// Drive an output. GPO = push-pull (level). OC/OC_PU = open-collector: level 0 pulls
+// low, level 1 releases (Hi-Z, or input+pull-up for OC_PU). Release goes Hi-Z FIRST
+// so there is never a momentary push-pull high on the shared line.
 static void bench_gpio_out(uint8_t level) {
-    if (bench_sel_role() != BENCH_ROLE_GPO) { g_bench_stat = BENCH_WRONG_ROLE; return; }
+    uint8_t role = bench_sel_role();
     uint8_t g = g_bench_pad[g_bench_sel].group, p = g_bench_pad[g_bench_sel].pin;
-    if (level & 1u) PORT->Group[g].OUTSET.reg = (1u << p);
-    else            PORT->Group[g].OUTCLR.reg = (1u << p);
-    g_bench_stat = BENCH_OK;
+    uint32_t m = (1u << p);
+    if (role == BENCH_ROLE_GPO) {
+        if (level & 1u) PORT->Group[g].OUTSET.reg = m;
+        else            PORT->Group[g].OUTCLR.reg = m;
+        g_bench_stat = BENCH_OK;
+    } else if (BENCH_IS_OC(role)) {
+        if (level & 1u) {                                       // release
+            PORT->Group[g].DIRCLR.reg = m;                     // Hi-Z first (no high glitch)
+            if (role == BENCH_ROLE_OC_PU) {
+                PORT->Group[g].OUTSET.reg = m;                 // OUT=1 -> pull-up direction
+                PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+            } else {
+                PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
+            }
+        } else {                                               // pull low
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;   // drop pull-up first
+            PORT->Group[g].OUTCLR.reg = m;
+            PORT->Group[g].DIRSET.reg = m;
+        }
+        g_bench_stat = BENCH_OK;
+    } else {
+        g_bench_stat = BENCH_WRONG_ROLE;
+    }
 }
 static uint8_t bench_gpio_in(void) {
-    if (bench_sel_role() != BENCH_ROLE_GPI) { g_bench_stat = BENCH_WRONG_ROLE; return 0xFFu; }
+    uint8_t role = bench_sel_role();
+    if (role != BENCH_ROLE_GPI && !BENCH_IS_OC(role)) { g_bench_stat = BENCH_WRONG_ROLE; return 0xFFu; }
     uint8_t g = g_bench_pad[g_bench_sel].group, p = g_bench_pad[g_bench_sel].pin;
     g_bench_stat = BENCH_OK;
-    return (PORT->Group[g].IN.reg & (1u << p)) ? 1u : 0u;
+    return (PORT->Group[g].IN.reg & (1u << p)) ? 1u : 0u;      // INEN always on -> reads the line
 }
 // Superloop: serve a pending ADC request (blocks ~1 ms at 16x; the pad is already
 // in analog mode from bench_apply_roles).

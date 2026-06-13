@@ -30,11 +30,11 @@ def panel_io(b):
     D7  run lamp       out:0   (push-pull)
     D8  enable relay   out:0   (push-pull; the interlock drops this)
     D9  aux output     out:1
-    D10 fault line     out:od  (open-drain, wire-OR'd across panels)
+    D10 fault line     oc  (open-drain, wire-OR'd across panels)
     """
     b.device("panel", i2c=0x20, cls="SAMD21", sub="GPIO",
              pins={"D0": "in:up",  "D1": "in:up",  "D2": "in:down", "D3": "in:none",
-                   "D7": "out:0",  "D8": "out:0",  "D9": "out:1",   "D10": "out:od"},
+                   "D7": "out:0",  "D8": "out:0",  "D9": "out:1",   "D10": "oc"},
              # enable D8 only while estop released AND guard closed (both read 1)
              interlock={"name": "guard", "expr": "D0 && D1", "drive": {"D8": 1}})
 

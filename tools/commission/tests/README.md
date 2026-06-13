@@ -44,7 +44,7 @@ external wiring:
 Only **physical pin-to-pin connectivity** — one pin's output actually reaching
 another pin:
 
-- **GPIO wired-OR** (`test_gpio_wired_or.py`): an `out:od` open-drain output
+- **GPIO wired-OR** (`test_gpio_wired_or.py`): an `oc` open-drain output
   pulling a line read by an `in:up` input. Jumper `D8↔D0`.
 - **ADC self-test** (`adc/`): the `A0→A1` DAC→ADC jumper (one jumper, used by the
   whole ADC suite).
