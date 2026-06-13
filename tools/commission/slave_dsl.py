@@ -5,7 +5,13 @@ definition into the raw on-chip files (`idnt`, `ilcf`).
 Three layers, matching the firmware:
 
   * unit(addr, type)            -> emits `idnt` = raw [addr, mode] (ALL modes)
-  * pins(D0='adc', D8='in:up')  -> the `cfg[...]` pin-role section (GPIO/MIXED)
+  * pins(D0='adc', D8='in:up')  -> the `cfg[...]` pin-role section (GPIO/MIXED).
+                                   Input pins take a pull (up/down/none) and, in
+                                   MIXED only, a debounce interval `debounce_<N>ms`
+                                   (e.g. D8='in:up:debounce_50ms'); the firmware
+                                   shift register runs at the ~100 Hz MIXED tick so
+                                   the interval rounds to ~20-150 ms. GPIO mode has
+                                   no debounce (reads the raw pin) -> rejected there.
   * interlock(name, when, drive)-> the `watch[...]`/`out_ok`/`out_err` sections,
                                    compiled from a boolean expression to the
                                    firmware's disjunctive-normal-form grammar
@@ -56,6 +62,23 @@ IL_MAX_OUTPUTS = 2
 IL_DSL_MAX = 128
 IL_NAME_MAX = 16
 
+# MIXED-mode GPIO debounce: authored in the DSL as a time (ms). The firmware shift
+# register samples at the ~100 Hz MIXED tick, so depth = round(ms / tick); the
+# firmware caps depth at [2,15] -> ~20-150 ms. GPIO mode has no debounce (its
+# evaluator reads the raw pin), so debounce is rejected outside MIXED.
+MIXED_TICK_MS = 10
+DEBOUNCE_DEPTH_MIN, DEBOUNCE_DEPTH_MAX = 2, 15
+
+# COUNTER mode: a `cntr` config file [VER=1, rate_lo, rate_hi, ch0..ch8]; each ch
+# byte = bit0 enable, bits1-2 pull (0 none/1 up/2 down), bits3-4 edge (0 rise/
+# 1 fall/2 both). Pad order (bit 0..8): D0,D1,D2,D3,D7,D8,D9,D10,D6 (= servo bank).
+CNTR_VERSION = 1
+COUNTER_PINS = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10', 'D6')
+COUNTER_PIN_IDX = {p: i for i, p in enumerate(COUNTER_PINS)}
+COUNTER_PULLS = {'none': 0, 'up': 1, 'down': 2}
+COUNTER_EDGES = {'rising': 0, 'falling': 1, 'both': 2}
+COUNTER_RATE_MIN, COUNTER_RATE_MAX = 50, 10000   # Hz; max countable ~ rate/2
+
 ADC_FULLSCALE = 4095
 VREF_DEFAULT = 3.3                    # full-scale volts (INTVCC1 ref + GAIN=DIV2)
 
@@ -68,7 +91,7 @@ _OP_FROM_SYM = {'>': 'gt', '<': 'lt', '>=': 'ge', '<=': 'le', '==': 'eq', '!=': 
 _OP_INVERT = {'gt': 'le', 'le': 'gt', 'lt': 'ge', 'ge': 'lt', 'eq': 'ne', 'ne': 'eq'}
 
 _PULL_MODS = {'up', 'down'}
-_ROLE_BASES = {'in', 'out', 'adc'}
+_ROLE_BASES = {'in', 'out', 'adc', 'count'}
 
 
 class DSLError(Exception):
@@ -95,7 +118,7 @@ _TOKEN = re.compile(r'''
 
 # ADC-mode interlock streams: a watch reads one of these per channel.
 ADC_STATS   = ('avg', 'min', 'max', 'rms')         # windowed stats
-ADC_WINDOWS = {'fast': 0, 'mid': 1, 'slow': 2}     # 10 Hz / 1 Hz / 0.1 Hz tumbling windows
+ADC_WINDOWS = {'fast': 0, 'mid': 1, 'slow': 2}     # 100/1000/10000-sample windows (~0.8/8/80 s @ ~125 Hz/ch)
 # Channels the ADC sweep samples (D6/A6 = interlock output, A0 = DAC -> not watchable).
 ADC_WATCH_PINS = ('A1', 'A2', 'A3', 'A7', 'A8', 'A9', 'A10',
                   'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
@@ -314,8 +337,20 @@ class Unit:
         self.vref = vref
         self.roles = {}               # label -> (base, [mods]) in declaration order
         self.il = None                # (name, when, drive)
+        self.cntr_rate = 1000         # COUNTER bank-global update rate (Hz)
 
     # -- authoring -------------------------------------------------------
+    def counter(self, rate=1000):
+        """Set the COUNTER bank-global update rate (Hz). Pins are declared via
+        pins(D1='count:up:rising'); see cntr()."""
+        if self.mode != MODES['COUNTER']:
+            raise DSLError("counter() is COUNTER-mode only")
+        if not (COUNTER_RATE_MIN <= rate <= COUNTER_RATE_MAX):
+            raise DSLError("counter rate %d out of [%d,%d] Hz"
+                           % (rate, COUNTER_RATE_MIN, COUNTER_RATE_MAX))
+        self.cntr_rate = rate
+        return self
+
     def pins(self, **roles):
         for label, spec in roles.items():
             parts = str(spec).split(':')
@@ -336,16 +371,43 @@ class Unit:
     def idnt(self):
         return bytes([self.addr, self.mode])
 
+    def _debounce_depth(self, pin, mod):
+        """Parse a `debounce_<N>ms` input modifier -> firmware shift depth.
+        MIXED-only (GPIO mode reads the raw pin); ms rounds to the ~100 Hz tick."""
+        if self.mode != MODES['MIXED']:
+            raise DSLError("debounce on %s is MIXED-only (GPIO mode has no debounce)" % pin)
+        body = mod[len('debounce_'):]
+        if not body.endswith('ms'):
+            raise DSLError("debounce on %s must be in ms, e.g. debounce_50ms (got %r)" % (pin, mod))
+        try:
+            ms = int(body[:-2])
+        except ValueError:
+            raise DSLError("debounce on %s: bad ms value in %r" % (pin, mod))
+        depth = (ms + MIXED_TICK_MS // 2) // MIXED_TICK_MS         # round to nearest tick
+        if not (DEBOUNCE_DEPTH_MIN <= depth <= DEBOUNCE_DEPTH_MAX):
+            raise DSLError("debounce %dms on %s -> depth %d out of range "
+                           "(allowed ~%d-%d ms)" % (ms, pin, depth,
+                           DEBOUNCE_DEPTH_MIN * MIXED_TICK_MS, DEBOUNCE_DEPTH_MAX * MIXED_TICK_MS))
+        return depth
+
     def _cfg_token(self, pin):
         """il_parse cfg token for one pin, derived from its declared role."""
         base, mods = self.roles[pin]
         if base == 'adc':
             return "(%s):adc%s" % (pin, "".join("," + m for m in mods))
         if base == 'in':
-            pull = mods[0] if mods else 'none'
-            sfx = {'up': ',up', 'down': ',down', 'none': ''}.get(pull)
-            if sfx is None:
-                raise DSLError("input %s pull must be up/down/none, got %r" % (pin, pull))
+            pull, deb = 'none', None
+            for m in mods:
+                if m in ('up', 'down', 'none'):
+                    pull = m
+                elif m.startswith('debounce_'):
+                    deb = self._debounce_depth(pin, m)
+                else:
+                    raise DSLError("input %s: bad modifier %r "
+                                   "(pull up/down/none or debounce_<N>ms)" % (pin, m))
+            sfx = {'up': ',up', 'down': ',down', 'none': ''}[pull]
+            if deb is not None:
+                sfx += ",debounce_%d" % deb
             return "(%s):in%s" % (pin, sfx)
         if base == 'out':
             return "(%s):out" % pin          # interlock drives it; init lives in gpmp
@@ -501,12 +563,41 @@ class Unit:
         intcfg = 0x01 if self.il else 0x00   # bit0: open-drain active-low INT enabled
         return bytes([GPMP_VERSION, dir_bm, pullen_bm, out_bm, od_bm, intcfg])
 
+    def cntr(self):
+        """COUNTER config file: [VER, rate_lo, rate_hi, ch0..ch8]. Each declared
+        `count` pad becomes a counter (pull up/down/none, edge rising/falling/both);
+        undeclared pads stay free for the bench tools (DAC on A0/D0)."""
+        if self.mode != MODES['COUNTER']:
+            return None
+        chbytes = [0] * len(COUNTER_PINS)
+        for label, (base, mods) in self.roles.items():
+            if base != 'count':
+                raise DSLError("COUNTER pin %s must be 'count', got %r" % (label, base))
+            if label not in COUNTER_PIN_IDX:
+                raise DSLError("COUNTER pin %s is not a counter pad %s" % (label, COUNTER_PINS))
+            pull, edge = 'none', 'rising'
+            for m in mods:
+                if m in COUNTER_PULLS:
+                    pull = m
+                elif m in COUNTER_EDGES:
+                    edge = m
+                else:
+                    raise DSLError("counter %s: bad modifier %r (pull up/down/none, "
+                                   "edge rising/falling/both)" % (label, m))
+            chbytes[COUNTER_PIN_IDX[label]] = (1 | (COUNTER_PULLS[pull] << 1)
+                                               | (COUNTER_EDGES[edge] << 3))
+        r = self.cntr_rate
+        return bytes([CNTR_VERSION, r & 0xFF, (r >> 8) & 0xFF] + chbytes)
+
     def files(self):
         """Return {name: bytes} ready for the commission tool to write."""
         out = {'idnt': self.idnt()}
         gpmp = self.gpmp()
         if gpmp is not None:
             out['gpmp'] = gpmp
+        cntr = self.cntr()
+        if cntr is not None:
+            out['cntr'] = cntr
         ilcf = self.ilcf()
         if ilcf is not None:
             out['ilcf'] = ilcf.encode('ascii')
@@ -581,12 +672,34 @@ def _selftest():
     assert u.ilcf().split(';')[3] == "out_ok[D6:0]"      # ok=0
     assert u.ilcf().split(';')[4] == "out_err[D6:1]"     # err=1-0
 
-    # 4. SERVO/COUNTER/IDLE: idnt only. ADC (interlock-capable) with no interlock
-    #    emits the null ilcf, like GPIO/MIXED.
-    for ty, m in (('SERVO', 4), ('COUNTER', 5), ('IDLE', 0)):
+    # 3b. MIXED GPIO debounce: ms -> shift depth at the ~100 Hz tick (50ms -> 5)
+    u = Unit(0x55, 'MIXED')
+    u.pins(A0='adc', D8='in:up:debounce_50ms', D6='out')
+    u.interlock('s', when='A0 > 2.5V && D8', drive={'D6': 1})
+    assert u.ilcf().split(';')[1] == \
+        "cfg[(A0):adc,(D8):in,up,debounce_5,(D6):out]", u.ilcf()
+    # rounds to nearest tick: 24ms -> depth 2
+    u = Unit(0x55, 'MIXED'); u.pins(D8='in:debounce_24ms', D6='out')
+    u.interlock('s', when='D8', drive={'D6': 1})
+    assert u.ilcf().split(';')[1] == "cfg[(D8):in,debounce_2,(D6):out]", u.ilcf()
+
+    # 4. SERVO/IDLE: idnt only. ADC (interlock-capable) with no interlock emits the
+    #    null ilcf, like GPIO/MIXED. COUNTER carries a `cntr` config file.
+    for ty, m in (('SERVO', 4), ('IDLE', 0)):
         u = Unit(0x60, ty)
         assert u.files() == {'idnt': bytes([0x60, m])}, (ty, u.files())
     assert Unit(0x60, 'ADC').files() == {'idnt': bytes([0x60, 2]), 'ilcf': b'off'}
+
+    # 4b. COUNTER cntr: D1 up/rising + D2 down/both at 2 kHz; D0 free (DAC pad).
+    #     ch byte = bit0 enable | pull<<1 | edge<<3. D1=idx1: 1|1<<1=0x03;
+    #     D2=idx2: 1|2<<1|2<<3 = 1|4|16 = 0x15. rate 2000 = 0x07D0.
+    u = Unit(0x55, 'COUNTER').counter(rate=2000)
+    u.pins(D1='count:up:rising', D2='count:down:both')
+    exp = bytes([1, 0xD0, 0x07, 0x00, 0x03, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    assert u.files()['cntr'] == exp, list(u.files()['cntr'])
+    assert u.files()['idnt'] == bytes([0x55, 5])
+    # bare COUNTER -> cntr with all channels disabled, default 1 kHz
+    assert Unit(0x60, 'COUNTER').cntr() == bytes([1, 0xE8, 0x03] + [0] * 9)
 
     # 5. error cases
     for fn in (
@@ -595,6 +708,23 @@ def _selftest():
         lambda: Unit(0x55, 'MIXED').pins(D6='out').interlock('s', when='D6 > 1').ilcf(),
         lambda: Unit(0x55, 'BOGUS'),
         lambda: Unit(0x99, 'MIXED'),
+        # debounce is MIXED-only -> rejected on GPIO
+        lambda: Unit(0x55, 'GPIO').pins(D8='in:up:debounce_50ms', D6='out')
+                    .interlock('s', when='D8', drive={'D6': 1}).ilcf(),
+        # debounce out of range: 200ms -> depth 20 > 15
+        lambda: Unit(0x55, 'MIXED').pins(D8='in:debounce_200ms', D6='out')
+                    .interlock('s', when='D8', drive={'D6': 1}).ilcf(),
+        # debounce must carry ms units
+        lambda: Unit(0x55, 'MIXED').pins(D8='in:debounce_5', D6='out')
+                    .interlock('s', when='D8', drive={'D6': 1}).ilcf(),
+        # counter rate out of range
+        lambda: Unit(0x55, 'COUNTER').counter(rate=50000),
+        # counter() is COUNTER-only
+        lambda: Unit(0x55, 'GPIO').counter(rate=1000),
+        # bad counter modifier
+        lambda: Unit(0x55, 'COUNTER').pins(D1='count:up:bogus').cntr(),
+        # D4 is not a counter pad (I2C pin)
+        lambda: Unit(0x55, 'COUNTER').pins(D4='count:up').cntr(),
     ):
         try:
             fn()

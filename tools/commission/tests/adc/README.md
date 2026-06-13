@@ -26,15 +26,18 @@ python3 run_adc_tests.py
 
 ```
 A1                 instantaneous 16x sample
-A1.avg.fast        10 Hz window average    (stat avg/min/max/rms, window fast/mid/slow)
+A1.avg.fast        fast-window average     (stat avg/min/max/rms, window fast/mid/slow)
 A1.rms.mid  ...
 ```
 
 ## Gotchas baked in
 
-- **Windowed stats settle on window-fill**, not instantly: fast (10 Hz/100 samples)
-  ≈ 0.4 s, mid (1 Hz/1000) ≈ 3 s, slow (0.1 Hz/10000) ≈ 25 s. The harness has the
-  settle times; reading too soon shows a stale/mid-flush value.
+- **Windowed stats settle on window-fill**, not instantly. At the measured ~125
+  Hz/channel sweep rate the windows are: fast (100 samples) ≈ 0.8 s, mid (1000) ≈
+  8 s, slow (10000) ≈ 80 s — a clean read after a DAC step needs ~2 windows. The
+  harness `WIN_SETTLE` has these; reading too soon shows a stale/mid-flush value.
+  (The window names are by sample count, not the old 10/1/0.1 Hz labels, which
+  assumed a 1 kHz sweep the 16x-oversample+throwaway ADC never reached.)
 - The interlock **latches** on trip; the tests `clear_trip()` (write `INT_FLAGS`
   bit3) each step so `cond-ok` (the live comparison, `ILSTATE` bit1) is what they
   assert. `tripped` (bit0) is the latched safety state.

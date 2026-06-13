@@ -174,22 +174,29 @@ static void dac_init(void) {
 }
 
 // ----------------------------------------------------------------------------
-// DAC waveform generator — TC3 timer-IRQ driven, single 64-step phase counter
-// for all waveform types (sine via LUT, ramp/square computed).
+// DAC two-tone DDS engine — TC3 timer-IRQ driven, fixed sample rate + per-tone
+// phase accumulators. Two independent tones (off / constant / sine / square,
+// 50 Hz–2 kHz, independent amplitude) are SUMMED and HARD-CLIPPED to the 10-bit
+// DAC range. Each ISR advances both accumulators by inc = freq·2^32/Fs and
+// writes offset + a1·f1(ph1) + a2·f2(ph2). A bench/diagnostic instrument, not an
+// application output.
 //
-// Frequency range: ~50 Hz to ~500 Hz output. At 500 Hz output × 64 steps =
-// 32 kHz ISR rate, which Cortex-M0+ at 48 MHz handles comfortably. Higher
-// rates need DMA (deferred to v2).
+// Fixed Fs = 32 kHz (TC3 period 1500 @ 48 MHz) — same ISR load as the old
+// engine's max. Square edges quantize to the ISR tick (~31 µs); fine for bench
+// use. Higher rates / crisp edges need DMA (deferred).
 // ----------------------------------------------------------------------------
 
-#define DAC_WF_PHASE_STEPS  64u
+#define DAC_WF_PHASE_STEPS  64u                       // sine LUT length (top-6-bit index)
 #define DAC_WF_FREQ_MIN     50u
-#define DAC_WF_FREQ_MAX     500u
+#define DAC_WF_FREQ_MAX     2000u
+#define DAC_FS_HZ           32000u                    // fixed DDS sample rate / ADC master clock
+#define DAC_TC3_PERIOD      (48000000u / DAC_FS_HZ)   // = 1500
 
-#define DAC_WF_TYPE_SINE       0
-#define DAC_WF_TYPE_RAMP_UP    1
-#define DAC_WF_TYPE_RAMP_DOWN  2
-#define DAC_WF_TYPE_SQUARE     3
+#define DAC_NTONES          2u
+#define DAC_TONE_OFF        0u
+#define DAC_TONE_CONST      1u
+#define DAC_TONE_SINE       2u
+#define DAC_TONE_SQUARE     3u
 
 // 64-point sine LUT, centered at 512, peak amplitude 511 (full DAC swing).
 // Scaling/offset to the user-requested amplitude+offset happens in the ISR.
@@ -206,12 +213,29 @@ static const uint16_t g_sine_lut[DAC_WF_PHASE_STEPS] = {
 
 static volatile struct {
     bool     active;
-    uint8_t  waveform_type;
-    uint16_t amplitude;            // peak-to-peak swing, 0..1023
-    uint16_t offset;               // DC center, 0..1023
+    uint8_t  type[DAC_NTONES];     // off / constant / sine / square
+    uint16_t amp[DAC_NTONES];      // peak amplitude, 0..1023
+    uint32_t inc[DAC_NTONES];      // phase increment per ISR (0 for off/constant)
+    uint32_t ph[DAC_NTONES];       // phase accumulator
+    int16_t  offset;               // DC center, 0..1023
     uint32_t isrs_remaining;       // 0 = infinite
-    uint8_t  phase;                // 0..63
-} g_dac_wf;
+} g_dds;
+
+// One tone's signed contribution at its current phase. amp is the peak.
+// Division-free: the Cortex-M0+ has no HW divide, and this runs at 32 kHz, so the
+// sine scale uses a >>9 shift (512 = 2^9) instead of /512. Two active tones would
+// otherwise do two software divides per ISR and starve the USB service loop.
+static inline int32_t dds_tone_sample(uint8_t type, uint32_t ph, int32_t amp) {
+    switch (type) {
+    case DAC_TONE_CONST:  return amp;                          // +amp DC term
+    case DAC_TONE_SINE: {
+        uint32_t idx = ph >> 26;                               // top 6 bits -> 0..63
+        return (((int32_t)g_sine_lut[idx] - 512) * amp) >> 9;  // ±amp peak (÷512)
+    }
+    case DAC_TONE_SQUARE: return (ph & 0x80000000u) ? amp : -amp;
+    default:              return 0;                            // off
+    }
+}
 
 static bool g_tc3_initialized = false;
 
@@ -266,73 +290,62 @@ static void tc3_start_at_period(uint16_t period) {
 
     TC3->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;     // clear stale
     TC3->COUNT16.INTENSET.reg = TC_INTENSET_MC0;
+    // The DAC waveform ISR fires up to 32 kHz. Keep it at the LOWEST priority so
+    // the USB IRQ (default priority 0) always preempts it — SAMD21 USB endpoints
+    // have tiny buffers, and a USB IRQ delayed by an in-progress TC3 ISR drops
+    // packets, which breaks CDC framing and hangs host register reads.
+    NVIC_SetPriority(TC3_IRQn, 3);
     NVIC_EnableIRQ(TC3_IRQn);
 
     TC3->COUNT16.CTRLA.bit.ENABLE = 1;
     while (TC3->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
 }
 
+static void adc_isr_service(void);   // ADC step, keyed off this tone clock (defined below)
+
+// TC3 is the master clock: it generates the DAC waveform AND, in ADC mode, keys
+// the ADC sampler. Both run from this one ISR.
 void TC3_Handler(void) {
     if (!TC3->COUNT16.INTFLAG.bit.MC0) return;
     TC3->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
 
     if (g_dac_follow.active) { dac_follow_step(); return; }
-    if (!g_dac_wf.active) return;
 
-    // Compute next sample for the current phase.
-    int32_t sample;
-    switch (g_dac_wf.waveform_type) {
-        case DAC_WF_TYPE_SINE: {
-            int32_t lut = (int32_t)g_sine_lut[g_dac_wf.phase] - 512;       // -512..+511
-            int32_t scaled = lut * (int32_t)g_dac_wf.amplitude / 1023;     // ±amplitude/2 approx
-            sample = (int32_t)g_dac_wf.offset + scaled;
-            break;
+    // DAC DDS update: advance both phase accumulators, sum, hard-clip.
+    if (g_dds.active) {
+        int32_t sample = g_dds.offset;
+        for (uint8_t t = 0; t < DAC_NTONES; t++) {
+            if (g_dds.type[t] == DAC_TONE_OFF) continue;
+            g_dds.ph[t] += g_dds.inc[t];
+            sample += dds_tone_sample(g_dds.type[t], g_dds.ph[t], (int32_t)g_dds.amp[t]);
         }
-        case DAC_WF_TYPE_RAMP_UP: {
-            int32_t v = (int32_t)g_dac_wf.phase * (int32_t)g_dac_wf.amplitude / (int32_t)(DAC_WF_PHASE_STEPS - 1u);
-            sample = (int32_t)g_dac_wf.offset - (int32_t)g_dac_wf.amplitude / 2 + v;
-            break;
-        }
-        case DAC_WF_TYPE_RAMP_DOWN: {
-            int32_t v = (int32_t)(DAC_WF_PHASE_STEPS - 1u - g_dac_wf.phase) * (int32_t)g_dac_wf.amplitude
-                      / (int32_t)(DAC_WF_PHASE_STEPS - 1u);
-            sample = (int32_t)g_dac_wf.offset - (int32_t)g_dac_wf.amplitude / 2 + v;
-            break;
-        }
-        case DAC_WF_TYPE_SQUARE: {
-            sample = (g_dac_wf.phase < (DAC_WF_PHASE_STEPS / 2u))
-                ? (int32_t)g_dac_wf.offset + (int32_t)g_dac_wf.amplitude / 2
-                : (int32_t)g_dac_wf.offset - (int32_t)g_dac_wf.amplitude / 2;
-            break;
-        }
-        default:
-            sample = (int32_t)g_dac_wf.offset;
-    }
+        if (sample <    0) sample = 0;
+        if (sample > 1023) sample = 1023;
+        DAC->DATA.reg = (uint16_t)sample;
 
-    // Clamp to 10-bit DAC range.
-    if (sample <    0) sample = 0;
-    if (sample > 1023) sample = 1023;
-    DAC->DATA.reg = (uint16_t)sample;
-
-    g_dac_wf.phase = (uint8_t)((g_dac_wf.phase + 1u) % DAC_WF_PHASE_STEPS);
-
-    // Duration handling: 0 = infinite; otherwise decrement and stop when zero.
-    if (g_dac_wf.isrs_remaining != 0u) {
-        if (--g_dac_wf.isrs_remaining == 0u) {
-            g_dac_wf.active = false;
+        // Duration: 0 = infinite (ADC mode); otherwise the standalone bench
+        // waveform decrements and stops TC3 when it expires.
+        if (g_dds.isrs_remaining != 0u && --g_dds.isrs_remaining == 0u) {
+            g_dds.active = false;
             tc3_stop();
+            return;                       // TC3 disabled; nothing left to service
         }
     }
+
+    adc_isr_service();                    // ADC step (no-op unless the ADC engine is running)
 }
 
 // ---------- CMD_DAC_WAVEFORM_WRITE ---------------------------------------
-// args:   waveform:u8 (0=sine, 1=ramp_up, 2=ramp_down, 3=square)
-//         amplitude:u16 (peak-to-peak, 0..1023)
+// args:   waveform:u8 (1=constant, 2=sine, 3=square)
+//         amplitude:u16 (peak, 0..1023)
 //         offset:u16    (DC center, 0..1023)
-//         frequency_hz:u32  (50..500 inclusive)
+//         frequency_hz:u32  (50..2000 inclusive)
 //         duration_ms:u32   (0 = infinite)
 // result: empty
 // status: OK / BAD_ARGS
+//
+// Drives ONE tone (tone 0) of the two-tone DDS engine; tone 1 is forced off.
+// For full two-tone control use the ADC mode-bank registers (0x20..0x2C).
 
 static uint8_t cmd_dac_waveform_write(shell_reader_t* args, shell_writer_t* result) {
     (void)result;
@@ -343,30 +356,29 @@ static uint8_t cmd_dac_waveform_write(shell_reader_t* args, shell_writer_t* resu
     uint32_t duration_ms = sr_u32(args);
     if (args->overflow)            return SHELL_STATUS_BAD_ARGS;
     if (sr_remaining(args) != 0)   return SHELL_STATUS_BAD_ARGS;
-    if (waveform > DAC_WF_TYPE_SQUARE) return SHELL_STATUS_BAD_ARGS;
+    if (waveform < DAC_TONE_CONST || waveform > DAC_TONE_SQUARE) return SHELL_STATUS_BAD_ARGS;
     if (amplitude > 1023u || offset > 1023u) return SHELL_STATUS_BAD_ARGS;
     if (frequency < DAC_WF_FREQ_MIN || frequency > DAC_WF_FREQ_MAX) return SHELL_STATUS_BAD_ARGS;
 
     dac_init();
     tc3_init_once();
 
-    // ISR rate = frequency × 64 steps. TC3 period = 48 MHz / isr_rate.
-    uint32_t isr_rate = frequency * DAC_WF_PHASE_STEPS;
-    uint32_t period   = 48000000u / isr_rate;
-    if (period < 2u || period > 65535u) return SHELL_STATUS_BAD_ARGS;
+    // Duration -> ISR count at the fixed sample rate. 0 = infinite.
+    uint32_t isrs = (duration_ms == 0u) ? 0u : (duration_ms * DAC_FS_HZ / 1000u);
 
-    // Compute ISR count for the duration. 0 = infinite.
-    uint32_t isrs = (duration_ms == 0u) ? 0u : (duration_ms * isr_rate / 1000u);
-
-    // Atomically install the new waveform state — disable IRQ during update.
+    // Atomically install the new tone state — disable IRQ during update.
     NVIC_DisableIRQ(TC3_IRQn);
-    g_dac_wf.active         = true;
-    g_dac_wf.waveform_type  = waveform;
-    g_dac_wf.amplitude      = amplitude;
-    g_dac_wf.offset         = offset;
-    g_dac_wf.isrs_remaining = isrs;
-    g_dac_wf.phase          = 0;
-    tc3_start_at_period((uint16_t)period);   // re-enables NVIC
+    g_dds.type[0] = waveform;
+    g_dds.amp[0]  = amplitude;
+    g_dds.inc[0]  = (waveform == DAC_TONE_CONST)
+                  ? 0u : (uint32_t)(((uint64_t)frequency << 32) / DAC_FS_HZ);
+    g_dds.ph[0]   = 0u;
+    g_dds.type[1] = DAC_TONE_OFF;
+    g_dds.amp[1]  = 0u; g_dds.inc[1] = 0u; g_dds.ph[1] = 0u;
+    g_dds.offset  = (int16_t)offset;
+    g_dds.isrs_remaining = isrs;
+    g_dds.active  = true;
+    tc3_start_at_period(DAC_TC3_PERIOD);   // re-enables NVIC
 
     return SHELL_STATUS_OK;
 }
@@ -381,7 +393,7 @@ static uint8_t cmd_dac_waveform_write(shell_reader_t* args, shell_writer_t* resu
 static uint8_t cmd_dac_stop(shell_reader_t* args, shell_writer_t* result) {
     (void)result;
     if (sr_remaining(args) != 0) return SHELL_STATUS_BAD_ARGS;
-    g_dac_wf.active = false;
+    g_dds.active = false;
     g_dac_follow.active = false;         // stop follow too (shared TC3 + DAC)
     tc3_stop();
     return SHELL_STATUS_OK;
@@ -404,8 +416,8 @@ static uint8_t cmd_dac_write(shell_reader_t* args, shell_writer_t* result) {
     dac_init();
 
     // If a waveform or follow mode is running, stop it — static write wins.
-    if (g_dac_wf.active || g_dac_follow.active) {
-        g_dac_wf.active = false;
+    if (g_dds.active || g_dac_follow.active) {
+        g_dds.active = false;
         g_dac_follow.active = false;
         tc3_stop();
     }
@@ -670,7 +682,7 @@ static uint8_t cmd_dac_follow_start(shell_reader_t* args, shell_writer_t* result
     ADC->SWTRIG.bit.START = 1;                    // kick the first conversion
 
     NVIC_DisableIRQ(TC3_IRQn);
-    g_dac_wf.active          = false;             // mutual exclusion with waveform
+    g_dds.active             = false;             // mutual exclusion with waveform
     g_dac_follow.adc_channel = p->adc_channel;
     g_dac_follow.active      = true;
     tc3_start_at_period((uint16_t)period);        // re-enables the TC3 NVIC line
@@ -1116,6 +1128,8 @@ static bool store_commit(uint8_t slot) {
 static void pio_il_tick(void);             // PIO-b gpio interlock eval (defined below)
 static void adc_sample_tick(void);         // ADC-a sampler (defined below)
 static void adc_il_tick(void);             // ADC-b interlock eval (defined below)
+static void adc_sampler_start(void);       // tone-clocked ADC sweep (defined below)
+static void adc_sampler_stop(void);
 static void mixed_tick(void);              // MIXED-a interlock eval (defined below)
 
 void i2c_store_service(void) {
@@ -1128,7 +1142,7 @@ void i2c_store_service(void) {
     }
     if (g_reset_pending) NVIC_SystemReset();
     pio_il_tick();                         // evaluate the gpio interlock (no-op unless armed in PIO)
-    adc_sample_tick();                     // 1 kHz ADC sweep + window stats (no-op unless MODE_ADC)
+    adc_sample_tick();                     // ADC interlock eval (sampling runs in the TC3 ISR)
     mixed_tick();                          // ~100 Hz mixed ADC+GPIO interlock (no-op unless MODE_MIXED)
 }
 
@@ -1375,27 +1389,36 @@ static void pio_reg_write(uint8_t reg, uint8_t val) {
 }
 
 // ---- ADC mode (ADC-a): free-running 8-ch sampler + tumbling-window stats ------
-// DIV16 (3 MHz) ADC, 16x hardware oversample, swept at 1 kHz from the superloop.
-// Per channel, three tumbling windows (10/1/0.1 Hz = 100/1000/10000 samples) keep
-// running min/max/sum/sumsq; on window-fill they snapshot min/max/avg/AC-rms into
-// a readable block and bump a per-window seq id (freshness + seqlock). Selector +
-// block register access. DAC sub-state is constant-only here; ADC-b adds waves.
+// DIV16 (3 MHz) ADC, 16x hardware oversample, round-robin keyed off the TC3 tone
+// ISR. The throwaway-per-mux + 16x averaging make each conversion ~500 us, so the
+// real sweep rate is ~125 Hz/channel (8 channels x throwaway+real). Per channel,
+// three tumbling windows of 100/1000/10000 samples -> ~0.8 s / ~8 s / ~80 s at
+// that rate. (The "fast/mid/slow" names are by length, not the old 10/1/0.1 Hz
+// labels, which assumed an unachieved 1 kHz.) On window-fill they snapshot
+// min/max/avg/AC-rms into a readable block and bump a per-window seq id (freshness
+// + seqlock). DAC sub-state is constant-only here; ADC-b adds waves.
 #define ADC_NCH   8u
 #define ADC_NWIN  3u
 #define REG_ADC_CH_SEL  0x10u            // w: channel 0..7
-#define REG_ADC_WIN_SEL 0x11u            // w: window 0=10Hz 1=1Hz 2=0.1Hz
+#define REG_ADC_WIN_SEL 0x11u            // w: window 0=fast(~0.8s) 1=mid(~8s) 2=slow(~80s)
 #define REG_ADC_SEQ     0x12u            // r: u16 window snapshot counter
 #define REG_ADC_MIN     0x14u            // r: u16  (block 0x12..0x1B = seq,min,max,avg,rms)
 #define REG_ADC_MAX     0x16u
 #define REG_ADC_AVG     0x18u
 #define REG_ADC_RMS     0x1Au
-#define REG_DAC_MODE    0x20u            // w: 0=constant (1=sine 2=square in ADC-b)
-#define REG_DAC_LEVEL   0x21u            // w: u16 level/amplitude 0..1023
-#define REG_DAC_FREQ    0x23u            // w: u16 Hz
-#define REG_DAC_APPLY   0x25u            // w: latch MODE+LEVEL+FREQ
+// Two-tone DDS bench generator. Tone 0 keeps the legacy 0x20/0x21/0x23 slots;
+// tone 1 + global offset follow APPLY at 0x26+. type 0=off 1=const 2=sine 3=square.
+#define REG_DAC_T1_TYPE 0x20u            // w: tone0 type
+#define REG_DAC_T1_AMP  0x21u            // w: u16 tone0 peak amplitude 0..1023
+#define REG_DAC_T1_FREQ 0x23u            // w: u16 tone0 Hz (50..2000)
+#define REG_DAC_APPLY   0x25u            // w: latch both tones + offset
+#define REG_DAC_T2_TYPE 0x26u            // w: tone1 type
+#define REG_DAC_T2_AMP  0x27u            // w: u16 tone1 peak amplitude 0..1023
+#define REG_DAC_T2_FREQ 0x29u            // w: u16 tone1 Hz (50..2000)
+#define REG_DAC_OFFSET  0x2Bu            // w: u16 DC center 0..1023 (default 512)
 
 static const uint8_t  g_adc_ain[ADC_NCH]     = { 4u, 18u, 19u, 2u, 3u, 7u, 5u, 6u }; // D1,D2,D3,D6,D7,D8,D9,D10
-static const uint16_t g_adc_win_len[ADC_NWIN] = { 100u, 1000u, 10000u };             // 10/1/0.1 Hz @ 1 kHz
+static const uint16_t g_adc_win_len[ADC_NWIN] = { 100u, 1000u, 10000u };             // ~0.8/8/80 s @ ~125 Hz/ch
 
 typedef struct { uint16_t min, max; uint32_t sum; uint64_t sumsq; uint16_t count; } adc_accum_t;
 typedef struct { uint16_t min, max, avg, rms; } adc_stat_t;
@@ -1404,10 +1427,10 @@ static adc_stat_t  g_adc_stat[ADC_NCH][ADC_NWIN];
 static volatile uint16_t g_adc_latest[ADC_NCH];     // most recent raw sample (instantaneous)
 static volatile uint16_t g_adc_seq[ADC_NWIN];
 static uint8_t   g_adc_ch_sel, g_adc_win_sel;
-static uint32_t  g_adc_next_ms;
-static uint8_t   g_dac_mode;             // 0=constant
-static uint16_t  g_dac_level;            // 0..1023
-static uint16_t  g_dac_freq;
+static uint8_t   g_dac_type[DAC_NTONES]; // per-tone off/const/sine/square (host shadow)
+static uint16_t  g_dac_amp[DAC_NTONES];  // per-tone peak 0..1023
+static uint16_t  g_dac_freq[DAC_NTONES]; // per-tone Hz
+static uint16_t  g_dac_offset = 512u;    // DC center, latched on APPLY
 
 static uint32_t isqrt32(uint32_t x) {    // integer sqrt for AC-rms
     uint32_t r = 0u, b = 1u << 30;
@@ -1435,71 +1458,116 @@ static void adc_mode_setup(void) {
     PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;  // have left it a GPIO; dac_init is 1-shot)
     DAC->CTRLB.bit.EOEN = 1;
     while (DAC->STATUS.bit.SYNCBUSY) { }
-    DAC->DATA.reg = g_dac_level;
-    g_adc_next_ms = board_millis();
+    DAC->DATA.reg = g_dac_offset;
+    adc_sampler_start();                                    // launch the IRQ-driven sweep
 }
 
-static uint16_t adc_convert(uint8_t ain) {
-    ADC->INPUTCTRL.bit.MUXPOS = ain;
-    while (ADC->STATUS.bit.SYNCBUSY) { }
-    // Throwaway conversion: after a mux switch the sample cap still holds the
-    // previous (possibly floating) channel; the first averaged result is
-    // contaminated. Discard it so the real read settles on the new channel.
-    ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
-    ADC->SWTRIG.bit.START = 1;
-    while (!ADC->INTFLAG.bit.RESRDY) { }
-    (void)ADC->RESULT.reg;
-    ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
-    // Real averaged conversion.
-    ADC->SWTRIG.bit.START = 1;
-    while (!ADC->INTFLAG.bit.RESRDY) { }
+// ---- Tone-ISR-keyed ADC sampler --------------------------------------------
+// TC3 (the DAC tone clock) keys the ADC: every TC3 tick calls adc_isr_service(),
+// which steps the round-robin sweep IF the previous conversion has completed
+// (RESRDY) and otherwise returns immediately. g_adc_running gates it; the
+// g_adc_throwaway flag absorbs the per-mux settle (a discarded first conversion).
+// ALL result processing (accumulate + window snapshot) happens here, in the ISR.
+// That is only safe because the host command path is now fast (libcomm reads
+// what's available instead of a fixed 256 B, so a reply returns in ~ms not ~1 s);
+// a few hundred microseconds of snapshot work in the ISR no longer stalls CDC.
+static volatile uint8_t g_adc_cur_ch;       // channel currently converting
+static volatile bool    g_adc_throwaway;    // next RESRDY is the post-mux throwaway
+static volatile bool    g_adc_running;      // sampler active
+
+static void adc_accum(uint8_t ch, uint16_t v) {
+    if (v > 4095u) v = 4095u;
+    g_adc_latest[ch] = v;
+    for (uint8_t w = 0; w < ADC_NWIN; w++) {
+        adc_accum_t *a = &g_adc_acc[ch][w];
+        if (a->count == 0u) { a->min = v; a->max = v; }
+        else { if (v < a->min) a->min = v; if (v > a->max) a->max = v; }
+        a->sum   += v;
+        a->sumsq += (uint32_t)v * (uint32_t)v;
+        a->count++;
+    }
+}
+
+// A full sweep just finished (all channels equal count) -> close any full window.
+static void adc_snapshot_full(void) {
+    for (uint8_t w = 0; w < ADC_NWIN; w++) {
+        if (g_adc_acc[0][w].count < g_adc_win_len[w]) continue;
+        for (uint8_t ch = 0; ch < ADC_NCH; ch++) {
+            adc_accum_t *a = &g_adc_acc[ch][w];
+            uint16_t n = a->count;
+            uint32_t avg = n ? (uint32_t)(a->sum / n) : 0u;
+            // AC-rms = sqrt(var); var = (n*sumsq - sum^2) / n^2, in u64 from the
+            // raw sums so avg truncation doesn't pollute it.
+            uint32_t var = 0u;
+            if (n) {
+                uint64_t nss = (uint64_t)n * a->sumsq;
+                uint64_t ss  = (uint64_t)a->sum * a->sum;
+                if (nss > ss) var = (uint32_t)((nss - ss) / ((uint64_t)n * n));
+            }
+            g_adc_stat[ch][w].min = a->min;
+            g_adc_stat[ch][w].max = a->max;
+            g_adc_stat[ch][w].avg = (uint16_t)avg;
+            g_adc_stat[ch][w].rms = (uint16_t)isqrt32(var);
+            a->min = 0u; a->max = 0u; a->count = 0u; a->sum = 0u; a->sumsq = 0u;
+        }
+        g_adc_seq[w]++;
+    }
+}
+
+// One ADC step, called from TC3_Handler (the tone clock) every tick. Flag-guarded:
+// a new conversion is scheduled only after the current one's RESRDY is handled, so
+// the tone ISR and the ADC stay in lockstep without ever spinning.
+static void adc_isr_service(void) {
+    if (!g_adc_running) return;
+    if (!ADC->INTFLAG.bit.RESRDY) return;       // still converting -> service on a later tick
     uint16_t v = (uint16_t)ADC->RESULT.reg;
     ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;
-    return v;
+    if (g_adc_throwaway) {                       // discard the post-mux settle conversion
+        g_adc_throwaway = false;
+        ADC->SWTRIG.bit.START = 1;              // launch the real (settled) conversion
+        return;
+    }
+    uint8_t ch = g_adc_cur_ch;
+    adc_accum(ch, v);
+    if (ch == ADC_NCH - 1u) adc_snapshot_full();           // sweep complete -> close windows
+    ch = (uint8_t)((ch + 1u) % ADC_NCH);                   // advance + kick the next channel
+    g_adc_cur_ch    = ch;
+    g_adc_throwaway = true;
+    ADC->INPUTCTRL.bit.MUXPOS = g_adc_ain[ch];             // throwaway absorbs mux-settle (no spin)
+    ADC->SWTRIG.bit.START = 1;
 }
 
+// Start the tone-clocked ADC engine. TC3 runs continuously in ADC mode (it is the
+// master sample clock); the DAC DDS rides the same ISR — with no waveform the DDS
+// just holds g_dac_offset each tick.
+static void adc_sampler_start(void) {
+    g_adc_cur_ch    = 0u;
+    g_adc_throwaway = true;
+    ADC->INTFLAG.reg = ADC_INTFLAG_RESRDY;                 // clear stale (we POLL it, no ADC IRQ)
+    ADC->INPUTCTRL.bit.MUXPOS = g_adc_ain[0];
+    g_adc_running = true;
+    ADC->SWTRIG.bit.START = 1;                             // first conversion (throwaway)
+    // DDS engine: tones off (DC at offset) until a waveform is applied.
+    for (uint8_t t = 0; t < DAC_NTONES; t++) { g_dds.type[t] = DAC_TONE_OFF; g_dds.inc[t] = 0u; g_dds.ph[t] = 0u; }
+    g_dds.offset         = (int16_t)g_dac_offset;
+    g_dds.isrs_remaining = 0u;                             // infinite
+    g_dds.active         = true;
+    dac_init();
+    tc3_init_once();
+    tc3_start_at_period(DAC_TC3_PERIOD);                   // 32 kHz master clock for DAC + ADC
+}
+
+static void adc_sampler_stop(void) {
+    g_adc_running = false;
+    g_dds.active  = false;
+    tc3_stop();
+}
+
+// Superloop hook: sampling runs in the TC3 ISR now; here we only evaluate the
+// interlock against the freshly-computed stats (non-blocking).
 static void adc_sample_tick(void) {
     if (g_mode != MODE_ADC) return;
-    uint32_t now = board_millis();
-    if ((int32_t)(now - g_adc_next_ms) < 0) return;          // 1 kHz gate (1 ms)
-    g_adc_next_ms = now + 1u;
-    for (uint8_t ch = 0; ch < ADC_NCH; ch++) {
-        uint16_t v = adc_convert(g_adc_ain[ch]);
-        if (v > 4095u) v = 4095u;
-        g_adc_latest[ch] = v;
-        for (uint8_t w = 0; w < ADC_NWIN; w++) {
-            adc_accum_t *a = &g_adc_acc[ch][w];
-            if (a->count == 0u) { a->min = v; a->max = v; }
-            else { if (v < a->min) a->min = v; if (v > a->max) a->max = v; }
-            a->sum   += v;
-            a->sumsq += (uint32_t)v * (uint32_t)v;
-            a->count++;
-        }
-    }
-    for (uint8_t w = 0; w < ADC_NWIN; w++) {
-        if (g_adc_acc[0][w].count >= g_adc_win_len[w]) {     // window full -> snapshot all channels
-            for (uint8_t ch = 0; ch < ADC_NCH; ch++) {
-                adc_accum_t *a = &g_adc_acc[ch][w];
-                uint16_t n = a->count;
-                uint32_t avg = n ? (uint32_t)(a->sum / n) : 0u;
-                // AC-rms = sqrt(var); var = (n*sumsq - sum^2) / n^2, computed in u64
-                // from the raw sums so avg truncation doesn't pollute it.
-                uint32_t var = 0u;
-                if (n) {
-                    uint64_t nss = (uint64_t)n * a->sumsq;
-                    uint64_t ss  = (uint64_t)a->sum * a->sum;
-                    if (nss > ss) var = (uint32_t)((nss - ss) / ((uint64_t)n * n));
-                }
-                g_adc_stat[ch][w].min = a->min;
-                g_adc_stat[ch][w].max = a->max;
-                g_adc_stat[ch][w].avg = (uint16_t)avg;
-                g_adc_stat[ch][w].rms = (uint16_t)isqrt32(var);
-                a->min = 0u; a->max = 0u; a->count = 0u; a->sum = 0u; a->sumsq = 0u;
-            }
-            g_adc_seq[w]++;
-        }
-    }
-    adc_il_tick();                                           // evaluate the ADC interlock
+    adc_il_tick();
 }
 
 // ---- ADC mode interlock (ADC-b): DNF over ADC streams -> drive D6 -------------
@@ -1587,37 +1655,89 @@ static void adc_il_manual_reset(void) {
     adc_il_drive(true);
 }
 
-// ADC-b: latch the DAC sub-state (constant / sine / square) from MODE+LEVEL+FREQ.
-// Reuses the TC3 waveform engine; sine/square are centered at mid-scale (offset
-// 512) with peak-to-peak swing = LEVEL, so the jumpered ADC captures the wave.
-static void adc_dac_apply(void) {
-    if (g_dac_level > 1023u) g_dac_level = 1023u;
-    if (g_dac_mode == 0u) {                                  // constant
-        NVIC_DisableIRQ(TC3_IRQn);
-        g_dac_wf.active = false;
-        tc3_stop();
-        DAC->DATA.reg = g_dac_level;
+// Latch both DDS tones + DC offset from the shadow registers. Mode-aware TC3 use:
+//  - ADC mode: TC3 runs continuously as the ADC master clock, so just update the
+//    DDS params atomically (mask the ISR) and keep it active.
+//  - MIXED / standalone bench: TC3 is NOT the sampler clock here, so it runs ONLY
+//    for a waveform — any active tone starts TC3; all-off writes a steady DC =
+//    offset and stops TC3 (no idle ISR). The DAC is a bench instrument in both
+//    modes; MIXED uses it as the controllable A0->A1 source for tests.
+// Tones sum and hard-clip around g_dac_offset (default 512).
+static void dac_apply(void) {
+    if (g_dac_offset > 1023u) g_dac_offset = 1023u;
+    bool any = false;
+    NVIC_DisableIRQ(TC3_IRQn);                              // mask the ISR during the update
+    for (uint8_t t = 0; t < DAC_NTONES; t++) {
+        if (g_dac_amp[t] > 1023u) g_dac_amp[t] = 1023u;
+        uint32_t f = g_dac_freq[t];
+        if (f < DAC_WF_FREQ_MIN) f = DAC_WF_FREQ_MIN;
+        if (f > DAC_WF_FREQ_MAX) f = DAC_WF_FREQ_MAX;
+        g_dds.type[t] = g_dac_type[t];
+        g_dds.amp[t]  = g_dac_amp[t];
+        g_dds.inc[t]  = (g_dac_type[t] == DAC_TONE_SINE || g_dac_type[t] == DAC_TONE_SQUARE)
+                      ? (uint32_t)(((uint64_t)f << 32) / DAC_FS_HZ) : 0u;   // off/const don't advance
+        g_dds.ph[t]   = 0u;
+        if (g_dac_type[t] != DAC_TONE_OFF) any = true;
+    }
+    g_dds.offset = (int16_t)g_dac_offset;
+
+    if (g_mode == MODE_ADC) {
+        g_dds.active = true;                               // TC3 is the ADC clock -> always on
+        NVIC_EnableIRQ(TC3_IRQn);
         return;
     }
-    uint32_t freq = g_dac_freq;                              // sine (1) / square (2)
-    if (freq < DAC_WF_FREQ_MIN) freq = DAC_WF_FREQ_MIN;
-    if (freq > DAC_WF_FREQ_MAX) freq = DAC_WF_FREQ_MAX;
-    uint32_t period = 48000000u / (freq * DAC_WF_PHASE_STEPS);
-    if (period < 2u) period = 2u;
-    if (period > 65535u) period = 65535u;
-    dac_init();
-    tc3_init_once();
-    NVIC_DisableIRQ(TC3_IRQn);
-    g_dac_wf.active         = true;
-    g_dac_wf.waveform_type  = (g_dac_mode == 2u) ? DAC_WF_TYPE_SQUARE : DAC_WF_TYPE_SINE;
-    g_dac_wf.amplitude      = g_dac_level;                   // peak-to-peak swing
-    g_dac_wf.offset         = 512u;                          // centered at mid-scale
-    g_dac_wf.isrs_remaining = 0u;                            // infinite
-    g_dac_wf.phase          = 0u;
-    tc3_start_at_period((uint16_t)period);                   // re-enables NVIC
+    if (any) {                                             // MIXED/standalone waveform -> run TC3
+        g_dds.active = true;
+        dac_init();
+        tc3_init_once();
+        tc3_start_at_period(DAC_TC3_PERIOD);               // re-enables NVIC
+    } else {                                               // pure DC -> hold offset, no ISR
+        g_dds.active = false;
+        tc3_stop();
+        DAC->DATA.reg = g_dac_offset;
+    }
 }
 
-// ADC mode-bank register access (0x10-0x25), dispatched only while MODE_ADC.
+// Shared DAC register access (tone0/1 TYPE/AMP/FREQ at 0x20-0x29, OFFSET 0x2B,
+// APPLY 0x25). The DAC is a bench tool in BOTH ADC and MIXED modes, so both banks
+// delegate here. Returns true if `reg` is a DAC register.
+static bool dac_reg_read(uint8_t reg, uint8_t* out) {
+    switch (reg) {
+    case REG_DAC_T1_TYPE:   *out = g_dac_type[0]; return true;
+    case REG_DAC_T1_AMP:    *out = (uint8_t)g_dac_amp[0]; return true;
+    case REG_DAC_T1_AMP+1u: *out = (uint8_t)(g_dac_amp[0] >> 8); return true;
+    case REG_DAC_T1_FREQ:   *out = (uint8_t)g_dac_freq[0]; return true;
+    case REG_DAC_T1_FREQ+1u:*out = (uint8_t)(g_dac_freq[0] >> 8); return true;
+    case REG_DAC_T2_TYPE:   *out = g_dac_type[1]; return true;
+    case REG_DAC_T2_AMP:    *out = (uint8_t)g_dac_amp[1]; return true;
+    case REG_DAC_T2_AMP+1u: *out = (uint8_t)(g_dac_amp[1] >> 8); return true;
+    case REG_DAC_T2_FREQ:   *out = (uint8_t)g_dac_freq[1]; return true;
+    case REG_DAC_T2_FREQ+1u:*out = (uint8_t)(g_dac_freq[1] >> 8); return true;
+    case REG_DAC_OFFSET:    *out = (uint8_t)g_dac_offset; return true;
+    case REG_DAC_OFFSET+1u: *out = (uint8_t)(g_dac_offset >> 8); return true;
+    default: return false;
+    }
+}
+static bool dac_reg_write(uint8_t reg, uint8_t val) {
+    switch (reg) {
+    case REG_DAC_T1_TYPE:   g_dac_type[0] = val; return true;
+    case REG_DAC_T1_AMP:    g_dac_amp[0]  = (uint16_t)((g_dac_amp[0]  & 0xFF00u) | val); return true;
+    case REG_DAC_T1_AMP+1u: g_dac_amp[0]  = (uint16_t)((g_dac_amp[0]  & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_T1_FREQ:   g_dac_freq[0] = (uint16_t)((g_dac_freq[0] & 0xFF00u) | val); return true;
+    case REG_DAC_T1_FREQ+1u:g_dac_freq[0] = (uint16_t)((g_dac_freq[0] & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_T2_TYPE:   g_dac_type[1] = val; return true;
+    case REG_DAC_T2_AMP:    g_dac_amp[1]  = (uint16_t)((g_dac_amp[1]  & 0xFF00u) | val); return true;
+    case REG_DAC_T2_AMP+1u: g_dac_amp[1]  = (uint16_t)((g_dac_amp[1]  & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_T2_FREQ:   g_dac_freq[1] = (uint16_t)((g_dac_freq[1] & 0xFF00u) | val); return true;
+    case REG_DAC_T2_FREQ+1u:g_dac_freq[1] = (uint16_t)((g_dac_freq[1] & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_OFFSET:    g_dac_offset  = (uint16_t)((g_dac_offset  & 0xFF00u) | val); return true;
+    case REG_DAC_OFFSET+1u: g_dac_offset  = (uint16_t)((g_dac_offset  & 0x00FFu) | ((uint16_t)val << 8)); return true;
+    case REG_DAC_APPLY:     dac_apply(); return true;
+    default: return false;
+    }
+}
+
+// ADC mode-bank register access (0x10-0x2C), dispatched only while MODE_ADC.
 static uint8_t adc_reg_read(uint8_t reg) {
     if (reg >= REG_ADC_SEQ && reg <= REG_ADC_RMS + 1u
         && g_adc_ch_sel < ADC_NCH && g_adc_win_sel < ADC_NWIN) {
@@ -1632,25 +1752,14 @@ static uint8_t adc_reg_read(uint8_t reg) {
     case REG_ADC_WIN_SEL: return g_adc_win_sel;
     case REG_ADC_ILSTAT:  return g_adc_il_pstat;
     case REG_ADC_ILSTATE: return g_adc_il_state;
-    case REG_DAC_MODE:     return g_dac_mode;
-    case REG_DAC_LEVEL:    return (uint8_t)g_dac_level;
-    case REG_DAC_LEVEL+1u: return (uint8_t)(g_dac_level >> 8);
-    case REG_DAC_FREQ:     return (uint8_t)g_dac_freq;
-    case REG_DAC_FREQ+1u:  return (uint8_t)(g_dac_freq >> 8);
-    default:               return 0xFFu;
+    default: { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }   // DAC bench regs
     }
 }
 static void adc_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case REG_ADC_CH_SEL:  if (val < ADC_NCH)  g_adc_ch_sel  = val; break;
     case REG_ADC_WIN_SEL: if (val < ADC_NWIN) g_adc_win_sel = val; break;
-    case REG_DAC_MODE:     g_dac_mode  = val; break;
-    case REG_DAC_LEVEL:    g_dac_level = (uint16_t)((g_dac_level & 0xFF00u) | val); break;
-    case REG_DAC_LEVEL+1u: g_dac_level = (uint16_t)((g_dac_level & 0x00FFu) | ((uint16_t)val << 8)); break;
-    case REG_DAC_FREQ:     g_dac_freq  = (uint16_t)((g_dac_freq  & 0xFF00u) | val); break;
-    case REG_DAC_FREQ+1u:  g_dac_freq  = (uint16_t)((g_dac_freq  & 0x00FFu) | ((uint16_t)val << 8)); break;
-    case REG_DAC_APPLY:   adc_dac_apply(); break;            // constant / sine / square
-    default: break;
+    default: dac_reg_write(reg, val); break;                 // DAC bench regs
     }
 }
 
@@ -1892,13 +2001,13 @@ static uint8_t mixed_reg_read(uint8_t reg) {
     case REG_MIXED_GPIO_DEB: return g_mixed_gpio_deb;
     case REG_MIXED_ILSTATE:  return g_mixed_il_state;
     case REG_MIXED_ILSTAT:   return g_mixed_il_pstat;
-    default:                 return 0xFFu;
+    default: { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }   // DAC bench regs (A0->A1 source)
     }
 }
 static void mixed_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case REG_MIXED_CH_SEL: if (val < IL_MAX_INPUTS) g_mixed_ch_sel = val; break;
-    default: break;                                          // all other regs are read-only
+    default: dac_reg_write(reg, val); break;                 // DAC bench regs (test source)
     }
 }
 
@@ -2167,34 +2276,42 @@ static void servo_reg_write(uint8_t reg, uint8_t val) {
 }
 
 // ============================================================================
-// COUNTER mode — 9 software edge counters sampled by a 1 kHz timer ISR (TC5).
+// COUNTER mode — software edge counters sampled by a timer ISR (TC5).
 //
-// Each TC5 tick (1 ms) reads all 9 channel pins, detects edges vs the previous
-// sample, and increments per-channel u32 counters on the configured edge. Max
-// reliable input is 500 Hz (Nyquist of the 1 kHz sampler). Pure input mode —
-// no interlock, no INT (D6/CH8 is just a 9th counter). Mirrors the Pico's
-// pulse_sample_1khz (a 1 kHz-sampled software edge counter; zero PIO/EIC).
+// Commissioned via a `cntr` config file: which of the 9 pads are counters, each
+// one's pull (up/down/none) and edge (rising/falling/both), and a bank-global
+// update rate. Each TC5 tick reads all pins, detects edges vs the previous
+// sample, and increments the per-channel u32 for ENABLED channels. Max countable
+// frequency ~ rate/2 (Nyquist). Pure input mode — no interlock.
 //
-// TC5 shares GCLK_ID 28 with TC4 (servo), but is a separate peripheral; TC4 is
-// idle in counter mode. Same 750 kHz tick as servo (DIV64 off the 48 MHz GCLK0),
-// so 1 ms = 750 ticks -> CC0=750 with MFRQ wavegen (CC0=TOP, auto-reset). Only
-// the MC0 interrupt is used (no CC1).
+// Pads NOT declared as counters are free for the bench tools: the DAC (on A0 =
+// PA02 = CH0) is available as a square-wave test stimulus when CH0 is not a
+// counter (jumper A0 -> a counter pad). The DAC rides TC3 (mode-aware dac_apply);
+// TC5 (this sampler) and TC3 are separate timers.
 //
-// Mode-bank registers (0x10-0x1A), dispatched only while MODE_COUNTER:
-//   0x10 CH_SEL       (rw)  channel 0..8 selected for the COUNT window
-//   0x11-0x14 COUNT   (r)   u32 of selected channel (coherent snapshot on 0x11)
-//   0x15-0x18 COUNT_RDCLR (r) same, but 0x15 also atomically zeroes the channel
-//   0x19 EDGE         (rw)  0=rising 1=falling 2=both for the selected channel
-//   0x1A CLEAR        (w)   0xFF -> zero all 9; else zero the selected channel
+// TC5 shares GCLK_ID 28 with TC4 (servo); TC4 idle here. 750 kHz tick (DIV64 off
+// the 48 MHz GCLK0), MFRQ wavegen (CC0=TOP, auto-reset), CC0 = 750000/rate.
+//
+// Mode-bank registers (read ALL counters in one transaction):
+//   0x10 READ      (w)  snapshot all counters -> shadow, reset DATA cursor
+//   0x11 READ_CLR  (w)  snapshot all + atomically zero all, reset DATA cursor
+//   0x12 DATA      (r)  stream the 36-byte shadow (9 x u32 LE), auto-incrementing
+//   0x13-0x14 ENABLE (r) u16 enable bitmap (bit ch = channel ch is a counter)
+//   0x1A CLEAR     (w)  0xFF -> zero all counters
+//   0x20-0x2C DAC bench tool (square-wave stimulus; when CH0/A0 is free)
+// `cntr` file: [VER=1, rate_lo, rate_hi, ch0..ch8]; each ch byte = bit0 enable,
+//   bits1-2 pull (0 none/1 up/2 down), bits3-4 edge (0 rise/1 fall/2 both).
 // ============================================================================
 #define COUNTER_CH_COUNT    9u
+#define CNTR_VERSION        1u
+#define COUNTER_RATE_MIN    50u
+#define COUNTER_RATE_MAX    10000u
+#define COUNTER_TICK_HZ     750000u     // 48 MHz / 64 (DIV64 prescaler)
 
-#define REG_COUNTER_CH_SEL      0x10u
-#define REG_COUNTER_COUNT0      0x11u   // 0x11..0x14 -> u32 bytes 0..3 (snapshot on 0x11)
-#define REG_COUNTER_COUNT3      0x14u
-#define REG_COUNTER_RDCLR0      0x15u   // 0x15..0x18 -> u32 bytes 0..3 (snapshot+clear on 0x15)
-#define REG_COUNTER_RDCLR3      0x18u
-#define REG_COUNTER_EDGE        0x19u
+#define REG_COUNTER_READ        0x10u
+#define REG_COUNTER_READCLR     0x11u
+#define REG_COUNTER_DATA        0x12u
+#define REG_COUNTER_ENABLE      0x13u   // 0x13 lo, 0x14 hi
 #define REG_COUNTER_CLEAR       0x1Au
 
 // Channel index -> (port group, pin). SAME pins as the servo bank.
@@ -2207,9 +2324,11 @@ static const struct { uint8_t group; uint8_t pin; } g_counter_pad[COUNTER_CH_COU
 
 static volatile uint32_t g_counter[COUNTER_CH_COUNT];   // running totals (ISR is sole writer)
 static uint16_t g_counter_last;                         // last sampled 9-bit level bitmap (bit ch)
-static uint8_t  g_counter_edge[COUNTER_CH_COUNT];       // 0=rising 1=falling 2=both (default rising)
-static uint32_t g_counter_shadow[COUNTER_CH_COUNT];     // coherent read snapshot (taken on byte 0)
-static uint8_t  g_counter_ch_sel;                       // selected channel for the COUNT window
+static uint8_t  g_counter_edge[COUNTER_CH_COUNT];       // 0=rising 1=falling 2=both
+static uint32_t g_counter_shadow[COUNTER_CH_COUNT];     // coherent read-all snapshot
+static uint16_t g_counter_enabled = 0x1FFu;             // bit ch = channel is a counter
+static uint8_t  g_counter_data_idx;                     // DATA stream cursor (0..35)
+static uint16_t g_counter_cc0 = 750u;                   // TC5 period (= 750000/rate); default 1 kHz
 
 static bool g_counter_tc_initialized;                   // TC5 GCLK/APBC wired once
 
@@ -2251,7 +2370,7 @@ static void counter_tc_start(void) {
     TC5->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16
                            | TC_CTRLA_WAVEGEN_MFRQ
                            | TC_CTRLA_PRESCALER_DIV64;
-    TC5->COUNT16.CC[0].reg = 750u;                                // 1 ms tick
+    TC5->COUNT16.CC[0].reg = g_counter_cc0;                       // CC0 = 750000/rate
     while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
 
     TC5->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;                    // clear stale
@@ -2262,33 +2381,83 @@ static void counter_tc_start(void) {
     while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { /* spin */ }
 }
 
-// Configure all 9 counter pins as GPIO inputs (no pull). Mirrors cmd_gpio_config's
-// input path (clear PMUXEN, DIRCLR, set INEN; clear PULLEN -> floating input).
-static void counter_pins_input(void) {
-    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
-        uint8_t g = g_counter_pad[ch].group, p = g_counter_pad[ch].pin;
-        PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
-        PORT->Group[g].DIRCLR.reg = (1u << p);
-        PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;          // input, no pull
-    }
+// Configure one counter pad as a GPIO input with the requested pull (0 none, 1
+// up, 2 down). On SAMD21 the pull direction is OUT (1=up/0=down) with PULLEN set.
+static void counter_pin_input(uint8_t g, uint8_t p, uint8_t pull) {
+    PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+    PORT->Group[g].DIRCLR.reg = (1u << p);
+    if (pull == 1u)      PORT->Group[g].OUTSET.reg = (1u << p);   // pull-up
+    else if (pull == 2u) PORT->Group[g].OUTCLR.reg = (1u << p);   // pull-down
+    PORT->Group[g].PINCFG[p].reg = (uint8_t)(PORT_PINCFG_INEN |
+                                   ((pull != 0u) ? PORT_PINCFG_PULLEN : 0u));
 }
 
-// Entering MODE_COUNTER: pins -> GPIO inputs, seed last-level (no phantom first
-// edge), zero counters + shadow, start TC5.
+// Apply the commissioned `cntr` file: enable bitmap, per-channel pull + edge, and
+// the bank-global update rate (-> TC5 CC0). No/short/bad file -> safe default
+// (all 9 enabled, no pull, rising, 1 kHz). Only ENABLED pads are driven as inputs;
+// the rest are left free for the bench tools (e.g. the DAC on A0/CH0).
+static void counter_apply_cfg(void) {
+    g_counter_enabled = 0x1FFu;
+    uint16_t rate = 1000u;
+    uint8_t  pull[COUNTER_CH_COUNT] = {0};
+    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) g_counter_edge[ch] = 0u;
+
+    int s = store_find_str("cntr");
+    if (s >= 0 && g_rec_len[s] >= 3u && g_rec_data[s][0] == CNTR_VERSION) {
+        const uint8_t* d = g_rec_data[s];
+        uint16_t len = g_rec_len[s];
+        rate = (uint16_t)(d[1] | ((uint16_t)d[2] << 8));
+        g_counter_enabled = 0u;
+        for (uint8_t ch = 0; ch < COUNTER_CH_COUNT && (3u + ch) < len; ch++) {
+            uint8_t b = d[3u + ch];
+            if (b & 1u) g_counter_enabled |= (uint16_t)(1u << ch);
+            pull[ch]           = (uint8_t)((b >> 1) & 3u);
+            g_counter_edge[ch] = (uint8_t)((b >> 3) & 3u);
+        }
+    }
+    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
+        if (g_counter_enabled & (uint16_t)(1u << ch))
+            counter_pin_input(g_counter_pad[ch].group, g_counter_pad[ch].pin, pull[ch]);
+    }
+    if (rate < COUNTER_RATE_MIN) rate = COUNTER_RATE_MIN;
+    if (rate > COUNTER_RATE_MAX) rate = COUNTER_RATE_MAX;
+    uint32_t cc0 = COUNTER_TICK_HZ / rate;
+    if (cc0 < 2u)     cc0 = 2u;
+    if (cc0 > 65535u) cc0 = 65535u;
+    g_counter_cc0 = (uint16_t)cc0;
+}
+
+// Entering MODE_COUNTER: apply the cntr config (enable/pull/edge/rate), seed the
+// last-level (no phantom first edge), zero counters + shadow, optionally bring up
+// the DAC bench tool on A0 (CH0) when CH0 isn't a counter, then start TC5.
 static void counter_enter(void) {
     counter_tc_init_once();
-    counter_pins_input();
+    counter_apply_cfg();
     g_counter_last = counter_sample_now();                       // seed: no edge on first tick
     for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
         g_counter[ch]        = 0u;
         g_counter_shadow[ch] = 0u;
     }
+    g_counter_data_idx = 0u;
+    if (!(g_counter_enabled & 0x1u)) {                           // CH0/A0 free -> DAC stimulus
+        dac_init();
+        PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;                 // route PA02 -> DAC
+        PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
+        DAC->CTRLB.bit.EOEN = 1;
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;
+        g_dds.active = false;
+        DAC->DATA.reg = g_dac_offset;
+    }
     counter_tc_start();
 }
 
-// Leaving MODE_COUNTER: stop TC5 (masks IRQ); pins stay inputs (safe).
+// Leaving MODE_COUNTER: stop TC5 + any DAC waveform (TC3); pins stay inputs (safe).
 static void counter_exit(void) {
     counter_tc_stop();
+    NVIC_DisableIRQ(TC3_IRQn);
+    g_dds.active = false;
+    tc3_stop();
 }
 
 // TC5 ISR — the 1 kHz sampler. Reads all 9 pins, detects edges vs the previous
@@ -2304,6 +2473,7 @@ void TC5_Handler(void) {
     uint16_t fell    = changed & (uint16_t)~now;  // 1 -> 0
     for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
         uint16_t bit = (uint16_t)(1u << ch);
+        if (!(g_counter_enabled & bit)) continue;                 // disabled pad -> not counted
         if ((g_counter_edge[ch] == 0u && (rose    & bit)) ||
             (g_counter_edge[ch] == 1u && (fell    & bit)) ||
             (g_counter_edge[ch] == 2u && (changed & bit)))
@@ -2312,58 +2482,47 @@ void TC5_Handler(void) {
     g_counter_last = now;
 }
 
-// COUNTER mode-bank register access (0x10-0x1A), dispatched only while MODE_COUNTER.
-// The u32 COUNT / COUNT_RDCLR windows are read as 4 consecutive byte addresses.
-// To avoid a torn u32 mid-read, byte 0 (0x11 / 0x15) takes a coherent snapshot of
-// the live counter into g_counter_shadow[sel] under a brief TC5-IRQ mask; bytes
-// 1..3 just return shadow bytes 1..3. RDCLR additionally zeroes the live counter
-// inside the same masked region (read-and-clear, no edges lost — edges between the
-// snapshot and the next ISR tick count toward the next read).
+// Coherent read-all: snapshot every live counter into the shadow under a brief
+// TC5-IRQ mask (optionally zeroing as we go), and reset the DATA stream cursor.
+// Edges between the snapshot and the next ISR tick count toward the next read.
+static void counter_snapshot(bool clear) {
+    NVIC_DisableIRQ(TC5_IRQn);
+    for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) {
+        g_counter_shadow[ch] = g_counter[ch];
+        if (clear) g_counter[ch] = 0u;
+    }
+    if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
+    g_counter_data_idx = 0u;
+}
+
+// COUNTER mode-bank register access, dispatched only while MODE_COUNTER. The Pico
+// triggers READ / READ_CLR (snapshot all), then streams the 36-byte shadow from
+// DATA (9 x u32 LE), one byte per read. DAC bench regs (0x20-0x2C) delegate out.
 static uint8_t counter_reg_read(uint8_t reg) {
-    uint8_t sel = (g_counter_ch_sel < COUNTER_CH_COUNT) ? g_counter_ch_sel : 0u;
     switch (reg) {
-    case REG_COUNTER_CH_SEL: return g_counter_ch_sel;
-    case REG_COUNTER_COUNT0:                                      // snapshot live -> shadow
-        NVIC_DisableIRQ(TC5_IRQn);
-        g_counter_shadow[sel] = g_counter[sel];
-        if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
-        return (uint8_t)g_counter_shadow[sel];
-    case 0x12u:              return (uint8_t)(g_counter_shadow[sel] >> 8);
-    case 0x13u:              return (uint8_t)(g_counter_shadow[sel] >> 16);
-    case REG_COUNTER_COUNT3: return (uint8_t)(g_counter_shadow[sel] >> 24);
-    case REG_COUNTER_RDCLR0:                                      // snapshot + atomic clear
-        NVIC_DisableIRQ(TC5_IRQn);
-        g_counter_shadow[sel] = g_counter[sel];
-        g_counter[sel]        = 0u;
-        if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
-        return (uint8_t)g_counter_shadow[sel];
-    case 0x16u:             return (uint8_t)(g_counter_shadow[sel] >> 8);
-    case 0x17u:             return (uint8_t)(g_counter_shadow[sel] >> 16);
-    case REG_COUNTER_RDCLR3:return (uint8_t)(g_counter_shadow[sel] >> 24);
-    case REG_COUNTER_EDGE:  return g_counter_edge[sel];
-    default:                return 0xFFu;                         // CLEAR is write-only
+    case REG_COUNTER_DATA: {                                     // stream the snapshot, auto-inc
+        uint8_t i = g_counter_data_idx;
+        if (i >= COUNTER_CH_COUNT * 4u) return 0xFFu;
+        g_counter_data_idx = (uint8_t)(i + 1u);
+        return (uint8_t)(g_counter_shadow[i >> 2] >> ((i & 3u) * 8u));
+    }
+    case REG_COUNTER_ENABLE:      return (uint8_t)g_counter_enabled;
+    case REG_COUNTER_ENABLE + 1u: return (uint8_t)(g_counter_enabled >> 8);
+    default: { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }   // DAC stimulus regs
     }
 }
 static void counter_reg_write(uint8_t reg, uint8_t val) {
-    uint8_t sel = (g_counter_ch_sel < COUNTER_CH_COUNT) ? g_counter_ch_sel : 0u;
     switch (reg) {
-    case REG_COUNTER_CH_SEL:
-        if (val < COUNTER_CH_COUNT) g_counter_ch_sel = val;      // out-of-range clamped (ignored)
-        break;
-    case REG_COUNTER_EDGE:
-        if (val > 2u) val = 2u;                                  // clamp to 0..2
-        g_counter_edge[sel] = val;
-        break;
-    case REG_COUNTER_CLEAR:                                      // 0xFF -> all; else selected
-        NVIC_DisableIRQ(TC5_IRQn);
+    case REG_COUNTER_READ:    counter_snapshot(false); break;    // read all
+    case REG_COUNTER_READCLR: counter_snapshot(true);  break;    // read + clear all
+    case REG_COUNTER_CLEAR:                                       // 0xFF -> zero all
         if (val == 0xFFu) {
+            NVIC_DisableIRQ(TC5_IRQn);
             for (uint8_t ch = 0; ch < COUNTER_CH_COUNT; ch++) g_counter[ch] = 0u;
-        } else {
-            g_counter[sel] = 0u;
+            if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
         }
-        if (g_counter_tc_initialized) NVIC_EnableIRQ(TC5_IRQn);
         break;
-    default: break;                                             // read-only / unimplemented ignored
+    default: dac_reg_write(reg, val); break;                     // DAC stimulus regs
     }
 }
 
@@ -2455,10 +2614,11 @@ static void mode_leave(uint8_t m) {
         DAC->CTRLB.bit.EOEN = 1;                    // restore DAC output buffer on PA02
         while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
     } else if (m == MODE_ADC) {                     // leaving ADC
-        NVIC_DisableIRQ(TC3_IRQn);                  // stop the DAC waveform generator
-        g_dac_wf.active = false;
-        tc3_stop();
+        adc_sampler_stop();                         // stop the tone-clocked sweep (TC3 + DDS off)
     } else if (m == MODE_MIXED) {                   // leaving MIXED
+        NVIC_DisableIRQ(TC3_IRQn);                  // stop any DAC waveform the bench tool ran
+        g_dds.active = false;
+        tc3_stop();
         mixed_il_disarm();                          // deassert INT, drop latch, release pins (safe)
     } else if (m == MODE_SERVO) {                   // leaving SERVO
         servo_exit();                               // stop TC4, drive all servo pins low
@@ -2483,6 +2643,14 @@ static void mode_enter(uint8_t m) {
         adc_mode_setup();                           // DIV16 sampler + window stats + DAC const
         adc_il_arm();                               // parse ilcf, claim D6 output, arm interlock
     } else if (m == MODE_MIXED) {                   // entering MIXED
+        dac_init();                                 // DAC bench source available in MIXED (A0->A1)
+        PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;    // route PA02 -> DAC (mode entry may have freed it)
+        PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
+        DAC->CTRLB.bit.EOEN = 1;
+        while (DAC->STATUS.bit.SYNCBUSY) { /* spin */ }
+        for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;  // idle: no waveform
+        g_dds.active = false;
+        DAC->DATA.reg = g_dac_offset;               // idle at the DC offset
         mixed_il_arm();                             // parse interlock_cfg, claim pins, set up INT
     } else if (m == MODE_SERVO) {                   // entering SERVO
         DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)

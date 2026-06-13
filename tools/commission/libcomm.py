@@ -284,7 +284,12 @@ class Dongle:
                 raise TimeoutError(
                     "no OP_SHELL_REPLY for request_id %d" % req_id
                 )
-            chunk = self._ser.read(256)
+            # Read exactly what's available (or block for 1 byte up to the serial
+            # timeout). A fixed read(256) would block for the FULL timeout on every
+            # call, since a reply is only ~14 bytes and pyserial waits for either
+            # `size` bytes or the timeout — that turned every round-trip into a ~1 s
+            # stall and made multi-op sequences look like hangs.
+            chunk = self._ser.read(max(1, self._ser.in_waiting))
             if not chunk:
                 continue
             for body in self._decoder.feed(chunk):
