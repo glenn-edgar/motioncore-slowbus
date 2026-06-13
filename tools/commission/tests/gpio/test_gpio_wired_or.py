@@ -3,7 +3,7 @@
 This is the point of open-drain outputs: several writers share one line, any of
 them pulling it low. Here one chip plays both writer and reader:
 
-    D8 = out:od  (the open-drain writer)
+    D8 = oc  (the open-drain writer)
     D0 = in:up   (reads the shared line; its pull-up is the line's pull-up)
 
 Jumper D8 <-> D0, then:
@@ -21,7 +21,7 @@ import slave_dsl
 def build():
     u = slave_dsl.Unit(0x20, "GPIO")
     u.pins(D0="in:up", D1="in:none", D2="in:none", D3="in:none",
-           D7="out:0", D8="out:od", D9="out:0", D10="out:0")
+           D7="out:0", D8="oc", D9="out:0", D10="out:0")
     return u
 
 

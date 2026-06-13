@@ -84,7 +84,9 @@ COUNTER_PULLS = {'none': 0, 'up': 1, 'down': 2}
 COUNTER_EDGES = {'rising': 0, 'falling': 1, 'both': 2}
 # Bench roles for spare (non-counter) pads -> firmware BENCH_ROLE_* value. The byte
 # stores (role << 1) with the enable bit clear. `dac` is hardware-limited to D0/A0.
-COUNTER_BENCH_ROLES = {'in': 1, 'out': 2, 'adc': 3, 'dac': 4}
+# `oc` = open-collector (6); `oc:up` (internal pull-up on release) = 7.
+COUNTER_BENCH_ROLES = {'in': 1, 'out': 2, 'adc': 3, 'dac': 4, 'oc': 6}
+BENCH_ROLE_OC, BENCH_ROLE_OC_PU = 6, 7
 COUNTER_RATE_MIN, COUNTER_RATE_MAX = 50, 10000   # Hz; max countable ~ rate/2
 
 # SERVO mode: a `srvo` config file [VER=1, role(CH0)..role(CH7)]; one role byte per
@@ -96,7 +98,7 @@ SERVO_PINS = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
 SERVO_PIN_IDX = {p: i for i, p in enumerate(SERVO_PINS)}
 SERVO_PIN_ALIAS = {'A0': 'D0', 'A1': 'D1', 'A2': 'D2', 'A3': 'D3',
                    'A7': 'D7', 'A8': 'D8', 'A9': 'D9', 'A10': 'D10'}
-SERVO_ROLES = {'in': 1, 'out': 2, 'adc': 3, 'dac': 4, 'servo': 5}
+SERVO_ROLES = {'in': 1, 'out': 2, 'adc': 3, 'dac': 4, 'servo': 5, 'oc': 6}
 
 ADC_FULLSCALE = 4095
 VREF_DEFAULT = 3.3                    # full-scale volts (INTVCC1 ref + GAIN=DIV2)
@@ -110,11 +112,26 @@ _OP_FROM_SYM = {'>': 'gt', '<': 'lt', '>=': 'ge', '<=': 'le', '==': 'eq', '!=': 
 _OP_INVERT = {'gt': 'le', 'le': 'gt', 'lt': 'ge', 'ge': 'lt', 'eq': 'ne', 'ne': 'eq'}
 
 _PULL_MODS = {'up', 'down'}
-_ROLE_BASES = {'in', 'out', 'adc', 'dac', 'count', 'servo'}
+_ROLE_BASES = {'in', 'out', 'adc', 'dac', 'count', 'servo', 'oc'}
 
 
 class DSLError(Exception):
     """Raised on any malformed unit definition or boolean expression."""
+
+
+def _bench_role_value(label, base, mods):
+    """Resolve a bench role base(+mods) to its firmware role byte. Only `oc` takes a
+    modifier -- `oc:up` (internal pull-up on release) = 7, plain `oc` = 6; every
+    other bench role takes no modifiers."""
+    if base == 'oc':
+        if not mods:
+            return BENCH_ROLE_OC
+        if mods == ['up']:
+            return BENCH_ROLE_OC_PU
+        raise DSLError("oc on %s: only the :up modifier is allowed, got %r" % (label, mods))
+    if mods:
+        raise DSLError("bench pin %s: role %r takes no modifiers, got %r" % (label, base, mods))
+    return COUNTER_BENCH_ROLES[base]
 
 
 # ---------------------------------------------------------------------------
@@ -568,14 +585,20 @@ class Unit:
             if base == 'out':
                 dir_bm |= bit
                 kind = mods[0] if mods else '0'
-                if kind == 'od':                       # open-drain, powers up released (Hi-Z)
-                    od_bm |= bit
-                    out_bm |= bit
-                elif kind in ('0', '1'):               # push-pull, drive level
+                if kind in ('0', '1'):                 # push-pull, drive level
                     if kind == '1':
                         out_bm |= bit
                 else:
-                    raise DSLError("output %s must be 0, 1 or od, got %r" % (pin, kind))
+                    raise DSLError("output %s must be 0 or 1 (open-collector is now 'oc'), got %r"
+                                   % (pin, kind))
+            elif base == 'oc':                         # open-collector: output, open-drain,
+                dir_bm |= bit                          # powers up released (Hi-Z, OUT=1)
+                od_bm  |= bit
+                out_bm |= bit
+                if mods == ['up']:                     # oc:up -> internal pull-up on release
+                    pullen_bm |= bit
+                elif mods:
+                    raise DSLError("oc on %s: only the :up modifier is allowed, got %r" % (pin, mods))
             elif base == 'in':
                 pull = mods[0] if mods else 'none'
                 if pull not in ('up', 'down', 'none'):
@@ -585,7 +608,7 @@ class Unit:
                     if pull == 'up':
                         out_bm |= bit
             else:
-                raise DSLError("GPIO pin %s: role %r not allowed (in/out only)" % (pin, base))
+                raise DSLError("GPIO pin %s: role %r not allowed (in / out / oc)" % (pin, base))
         intcfg = 0x01 if self.il else 0x00   # bit0: open-drain active-low INT enabled
         return bytes([GPMP_VERSION, dir_bm, pullen_bm, out_bm, od_bm, intcfg])
 
@@ -615,12 +638,10 @@ class Unit:
                                        "edge rising/falling/both)" % (label, m))
                 chbytes[idx] = (1 | (COUNTER_PULLS[pull] << 1) | (COUNTER_EDGES[edge] << 3))
             elif base in COUNTER_BENCH_ROLES:
-                if mods:
-                    raise DSLError("COUNTER bench pin %s: role %r takes no modifiers, got %r"
-                                   % (label, base, mods))
+                role = _bench_role_value(label, base, mods)      # handles oc / oc:up
                 if base == 'dac' and pin != 'D0':
                     raise DSLError("COUNTER pin %s: dac role is only on D0/A0 (the DAC pad)" % label)
-                chbytes[idx] = (COUNTER_BENCH_ROLES[base] << 1)   # enable bit 0 left clear
+                chbytes[idx] = (role << 1)                        # enable bit 0 left clear
             else:
                 raise DSLError("COUNTER pin %s: role %r must be count or a bench role %s"
                                % (label, base, sorted(COUNTER_BENCH_ROLES)))
@@ -643,11 +664,15 @@ class Unit:
             if base not in SERVO_ROLES:
                 raise DSLError("SERVO pin %s: role %r must be one of %s"
                                % (label, base, sorted(SERVO_ROLES)))
-            if mods:
-                raise DSLError("SERVO pin %s: role %r takes no modifiers, got %r" % (label, base, mods))
             if base == 'dac' and pin != 'D0':
                 raise DSLError("SERVO pin %s: dac role is only on D0/A0 (the DAC pad)" % label)
-            rolebytes[SERVO_PIN_IDX[pin]] = SERVO_ROLES[base]
+            if base == 'oc':
+                role = _bench_role_value(label, base, mods)      # oc / oc:up
+            elif mods:
+                raise DSLError("SERVO pin %s: role %r takes no modifiers, got %r" % (label, base, mods))
+            else:
+                role = SERVO_ROLES[base]
+            rolebytes[SERVO_PIN_IDX[pin]] = role
         return bytes([SRVO_VERSION] + rolebytes)
 
     def files(self):
@@ -857,16 +882,17 @@ def _selftest():
     assert fg['ilcf'] == b'off', fg['ilcf']
     assert fg['gpmp'] == bytes([2, 0xFF, 0x00, 0x00, 0x00, 0x00]), list(fg['gpmp'])
 
-    # 10. open-drain output (out:od): OD bit set, OUT=1 (released/Hi-Z) at boot
+    # 10. open-collector output (oc): OD bit set, OUT=1 (released/Hi-Z) at boot.
+    #     oc:up adds the internal pull-up (PULLEN bit) for that pad.
     u = Unit(0x20, 'GPIO')
     u.pins(D0='in:up', D1='in:none', D2='in:none', D3='in:none',
-           D7='out:0', D8='out:od', D9='out:1', D10='out:od')
+           D7='out:0', D8='oc', D9='out:1', D10='oc:up')
     g = u.gpmp()
     #  DIR  outputs D7,D8,D9,D10 = 0xF0
-    #  PULLEN D0 up = 0x01
-    #  OUT  D0(up) + D8,D10(od released) + D9(out:1) = bits 0,5,6,7 = 0xE1
+    #  PULLEN D0 up + D10 oc:up = bits 0,7 = 0x81
+    #  OUT  D0(up) + D8,D10(oc released) + D9(out:1) = bits 0,5,6,7 = 0xE1
     #  OD   D8,D10 = bits 5,7 = 0xA0
-    assert g == bytes([2, 0xF0, 0x01, 0xE1, 0xA0, 0x00]), list(g)
+    assert g == bytes([2, 0xF0, 0x81, 0xE1, 0xA0, 0x00]), list(g)
 
     # 11. ADC mode interlock: stream selectors (.stat.window) + default instantaneous
     u = Unit(0x30, 'ADC')

@@ -19,14 +19,14 @@ MODE_IDLE, MODE_GPIO, MODE_ADC, MODE_MIXED, MODE_SERVO, MODE_COUNTER = 0, 1, 2, 
 
 # GPIO expander: channel bitmap order (IODIR/GPIO/OLAT bit i = channel i).
 GPIO_CH = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
-G_IODIR, G_GPIO, G_OLAT = 0x10, 0x13, 0x14
+G_IODIR, G_GPPU, G_OLAT, G_GPIO, G_OD = 0x10, 0x11, 0x14, 0x13, 0x18
 
 # COUNTER/SERVO per-pin bench: Seeed pad index + the 0x15-0x1E registers.
 SEEED_IDX = {n: i for i, n in enumerate(
     ('D0', 'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D9', 'D10'))}
 B_SEL, B_GPO, B_GPI, B_STAT, B_ROLE = 0x15, 0x16, 0x17, 0x1D, 0x1E
 BENCH_OK, BENCH_BAD_PIN, BENCH_WRONG_ROLE, BENCH_UNSUPPORTED = 0, 1, 2, 3
-ROLE_NAME = {0: 'none', 1: 'in', 2: 'out', 3: 'adc', 4: 'dac'}
+ROLE_NAME = {0: 'none', 1: 'in', 2: 'out', 3: 'adc', 4: 'dac', 6: 'oc', 7: 'oc:up'}
 
 A_ALIAS = {'A0': 'D0', 'A1': 'D1', 'A2': 'D2', 'A3': 'D3', 'A6': 'D6',
            'A7': 'D7', 'A8': 'D8', 'A9': 'D9', 'A10': 'D10'}
@@ -69,7 +69,12 @@ class Bench:
                 return 'i2c'
             if p not in GPIO_CH:
                 raise BenchError("%s is not a GPIO channel" % p)
-            return 'in' if (self.dg.reg_read(G_IODIR) >> GPIO_CH.index(p)) & 1 else 'out'
+            bit = GPIO_CH.index(p)
+            if (self.dg.reg_read(G_IODIR) >> bit) & 1:
+                return 'in'
+            if (self.dg.reg_read(G_OD) >> bit) & 1:            # open-collector output
+                return 'oc:up' if (self.dg.reg_read(G_GPPU) >> bit) & 1 else 'oc'
+            return 'out'
         if self.mode in (MODE_COUNTER, MODE_SERVO):
             self.dg.reg_write(B_SEL, self._seeed(p))
             if self.dg.reg_read(B_STAT) == BENCH_BAD_PIN:
