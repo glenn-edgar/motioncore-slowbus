@@ -28,9 +28,10 @@ import slave_dsl                     # noqa: E402
 R = {
     "MODE":      0x02,
     "INT_FLAGS": 0x04,   # W1C; bit3 = ADC interlock trip
-    "CH_SEL":    0x10,   # ADC channel 0..7 (A1=0, A2=1, A3=2, D6=3, ...)
-    "WIN_SEL":   0x11,   # window 0 fast / 1 mid / 2 slow
+    "OVERRUN":   0x10,   # r: u8 saturating count of 16 kHz slots a conversion overran (~0)
+    "WIN_SEL":   0x11,   # downsample window 0=khz1 / 1=hz100 / 2=hz10
     "AVG":       0x18,   # u16 window average (block 0x12..0x1B = seq,min,max,avg,rms)
+    "LATEST":    0x1E,   # u16 most recent raw 16 kHz sample (instantaneous)
     "ILSTAT":    0x1C,   # interlock il_parse status (0 = armed)
     "ILSTATE":   0x1D,   # bit0 tripped, bit1 cond-ok, bit2 armed
     "DAC_T1_TYPE": 0x20, "DAC_T1_AMP": 0x21, "DAC_T1_FREQ": 0x23,  # tone 0
@@ -44,11 +45,11 @@ R = {
 # tone types
 T_OFF, T_CONST, T_SINE, T_SQUARE = 0, 1, 2, 3
 ADC_IL_INT_BIT = 0x08
-WIN = {"fast": 0, "mid": 1, "slow": 2}
-# Real window fill times at the measured ~125 Hz/channel sweep rate: fast (100
-# samples) ~0.8 s, mid (1000) ~8 s, slow (10000) ~80 s. A clean read after a DAC
-# step needs ~2 windows (flush the old + fill fresh), hence ~2x below.
-WIN_SETTLE = {0: 2.0, 1: 16.0, 2: 160.0}   # seconds to settle the tumbling window
+WIN = {"khz1": 0, "hz100": 1, "hz10": 2}
+# Window fill times at 16 kHz: khz1 (16 samples) 1 ms, hz100 (160) 10 ms, hz10
+# (1600) 100 ms. A clean read after a DAC step wants a couple of fresh windows;
+# the reg-read overhead dominates the short ones, so just give comfortable margins.
+WIN_SETTLE = {0: 0.1, 1: 0.1, 2: 0.4}      # seconds to settle the tumbling window
 
 
 def find_port():
@@ -101,21 +102,27 @@ def dac_apply(dg):
     dg.reg_write(R["DAC_APPLY"], 1)
 
 
-def read_avg(dg, ch=0, win=0):
-    dg.reg_write(R["CH_SEL"], ch)
+def read_avg(dg, win=0):
     dg.reg_write(R["WIN_SEL"], win)
     time.sleep(0.02)
     return dg.reg_read(R["AVG"]) | (dg.reg_read(R["AVG"] + 1) << 8)
 
 
-def read_stats(dg, ch=0, win=0):
-    """All four stats of the selected channel/window: min, max, avg, rms (counts)."""
-    dg.reg_write(R["CH_SEL"], ch)
+def read_stats(dg, win=0):
+    """All four stats of the selected window: min, max, avg, rms (AC-rms), in counts."""
     dg.reg_write(R["WIN_SEL"], win)
     time.sleep(0.02)
     def u16(base):
         return dg.reg_read(base) | (dg.reg_read(base + 1) << 8)
     return {"min": u16(0x14), "max": u16(0x16), "avg": u16(0x18), "rms": u16(0x1A)}
+
+
+def latest(dg):
+    return dg.reg_read(R["LATEST"]) | (dg.reg_read(R["LATEST"] + 1) << 8)
+
+
+def overrun(dg):
+    return dg.reg_read(R["OVERRUN"])
 
 
 def clear_trip(dg):
