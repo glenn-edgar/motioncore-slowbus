@@ -1298,6 +1298,75 @@ static void pio_int_assert(bool on) {
     }
 }
 
+// ============================================================================
+// Interlock trip freeze-frame — shared by PIO / ADC / MIXED.
+//
+// On the trip EDGE the active interlock latches the values that caused it: each
+// input's value (ADC counts, or 0/1 for GPIO) + role, and the safe value driven to
+// each output. The snapshot holds the FIRST trip until the interlock is reset (the
+// W1C INT_FLAGS write), then it clears. Only one interlock mode runs at a time, so
+// one global suffices. Exposed at mode-bank regs 0x30-0x38 (delegated from the
+// PIO/ADC/MIXED dispatch) — readable over I2C (Pico) and USB (CMD_REG_READ).
+//   0x30 VALID (r)   0x31 N_IN (r)   0x32 N_OUT (r)   0x33 SEL (w/r index)
+//   0x34 IN_ROLE (r 1=gpio 2=adc)    0x35/0x36 IN_VAL (r u16)
+//   0x37 OUT_PHYS (r)                0x38 OUT_VAL (r safe value driven)
+#define REG_ILSNAP_VALID    0x30u
+#define REG_ILSNAP_NIN      0x31u
+#define REG_ILSNAP_NOUT     0x32u
+#define REG_ILSNAP_SEL      0x33u
+#define REG_ILSNAP_IN_ROLE  0x34u
+#define REG_ILSNAP_IN_VAL   0x35u   // 0x35 lo, 0x36 hi
+#define REG_ILSNAP_OUT_PHYS 0x37u
+#define REG_ILSNAP_OUT_VAL  0x38u
+
+static struct {
+    bool     valid;
+    uint8_t  n_in, n_out;
+    uint16_t in[IL_MAX_INPUTS];          // value each input had at trip
+    uint8_t  in_role[IL_MAX_INPUTS];     // 1 = GPIO, 2 = ADC
+    uint8_t  out_phys[IL_MAX_OUTPUTS];
+    uint8_t  out_val[IL_MAX_OUTPUTS];    // safe value driven to each output at trip
+} g_il_snap;
+static uint8_t g_il_snap_sel;
+
+// Capture at the trip edge. vals[i] is the value of input i this tick (the same
+// array the watches were evaluated against). No-op if a snapshot is already held.
+static void il_snap_capture(const il_inst_t* inst, const uint16_t* vals) {
+    if (g_il_snap.valid) return;
+    g_il_snap.n_in  = (inst->input_count  > IL_MAX_INPUTS)  ? IL_MAX_INPUTS  : inst->input_count;
+    g_il_snap.n_out = (inst->output_count > IL_MAX_OUTPUTS) ? IL_MAX_OUTPUTS : inst->output_count;
+    for (uint8_t i = 0; i < g_il_snap.n_in; i++) {
+        g_il_snap.in[i] = vals[i];
+        il_pin_mode_t m = (il_pin_mode_t)inst->inputs[i].mode;
+        g_il_snap.in_role[i] = (m == IL_PIN_MODE_ADC || m == IL_PIN_MODE_ADC_STREAM) ? 2u : 1u;
+    }
+    for (uint8_t i = 0; i < g_il_snap.n_out; i++) {
+        g_il_snap.out_phys[i] = inst->outputs[i].phys_id;
+        g_il_snap.out_val[i]  = inst->outputs[i].err_value;
+    }
+    g_il_snap.valid = true;
+}
+static void il_snap_clear(void) { g_il_snap.valid = false; g_il_snap_sel = 0u; }
+
+static uint8_t il_snap_reg_read(uint8_t reg) {
+    uint8_t s = g_il_snap_sel;
+    switch (reg) {
+    case REG_ILSNAP_VALID:    return g_il_snap.valid ? 1u : 0u;
+    case REG_ILSNAP_NIN:      return g_il_snap.n_in;
+    case REG_ILSNAP_NOUT:     return g_il_snap.n_out;
+    case REG_ILSNAP_SEL:      return g_il_snap_sel;
+    case REG_ILSNAP_IN_ROLE:  return (s < g_il_snap.n_in) ? g_il_snap.in_role[s] : 0u;
+    case REG_ILSNAP_IN_VAL:   return (s < g_il_snap.n_in) ? (uint8_t)g_il_snap.in[s] : 0xFFu;
+    case REG_ILSNAP_IN_VAL+1u:return (s < g_il_snap.n_in) ? (uint8_t)(g_il_snap.in[s] >> 8) : 0xFFu;
+    case REG_ILSNAP_OUT_PHYS: return (s < g_il_snap.n_out) ? g_il_snap.out_phys[s] : 0xFFu;
+    case REG_ILSNAP_OUT_VAL:  return (s < g_il_snap.n_out) ? g_il_snap.out_val[s] : 0xFFu;
+    default:                  return 0xFFu;
+    }
+}
+static void il_snap_reg_write(uint8_t reg, uint8_t val) {
+    if (reg == REG_ILSNAP_SEL) g_il_snap_sel = val;   // index into inputs/outputs
+}
+
 static bool pio_watch_pass(const il_watch_t* w) {
     uint16_t v = pio_phys_read(g_pio_il.inputs[w->input_idx].phys_id);   // digital 0/1
     switch (w->op) {
@@ -1316,6 +1385,7 @@ static void pio_il_drive_safe(void) {                   // force out_err pins to
 }
 // Arm from the interlock_cfg record; set up INT pin (D10 output, deasserted).
 static void pio_il_arm(void) {
+    il_snap_clear();                        // fresh arm: no stale freeze-frame
     g_pio_il_valid = false; g_pio_il_tripped = false;
     PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN;
     PORT->Group[PIO_INT_GROUP].DIRCLR.reg = (1u << PIO_INT_PIN);   // open-drain INT: Hi-Z idle
@@ -1345,6 +1415,10 @@ static void pio_il_tick(void) {             // run from i2c_store_service (super
         if (!all_pass) {                                     // a watch failed -> TRIP (latched)
             g_pio_il_tripped = true;
             g_int_flags |= 0x01u;
+            uint16_t vals[IL_MAX_INPUTS] = {0};              // freeze the input levels
+            for (uint8_t i = 0; i < g_pio_il.input_count && i < IL_MAX_INPUTS; i++)
+                vals[i] = pio_phys_read(g_pio_il.inputs[i].phys_id);
+            il_snap_capture(&g_pio_il, vals);
             pio_il_drive_safe();
             pio_int_assert(true);
         }
@@ -1357,6 +1431,7 @@ static void pio_il_tick(void) {             // run from i2c_store_service (super
 static void pio_il_manual_reset(void) {
     if (!g_pio_il_tripped) return;
     g_pio_il_tripped = false;
+    il_snap_clear();                        // drop the trip freeze-frame
     pio_int_assert(false);
     pio_update_outputs();                   // restore master OLAT on the freed output pins
 }
@@ -1623,6 +1698,7 @@ static void adc_il_drive(bool ok) {                          // drive every outp
     }
 }
 static void adc_il_arm(void) {
+    il_snap_clear();                        // fresh arm: no stale freeze-frame
     g_adc_il_valid = false; g_adc_il_tripped = false; g_adc_il_state = 0u;
     int ils = store_find_str("ilcf");
     if (ils < 0) { g_adc_il_pstat = 0xFFu; return; }
@@ -1648,6 +1724,10 @@ static void adc_il_tick(void) {
     if (!g_adc_il_tripped && !all_pass) {                    // first failure -> latch trip
         g_adc_il_tripped = true;
         g_int_flags |= ADC_IL_INT_BIT;
+        uint16_t vals[IL_MAX_INPUTS] = {0};                 // freeze the stream values
+        for (uint8_t i = 0; i < g_adc_il.input_count && i < IL_MAX_INPUTS; i++)
+            vals[i] = adc_stream_value(&g_adc_il.inputs[i]);
+        il_snap_capture(&g_adc_il, vals);
     }
     adc_il_drive(!g_adc_il_tripped);                         // ok while safe, err (safe) once tripped
 }
@@ -1656,6 +1736,7 @@ static void adc_il_tick(void) {
 static void adc_il_manual_reset(void) {
     if (!g_adc_il_tripped) return;
     g_adc_il_tripped = false;
+    il_snap_clear();                                        // drop the trip freeze-frame
     adc_il_drive(true);
 }
 
@@ -1878,6 +1959,7 @@ fail:
 // Arm from the interlock_cfg record; set up the D6/PB08 INT pin (output, deasserted)
 // and claim the declared pins. Mirrors pio_il_arm().
 static void mixed_il_arm(void) {
+    il_snap_clear();                        // fresh arm: no stale freeze-frame
     g_mixed_il_valid = false; g_mixed_il_tripped = false;
     // INT pin = D6 = PB08 (same as PIO): drive low (deasserted), keep INEN for read-back.
     PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN;
@@ -1915,6 +1997,7 @@ static void mixed_il_disarm(void) {
 static void mixed_il_manual_reset(void) {
     if (!g_mixed_il_tripped) return;
     g_mixed_il_tripped = false;
+    il_snap_clear();                        // drop the trip freeze-frame
     pio_int_assert(false);
     // Restore each output to its ok value (drop the safe override).
     for (uint8_t i = 0; i < g_mixed_il.output_count; i++)
@@ -1976,6 +2059,7 @@ static void mixed_tick(void) {
         if (!all_pass) {                                     // a watch failed -> TRIP (latched)
             g_mixed_il_tripped = true;
             g_int_flags |= MIXED_IL_INT_BIT;
+            il_snap_capture(&g_mixed_il, vals);              // freeze inputs + outputs
             mixed_il_drive_safe();
             pio_int_assert(true);
         }
@@ -2806,6 +2890,9 @@ static void counter_reg_write(uint8_t reg, uint8_t val) {
 // Register read dispatch (control bank). Out-of-range -> 0xFF.
 static uint8_t i2c_reg_read(uint8_t reg) {
     if (reg >= 0x10u && reg <= 0x3Fu) {                  // mode bank — interpreted per active mode
+        if (reg >= REG_ILSNAP_VALID &&                   // 0x30-0x3F: shared trip freeze-frame
+            (g_mode == MODE_PIO || g_mode == MODE_ADC || g_mode == MODE_MIXED))
+            return il_snap_reg_read(reg);
         if (g_mode == MODE_PIO) return pio_reg_read(reg);
         if (g_mode == MODE_ADC) return adc_reg_read(reg);
         if (g_mode == MODE_MIXED) return mixed_reg_read(reg);
@@ -2983,7 +3070,10 @@ void mode_go_offline(void) {
 // Register write dispatch. Read-only / unimplemented regs are ignored.
 static void i2c_reg_write(uint8_t reg, uint8_t val) {
     if (reg >= 0x10u && reg <= 0x3Fu) {                  // mode bank — interpreted per active mode
-        if (g_mode == MODE_PIO) pio_reg_write(reg, val);
+        if (reg >= REG_ILSNAP_VALID &&                   // 0x30-0x3F: shared trip freeze-frame
+            (g_mode == MODE_PIO || g_mode == MODE_ADC || g_mode == MODE_MIXED))
+            il_snap_reg_write(reg, val);
+        else if (g_mode == MODE_PIO) pio_reg_write(reg, val);
         else if (g_mode == MODE_ADC) adc_reg_write(reg, val);
         else if (g_mode == MODE_MIXED) mixed_reg_write(reg, val);
         else if (g_mode == MODE_SERVO) servo_reg_write(reg, val);

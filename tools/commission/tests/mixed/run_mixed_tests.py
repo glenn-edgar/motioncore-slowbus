@@ -10,7 +10,7 @@ REQUIRES the A0->A1 DAC jumper (the DAC is the controllable ADC source).
 import importlib
 import sys
 
-TESTS = ["test_mixed_interlock"]
+TESTS = ["test_mixed_interlock", "test_mixed_trip"]
 
 
 def main():
