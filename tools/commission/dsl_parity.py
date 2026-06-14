@@ -64,18 +64,30 @@ def lua_compile(cfg):
     return out
 
 
+# Under the coverage rule, EVERY configurable pad for the mode must be declared
+# (a real role or `safe` to hold it Hi-Z). D4/D5 = I2C; D6 = INT (GPIO/MIXED/ADC),
+# e-stop (SERVO) or a free pad (COUNTER). ADC also reserves D0/D1.
 CONFIGS = [
     ("gpio", {"i2c": 0x20, "mode": "GPIO",
               "pins": {"D0": "in:up", "D1": "in:down", "D2": "in:up", "D3": "in:none",
                        "D7": "out:0", "D8": "out:0", "D9": "out:1", "D10": "out:0"},
               "interlock": {"name": "safe", "expr": "(D0 && D1) && (D2 || D3)", "drive": {"D8": 1}}}),
-    ("adc", {"i2c": 0x21, "mode": "ADC", "pins": {"D6": "oc"},
+    ("adc", {"i2c": 0x21, "mode": "ADC",
+             "pins": {"D2": "safe", "D3": "safe", "D7": "safe", "D8": "safe",
+                      "D9": "safe", "D10": "safe"},
              "interlock": {"name": "rms", "expr": "A1.avg.hz100 > 2.0V", "drive": {"D6": 1}}}),
     ("mixed", {"i2c": 0x22, "mode": "MIXED",
-               "pins": {"A1": "adc", "D8": "in:up", "D6": "out"},
-               "interlock": {"name": "mix", "expr": "A1 > 2.0V && D8", "drive": {"D6": 1}}}),
+               "pins": {"D0": "safe", "D1": "safe", "D2": "safe", "D3": "safe",
+                        "D7": "out", "D8": "in:up", "D9": "safe", "D10": "safe"},
+               "interlock": {"name": "mix", "expr": "D8", "drive": {"D7": 1}}}),
     ("counter", {"i2c": 0x23, "mode": "COUNTER", "rate": 1000,
-                 "pins": {"D2": "count:up:rising", "A0": "dac", "D1": "adc", "D9": "out", "D10": "in"}}),
+                 "pins": {"D2": "count:up:rising", "A0": "dac", "D1": "adc", "D9": "out",
+                          "D10": "in", "D3": "safe", "D7": "safe",
+                          "D8": "safe", "D6": "safe"}}),
+    # SERVO: servo channels + bench roles + safe; D6 = e-stop (not declared)
+    ("servo", {"i2c": 0x24, "mode": "SERVO",
+               "pins": {"D0": "servo", "D1": "servo", "D2": "adc", "D3": "out",
+                        "D7": "oc:up", "D8": "safe", "D9": "safe", "D10": "safe"}}),
     # edge cases -----------------------------------------------------------
     ("gpio_no_il", {"i2c": 0x20, "mode": "GPIO",
                     "pins": {"D0": "in:up", "D1": "in:up", "D2": "in:up", "D3": "in:up",
@@ -84,15 +96,48 @@ CONFIGS = [
                      "pins": {"D0": "in:up", "D1": "in:up", "D2": "in:none", "D3": "in:none",
                               "D7": "out:0", "D8": "oc", "D9": "out:1", "D10": "out:0"},
                      "interlock": {"name": "n", "expr": "~D0 || (D1 && ~D2)", "drive": {"D8": 1, "D7": 0}}}),
-    ("adc_dnf", {"i2c": 0x21, "mode": "ADC", "pins": {"D6": "oc"},
+    # GPIO with a `safe` (Hi-Z) pad
+    ("gpio_safe", {"i2c": 0x20, "mode": "GPIO",
+                   "pins": {"D0": "in:up", "D1": "safe", "D2": "in:none", "D3": "in:down",
+                            "D7": "out:0", "D8": "out:1", "D9": "oc:up", "D10": "safe"},
+                   "interlock": {"name": "g", "expr": "D0 && ~D2", "drive": {"D7": 1}}}),
+    ("adc_dnf", {"i2c": 0x21, "mode": "ADC",
+                 "pins": {"D2": "safe", "D3": "safe", "D7": "safe", "D8": "safe",
+                          "D9": "safe", "D10": "safe"},
                  "interlock": {"name": "t", "expr": "A1.avg.hz100 > 1.0V && A1.avg.hz100 < 3.0V",
                                "drive": {"D6": 1}}}),
-    ("mixed_deb", {"i2c": 0x22, "mode": "MIXED",
-                   "pins": {"A1": "adc", "D8": "in:up:debounce_50ms", "D6": "oc"},
-                   "interlock": {"name": "s", "expr": "A1 > 1.5V && D8", "drive": {"D6": 1}}}),
+    # MIXED mxmp: a mix of roles incl. dac on D0, an in:up:debounce_50ms, safe pads;
+    # the interlock watches D8 and drives the oc pin D7.
+    ("mixed_mxmp", {"i2c": 0x22, "mode": "MIXED",
+                    "pins": {"D0": "dac", "A1": "adc", "D2": "out", "D3": "oc",
+                             "D7": "oc:up", "D8": "in:up:debounce_50ms", "D9": "in:down",
+                             "D10": "safe"},
+                    "interlock": {"name": "s", "expr": "A1 > 1.5V && D8", "drive": {"D7": 1}}}),
+    # MIXED dac on D0 + plain safe everywhere else, no interlock
+    ("mixed_dac", {"i2c": 0x22, "mode": "MIXED",
+                   "pins": {"D0": "dac", "D1": "safe", "D2": "safe", "D3": "safe",
+                            "D7": "safe", "D8": "safe", "D9": "safe", "D10": "safe"}}),
     ("counter_multi", {"i2c": 0x23, "mode": "COUNTER", "rate": 2000,
                        "pins": {"D0": "count:up:rising", "D2": "count:down:both",
-                                "D3": "count:none:falling", "D7": "out", "D1": "adc"}}),
+                                "D3": "count:none:falling", "D7": "out", "D1": "adc",
+                                "D8": "safe", "D9": "safe", "D10": "safe", "D6": "count:up"}}),
+]
+
+# Configs that MUST raise DSLError in BOTH Python and Lua.
+ERROR_CONFIGS = [
+    # D6 is the interlock/INT output in GPIO -- not a configurable pad
+    ("err_gpio_d6", {"i2c": 0x20, "mode": "GPIO",
+                     "pins": {"D0": "in:up", "D1": "in:up", "D2": "in:up", "D3": "in:up",
+                              "D6": "out:0", "D7": "out:0", "D8": "out:0", "D9": "out:0",
+                              "D10": "out:0"}}),
+    # dac is only on D0/A0 in MIXED
+    ("err_mixed_dac", {"i2c": 0x22, "mode": "MIXED",
+                       "pins": {"D0": "safe", "D1": "safe", "D2": "dac", "D3": "safe",
+                                "D7": "safe", "D8": "safe", "D9": "safe", "D10": "safe"}}),
+    # missing pad: D10 unassigned -> coverage error
+    ("err_missing_pad", {"i2c": 0x20, "mode": "GPIO",
+                         "pins": {"D0": "in:up", "D1": "in:up", "D2": "in:up", "D3": "in:up",
+                                  "D7": "out:0", "D8": "out:0", "D9": "out:0"}}),
 ]
 
 
@@ -117,6 +162,21 @@ def main():
                     print("      %-5s py=%s" % (k, py.get(k)))
                     print("      %-5s lua=%s" % (k, lua.get(k)))
             nfail += 1
+
+    # expected-error configs: BOTH sides must reject (Python raises, Lua _ERROR)
+    for name, cfg in ERROR_CONFIGS:
+        py_err = lua_err = False
+        try:
+            py_compile(cfg)
+        except Exception:
+            py_err = True
+        lua = lua_compile(cfg)
+        lua_err = "_ERROR" in lua
+        if py_err and lua_err:
+            print("  %-14s OK  (both reject)" % name); npass += 1
+        else:
+            print("  %-14s MISMATCH py_err=%s lua_err=%s" % (name, py_err, lua_err)); nfail += 1
+
     print("\n%d/%d configs byte-identical" % (npass, npass + nfail))
     sys.exit(0 if nfail == 0 else 1)
 
