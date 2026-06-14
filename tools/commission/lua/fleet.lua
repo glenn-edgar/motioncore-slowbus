@@ -13,9 +13,10 @@
 
 local _dir = (debug.getinfo(1, "S").source:sub(2)):match("(.*/)") or "./"
 package.path = _dir .. "?.lua;" .. package.path
-local ndb  = require("namespace_db")
-local Link = require("link")
-local lc   = require("libcomm")
+local ndb   = require("namespace_db")
+local Link  = require("link")
+local lc    = require("libcomm")
+local Bench = require("bench")
 
 local Fleet = {}
 Fleet.__index = Fleet
@@ -45,6 +46,7 @@ function Fleet:write(path, reg, val) return self:link(path):reg_write(reg, val) 
 function Fleet:mode(path)            return self:link(path):mode() end
 function Fleet:status(path)          return self:link(path):status() end
 function Fleet:int_line(path)        return self:link(path):reg_read(0x3A) end   -- D6 interlock line
+function Fleet:bench(path)           return Bench.new(self:link(path)) end       -- per-pin bench by name
 
 -- roster + reconcile: every DEV node, its binding, and live presence.
 function Fleet:roster()
