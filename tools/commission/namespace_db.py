@@ -34,8 +34,21 @@ Locked-in rules (see the design discussion):
 
 import json
 import os
-import sqlite3
 import sys
+
+# Bring our own modern SQLite where available -- pysqlite3 statically bundles a
+# recent SQLite amalgamation, the same way we vendor ltree.so. It shadows the
+# stdlib sqlite3 (DB-API compatible) and supports loadable extensions, so ltree
+# loads into it identically. Guarantees the JSONB / >= 3.45 path everywhere
+# (dongle container == standalone) without depending on the host's sqlite. If
+# absent, we fall back to the host's stdlib sqlite3 and the version gate selects
+# the TEXT-json path -- so it always runs; pysqlite3 just makes it uniform.
+try:
+    import pysqlite3.dbapi2 as sqlite3
+    SQLITE_SOURCE = "pysqlite3"
+except ImportError:
+    import sqlite3
+    SQLITE_SOURCE = "stdlib"
 
 # -- vendored ltree extension (same artifact config_tree.py uses) ------------
 _VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
@@ -94,11 +107,15 @@ class NamespaceDB:
         self._db = sqlite3.connect(db_path)
         self._db.row_factory = sqlite3.Row
 
-        # JSONB version gate (locked-in rule #1).
+        # JSONB version gate (locked-in rule #1). Real floor is 3.18 (json_patch,
+        # the deepest function used); 3.45 adds the binary jsonb format. A modern
+        # sqlite (the dongle container) stores binary JSONB; an older one (e.g. a
+        # stock Raspberry Pi's 3.34.1) stores TEXT json -- same queries, auto-
+        # selected, invisible to callers. Standalone == container at this layer.
         v = _ver_tuple(sqlite3.sqlite_version)
-        if v < (3, 38, 0):
+        if v < (3, 18, 0):
             raise NamespaceError(
-                "SQLite %s too old: JSON1 needs >= 3.38" % sqlite3.sqlite_version)
+                "SQLite %s too old: json_patch needs >= 3.18" % sqlite3.sqlite_version)
         self.jsonb = v >= (3, 45, 0)
         self._jfn = "jsonb" if self.jsonb else "json"   # writer; reader is always json()
 
