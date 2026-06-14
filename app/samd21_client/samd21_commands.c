@@ -1969,6 +1969,16 @@ static uint8_t   g_mixed_gpio_raw;                 // raw-level bitmap (bit i = 
 static uint8_t   g_mixed_gpio_deb;                 // debounced bitmap (bit i = input i)
 static uint32_t  g_mixed_next_ms;                  // ~100 Hz tick gate
 
+// mxmp — the MIXED fixed pin-map (commissioned file "mxmp"), applied at mode entry
+// and ENFORCED (the I2C master is read-only). One padbyte per configurable pad in
+// g_pio_ch order (D0,D1,D2,D3,D7,D8,D9,D10; D6 = INT, not here): role low-nibble,
+// debounce depth high-nibble. The interlock operates WITHIN this pin environment.
+#define MXMP_VERSION 1u
+enum { MXMP_SAFE = 0u, MXMP_IN, MXMP_IN_PU, MXMP_IN_PD, MXMP_OUT, MXMP_OC, MXMP_OC_PU, MXMP_ADC, MXMP_DAC };
+static uint8_t g_mxmp_role[8];                      // per MIXED pad, applied + cached for the interlock
+static uint8_t g_mxmp_deb[8];                       // per-pad debounce depth (in-roles; 0 = none, else 2..15)
+static bool    g_mixed_dac_en;                      // D0 role == dac -> the DAC bank (0x20-0x2C) is live
+
 // Compare one watch against a freshly-read input value. Same op switch as
 // eval_slot()/pio_watch_pass(); `v` is the debounced level (GPIO) or 16x ADC
 // value (ADC), already selected by the caller.
@@ -2175,13 +2185,17 @@ static uint8_t mixed_reg_read(uint8_t reg) {
     case REG_MIXED_GPIO_DEB: return g_mixed_gpio_deb;
     case REG_MIXED_ILSTATE:  return g_mixed_il_state;
     case REG_MIXED_ILSTAT:   return g_mixed_il_pstat;
-    default: { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }   // DAC bench regs (A0->A1 source)
+    default:                                                 // DAC bench regs (A0->A1 source)
+        if (!g_mixed_dac_en) return 0xFFu;                   // gated: D0 not commissioned `dac`
+        { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }
     }
 }
 static void mixed_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case REG_MIXED_CH_SEL: if (val < IL_MAX_INPUTS) g_mixed_ch_sel = val; break;
-    default: dac_reg_write(reg, val); break;                 // DAC bench regs (test source)
+    default:                                                 // DAC bench regs (test source)
+        if (g_mixed_dac_en) dac_reg_write(reg, val);         // gated: ignored unless D0 = `dac`
+        break;
     }
 }
 
@@ -3096,6 +3110,80 @@ static void file_list_advance(bool from_start) {
 // and the offline transition (which leaves the active mode then tri-states).
 // ============================================================================
 
+// Drive one MIXED pad to the true safe state: Hi-Z, input buffer + pull OFF. This
+// is the ACTIVE safe (not reliant on the power-on reset default), so a `safe` pad
+// — or a runtime mode switch — never leaves a pad driven.
+static void mxmp_pad_safe(uint8_t g, uint8_t p) {
+    PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+    PORT->Group[g].DIRCLR.reg           = (1u << p);
+    PORT->Group[g].OUTCLR.reg           = (1u << p);
+    PORT->Group[g].PINCFG[p].reg        = 0u;              // INEN=0, PULLEN=0 -> true Hi-Z
+}
+
+// Apply the commissioned MIXED pin-map ("mxmp") to the 8 configurable pads, ONCE at
+// mode entry. Every pad gets an explicit hardware state from the file; absent/short/
+// bad-version -> every pad safe (Hi-Z). D6 (INT) is owned by mixed_il_arm, not here.
+// Records the per-pad role/debounce for the interlock and sets the DAC gate.
+static void mxmp_apply(void) {
+    g_mixed_dac_en = false;
+    int s = store_find_str("mxmp");
+    const uint8_t *d = (s >= 0) ? g_rec_data[s] : NULL;
+    bool ok = (d && g_rec_len[s] >= 9u && d[0] == MXMP_VERSION);
+    for (uint8_t i = 0; i < 8u; i++) {
+        uint8_t g = g_pio_ch[i].group, p = g_pio_ch[i].pin;
+        uint8_t role = MXMP_SAFE, deb = 0u;
+        if (ok) { uint8_t b = d[1u + i]; role = (uint8_t)(b & 0x0Fu); deb = (uint8_t)((b >> 4) & 0x0Fu); }
+        g_mxmp_role[i] = role; g_mxmp_deb[i] = deb;
+        switch (role) {
+        case MXMP_IN:                                          // input, no pull
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
+            break;
+        case MXMP_IN_PU:                                       // input, pull-up
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].OUTSET.reg = (1u << p);             // OUT=1 -> pull-up direction
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+            break;
+        case MXMP_IN_PD:                                       // input, pull-down
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].OUTCLR.reg = (1u << p);             // OUT=0 -> pull-down direction
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+            break;
+        case MXMP_OUT:                                         // push-pull output, idle low
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].OUTCLR.reg = (1u << p);
+            PORT->Group[g].DIRSET.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;   // INEN for read-back
+            break;
+        case MXMP_OC:                                          // open-collector: Hi-Z idle, ext pull-up
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
+            break;
+        case MXMP_OC_PU:                                       // open-collector: Hi-Z idle, internal pull-up
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].OUTSET.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+            break;
+        case MXMP_ADC:                                         // analog input
+            adc_init();
+            adc_pin_config(g, p);                              // PMUX -> analog
+            break;
+        case MXMP_DAC:                                         // D0 only: DAC source (routed in mode_enter)
+            g_mixed_dac_en = true;
+            break;
+        case MXMP_SAFE:
+        default:
+            mxmp_pad_safe(g, p);
+            break;
+        }
+    }
+}
+
 // "leaving m" — undo whatever mode_enter(m) set up. IDLE = no-op.
 static void mode_leave(uint8_t m) {
     if (m == MODE_PIO) {                            // leaving PIO
@@ -3134,15 +3222,21 @@ static void mode_enter(uint8_t m) {
         adc_mode_setup();                           // DIV16 sampler + window stats + DAC const
         adc_il_arm();                               // parse ilcf, claim D6 output, arm interlock
     } else if (m == MODE_MIXED) {                   // entering MIXED
-        dac_init();                                 // DAC bench source available in MIXED (A0->A1)
-        PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;    // route PA02 -> DAC (mode entry may have freed it)
-        PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
-        DAC->CTRLB.bit.EOEN = 1;
-        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
-        for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;  // idle: no waveform
-        g_dds.active = false;
-        DAC->DATA.reg = g_dac_offset;               // idle at the DC offset
-        mixed_il_arm();                             // parse interlock_cfg, claim pins, set up INT
+        mxmp_apply();                               // fixed pin-map: configure all 8 pads + set DAC gate
+        if (g_mixed_dac_en) {                       // D0 commissioned `dac` -> bring up the DAC source
+            dac_init();                             // (A0->A1 two-tone bench), route PA02 -> DAC
+            PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;
+            PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
+            DAC->CTRLB.bit.EOEN = 1;
+            BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
+            for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;  // idle: no waveform
+            g_dds.active = false;
+            DAC->DATA.reg = g_dac_offset;           // idle at the DC offset
+        } else {                                    // D0 not `dac` -> release the DAC so mxmp owns PA02
+            DAC->CTRLB.bit.EOEN = 0;
+            BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
+        }
+        mixed_il_arm();                             // interlock operates WITHIN the mxmp pin environment
     } else if (m == MODE_SERVO) {                   // entering SERVO
         DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)
         BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
