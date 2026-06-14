@@ -28,6 +28,7 @@ ffi.cdef [[
 ]]
 local C = ffi.C
 local O_RDWR, O_NOCTTY, TCSANOW, B115200, POLLIN = 0x0002, 0x100, 0, 4098, 0x001
+local O_NONBLOCK = 0x800   -- so open() never blocks on a wedged CDC (no carrier); reads use poll
 local VMIN, VTIME = 6, 5
 
 local M = {}
@@ -140,7 +141,7 @@ local function now_ms()
 end
 
 function M.open(port, timeout)
-    local fd = C.open(port, bit.bor(O_RDWR, O_NOCTTY))
+    local fd = C.open(port, bit.bor(O_RDWR, O_NOCTTY, O_NONBLOCK))
     if fd < 0 then error("open(" .. port .. "): " .. ffi.string(C.strerror(ffi.errno()))) end
     local tio = ffi.new("struct termios")
     C.tcgetattr(fd, tio); C.cfmakeraw(tio); C.cfsetspeed(tio, B115200)
@@ -156,7 +157,7 @@ function Dongle:close() if self.fd and self.fd >= 0 then C.close(self.fd); self.
 -- 1200-baud touch: open the port at B1200 and close it -- the running app (if it
 -- has the handler) jumps to the UF2 bootloader. No-op if the app lacks it.
 function M.touch_1200(port)
-    local fd = C.open(port, bit.bor(O_RDWR, O_NOCTTY))
+    local fd = C.open(port, bit.bor(O_RDWR, O_NOCTTY, O_NONBLOCK))
     if fd < 0 then return false end
     local tio = ffi.new("struct termios")
     C.tcgetattr(fd, tio); C.cfmakeraw(tio); C.cfsetspeed(tio, 9)   -- 9 = B1200
@@ -171,7 +172,8 @@ function M.sleep(s) C.usleep(math.floor(s * 1e6)) end
 local _rbuf = ffi.new("uint8_t[?]", 1024)
 function Dongle:_drain()
     local pfd = ffi.new("struct pollfd[1]"); pfd[0].fd = self.fd; pfd[0].events = POLLIN
-    while C.poll(pfd, 1, 0) > 0 do
+    for _ = 1, 64 do                        -- BOUNDED: a wedged/streaming chip would
+        if C.poll(pfd, 1, 0) <= 0 then break end          -- otherwise loop forever here
         if tonumber(C.read(self.fd, _rbuf, 1024)) <= 0 then break end
     end
 end
