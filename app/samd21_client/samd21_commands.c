@@ -1342,7 +1342,12 @@ static void pio_int_assert(bool on) {
         PORT->Group[PIO_INT_GROUP].OUTCLR.reg = m;   // drive low
         PORT->Group[PIO_INT_GROUP].DIRSET.reg = m;
     } else {
-        PORT->Group[PIO_INT_GROUP].DIRCLR.reg = m;   // release: Hi-Z
+        // release: input + internal pull-up so the active-low INT idles HIGH and
+        // reads cleanly via REG_ILSNAP_INT_LIVE (parallels an external bus pull-up;
+        // a remote wired-OR node can still pull the line low).
+        PORT->Group[PIO_INT_GROUP].DIRCLR.reg = m;
+        PORT->Group[PIO_INT_GROUP].OUTSET.reg = m;   // OUT=1 -> pull-up direction
+        PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
     }
 }
 
@@ -1361,6 +1366,9 @@ static void pio_int_assert(bool on) {
 //   0x39 OUT_LIVE (r): the selected output pin's LIVE physical level (read-back).
 //        Open-collector outputs keep INEN on, so this confirms what is actually on
 //        the pin (e.g. an `oc` D6 driven low on trip reads 0) -- no jumper needed.
+//   0x3A INT_LIVE (r): the D6/PB08 interlock INT line's LIVE level (1=high/released,
+//        0=low/asserted). The interlock DRIVES D6; this lets the master READ it --
+//        the live wired-OR interlock-line state, in GPIO/ADC/MIXED. No jumper.
 #define REG_ILSNAP_VALID    0x30u
 #define REG_ILSNAP_NIN      0x31u
 #define REG_ILSNAP_NOUT     0x32u
@@ -1370,6 +1378,8 @@ static void pio_int_assert(bool on) {
 #define REG_ILSNAP_OUT_PHYS 0x37u
 #define REG_ILSNAP_OUT_VAL  0x38u
 #define REG_ILSNAP_OUT_LIVE 0x39u
+#define REG_ILSNAP_INT_LIVE 0x3Au
+#define PIO_INT_PHYS        ((uint8_t)((PIO_INT_GROUP << 5) | PIO_INT_PIN))   // D6=PB08=0x28
 
 static struct {
     bool     valid;
@@ -1413,6 +1423,7 @@ static uint8_t il_snap_reg_read(uint8_t reg) {
     case REG_ILSNAP_OUT_PHYS: return (s < g_il_snap.n_out) ? g_il_snap.out_phys[s] : 0xFFu;
     case REG_ILSNAP_OUT_VAL:  return (s < g_il_snap.n_out) ? g_il_snap.out_val[s] : 0xFFu;
     case REG_ILSNAP_OUT_LIVE: return (s < g_il_snap.n_out) ? pio_phys_read(g_il_snap.out_phys[s]) : 0xFFu;
+    case REG_ILSNAP_INT_LIVE: return pio_phys_read(PIO_INT_PHYS);   // live D6/PB08 INT line level
     default:                  return 0xFFu;
     }
 }
@@ -1440,8 +1451,7 @@ static void pio_il_drive_safe(void) {                   // force out_err pins to
 static void pio_il_arm(void) {
     il_snap_clear();                        // fresh arm: no stale freeze-frame
     g_pio_il_valid = false; g_pio_il_tripped = false;
-    PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN;
-    PORT->Group[PIO_INT_GROUP].DIRCLR.reg = (1u << PIO_INT_PIN);   // open-drain INT: Hi-Z idle
+    pio_int_assert(false);                  // INT released: Hi-Z + internal pull-up, INEN on
     g_pio_il_state = 0u;
     int ils = store_find_str("ilcf");      // interlock-config named slot
     if (ils >= 0 && g_rec_len[ils] > 0u) {
