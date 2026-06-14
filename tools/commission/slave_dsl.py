@@ -100,6 +100,15 @@ SERVO_PIN_ALIAS = {'A0': 'D0', 'A1': 'D1', 'A2': 'D2', 'A3': 'D3',
                    'A7': 'D7', 'A8': 'D8', 'A9': 'D9', 'A10': 'D10'}
 SERVO_ROLES = {'in': 1, 'out': 2, 'adc': 3, 'dac': 4, 'servo': 5, 'oc': 6}
 
+# MIXED mode: a `mxmp` fixed pin-map file [VER=1, padbyte x8] over the 8 usable pads
+# (D0,D1,D2,D3,D7,D8,D9,D10; D6 = INT line, reserved). padbyte = (debounce<<4)|role;
+# role low-nibble: 0 safe, 1 in, 2 in,up, 3 in,down, 4 out, 5 oc, 6 oc,up, 7 adc,
+# 8 dac (D0/A0 only). The firmware applies + enforces this at MIXED mode-entry; the
+# interlock operates WITHIN this pin environment (the I2C master is read-only).
+MXMP_VERSION = 1
+MIXED_PINS = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')   # D6 = INT (reserved)
+MIXED_PIN_IDX = {p: i for i, p in enumerate(MIXED_PINS)}
+
 ADC_FULLSCALE = 4095
 VREF_DEFAULT = 3.3                    # full-scale volts (INTVCC1 ref + GAIN=DIV2)
 
@@ -108,15 +117,50 @@ VREF_DEFAULT = 3.3                    # full-scale volts (INTVCC1 ref + GAIN=DIV
 GPIO_PINS = ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10')
 GPMP_VERSION = 2
 
+# The configurable GP pads per mode. D4/D5 = I2C (always reserved); D6's role is
+# mode-specific (interlock output in GPIO/ADC/MIXED, e-stop input in SERVO, a free
+# counter/bench pad in COUNTER); ADC also reserves A0/D0 (DAC) + A1/D1 (sample).
+# SAFETY RULE: every pad listed here must be EXPLICITLY assigned a role (a real role
+# or `safe` = held Hi-Z) -- enforced by Unit._check_coverage. The I2C master is
+# read-only, so a commissioned pin state can never be changed on the bus.
+CONFIG_PADS = {
+    MODES['GPIO']:    ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10'),        # D6 = INT output
+    MODES['MIXED']:   ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10'),        # D6 = INT output
+    MODES['ADC']:     ('D2', 'D3', 'D7', 'D8', 'D9', 'D10'),                    # D0=DAC, D1=sample, D6=INT
+    MODES['SERVO']:   ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10'),        # D6 = e-stop input
+    MODES['COUNTER']: ('D0', 'D1', 'D2', 'D3', 'D7', 'D8', 'D9', 'D10', 'D6'),  # D6 = free pad
+}
+# Why a pad is reserved, per mode -- for a clear DSL error if the user declares it.
+RESERVED_WHY = {
+    MODES['GPIO']:    {'D6': 'the interlock/INT output'},
+    MODES['MIXED']:   {'D6': 'the interlock/INT output'},
+    MODES['ADC']:     {'D0': 'the A0 DAC output', 'D1': 'the A1 ADC sample channel',
+                       'D6': 'the interlock/INT output'},
+    MODES['SERVO']:   {'D6': 'the e-stop input'},
+    MODES['COUNTER']: {},
+}
+PIN_ALIAS = {'A0': 'D0', 'A1': 'D1', 'A2': 'D2', 'A3': 'D3', 'A6': 'D6',
+             'A7': 'D7', 'A8': 'D8', 'A9': 'D9', 'A10': 'D10'}
+
 _OP_FROM_SYM = {'>': 'gt', '<': 'lt', '>=': 'ge', '<=': 'le', '==': 'eq', '!=': 'ne'}
 _OP_INVERT = {'gt': 'le', 'le': 'gt', 'lt': 'ge', 'ge': 'lt', 'eq': 'ne', 'ne': 'eq'}
 
 _PULL_MODS = {'up', 'down'}
-_ROLE_BASES = {'in', 'out', 'adc', 'dac', 'count', 'servo', 'oc'}
+_ROLE_BASES = {'in', 'out', 'adc', 'dac', 'count', 'servo', 'oc', 'safe'}
 
 
 class DSLError(Exception):
     """Raised on any malformed unit definition or boolean expression."""
+
+
+_PAD_RANK_RE = re.compile(r'^[ADad](\d+)$')
+
+
+def _pad_rank(label):
+    """Canonical pad order: numeric (A-alias folds onto D); unknown labels last.
+    Mirrors the Lua port's pad_rank/sorted_keys so emission is deterministic."""
+    m = _PAD_RANK_RE.match(label)
+    return (int(m.group(1)) if m else 999, label)
 
 
 def _bench_role_value(label, base, mods):
@@ -401,6 +445,8 @@ class Unit:
             base, mods = parts[0], parts[1:]
             if base not in _ROLE_BASES:
                 raise DSLError("pin %s: bad role base %r" % (label, base))
+            if base == 'safe' and mods:
+                raise DSLError("pin %s: 'safe' takes no modifiers" % label)
             self.roles[label.upper()] = (base, mods)   # pin names case-insensitive
         return self
 
@@ -410,6 +456,41 @@ class Unit:
         drive = {k.upper(): v for k, v in (drive or {}).items()}
         self.il = (name, when, drive)
         return self
+
+    # SAFETY GATE: every configurable pad for this mode must be explicitly assigned
+    # (a real role or `safe`), no reserved pad may be declared, and no pad declared
+    # twice. A hardware environment must never be left with a pad in an unspecified
+    # state, and the I2C master cannot change a commissioned pin -- so completeness is
+    # proven here, at config time. Run first in files().
+    def _check_coverage(self):
+        pads = CONFIG_PADS.get(self.mode)
+        if pads is None:                              # IDLE: idnt-only, no pins
+            if self.roles:
+                raise DSLError("%s mode takes no pins()" % MODE_NAME[self.mode])
+            return
+        want = set(pads)
+        why = RESERVED_WHY.get(self.mode, {})
+        have = set()
+        for label in self.roles:                      # roles keys are already upper
+            p = PIN_ALIAS.get(label, label)
+            if p in ('D4', 'D5'):
+                raise DSLError("%s: %s is the I2C bus, not user I/O"
+                               % (MODE_NAME[self.mode], label))
+            if p in why:
+                raise DSLError("%s: %s is %s, not user I/O"
+                               % (MODE_NAME[self.mode], label, why[p]))
+            if p not in want:
+                raise DSLError("%s: %s is not a configurable pad"
+                               % (MODE_NAME[self.mode], label))
+            if p in have:
+                raise DSLError("%s: pad %s declared twice (alias?)"
+                               % (MODE_NAME[self.mode], p))
+            have.add(p)
+        for p in pads:
+            if p not in have:
+                raise DSLError("%s: pad %s is unassigned -- every configurable pad "
+                               "must be set (use 'safe' to hold it Hi-Z)"
+                               % (MODE_NAME[self.mode], p))
 
     # -- emission --------------------------------------------------------
     def idnt(self):
@@ -469,6 +550,9 @@ class Unit:
             if mods:
                 raise DSLError("oc on %s: only the :up modifier is allowed, got %r" % (pin, mods))
             return "(%s):oc" % pin
+        if base != 'out':
+            raise DSLError("pin %s drives an interlock output but is declared %r; "
+                           "must be out or oc" % (pin, base))
         return "(%s):out" % pin
 
     # An inert ilcf: a name with no watch section -> il_parse OK but the firmware
@@ -512,10 +596,13 @@ class Unit:
             if self.roles.get(label, (None,))[0] not in ('out', 'oc'):
                 raise DSLError("drive pin %r not declared as 'out' or 'oc'" % label)
 
-        # MIXED's cfg declares every channel (the mode samples them all); GPIO's
-        # cfg declares only the interlock's pins (all 8 live in gpmp, can't fit).
+        # MIXED's interlock cfg lists the in/out/oc/adc pins; pin HW config lives in
+        # mxmp, so skip safe (Hi-Z) and dac (DAC bank). GPIO's cfg declares only the
+        # interlock's pins (all 8 live in gpmp, can't fit). Emit in canonical PAD
+        # order so insertion order matches the Lua port's deterministic output.
         if self.mode == MODES['MIXED']:
-            cfg_pins = list(self.roles.keys())
+            cfg_pins = [p for p in sorted(self.roles, key=_pad_rank)
+                        if self.roles[p][0] not in ('safe', 'dac')]
         else:
             cfg_pins = inputs + [p for p in drive if p not in inputs]
 
@@ -615,15 +702,22 @@ class Unit:
                 elif mods:
                     raise DSLError("oc on %s: only the :up modifier is allowed, got %r" % (pin, mods))
             elif base == 'in':
-                pull = mods[0] if mods else 'none'
-                if pull not in ('up', 'down', 'none'):
-                    raise DSLError("input %s pull must be up/down/none, got %r" % (pin, pull))
+                pull = 'none'                          # iterate all mods (don't drop extras)
+                for m in mods:
+                    if m in ('up', 'down', 'none'):
+                        pull = m
+                    elif m.startswith('debounce_'):
+                        raise DSLError("debounce on %s is MIXED-only" % pin)
+                    else:
+                        raise DSLError("GPIO input %s: bad modifier %r" % (pin, m))
                 if pull != 'none':
                     pullen_bm |= bit
                     if pull == 'up':
                         out_bm |= bit
+            elif base == 'safe':
+                pass                                   # held safe: input, no pull (all bits 0)
             else:
-                raise DSLError("GPIO pin %s: role %r not allowed (in / out / oc)" % (pin, base))
+                raise DSLError("GPIO pin %s: role %r not allowed (in/out/oc/safe)" % (pin, base))
         intcfg = 0x01 if self.il else 0x00   # bit0: open-drain active-low INT enabled
         return bytes([GPMP_VERSION, dir_bm, pullen_bm, out_bm, od_bm, intcfg])
 
@@ -657,9 +751,11 @@ class Unit:
                 if base == 'dac' and pin != 'D0':
                     raise DSLError("COUNTER pin %s: dac role is only on D0/A0 (the DAC pad)" % label)
                 chbytes[idx] = (role << 1)                        # enable bit 0 left clear
+            elif base == 'safe':
+                chbytes[idx] = 0                                  # NONE: held safe (Hi-Z)
             else:
-                raise DSLError("COUNTER pin %s: role %r must be count or a bench role %s"
-                               % (label, base, sorted(COUNTER_BENCH_ROLES)))
+                raise DSLError("COUNTER pin %s: role %r must be count, a bench role, or safe"
+                               % (label, base))
         r = self.cntr_rate
         return bytes([CNTR_VERSION, r & 0xFF, (r >> 8) & 0xFF] + chbytes)
 
@@ -676,12 +772,14 @@ class Unit:
                 raise DSLError("SERVO pin %s is the e-stop interlock; it can't be declared" % label)
             if pin not in SERVO_PIN_IDX:
                 raise DSLError("SERVO pin %s is not a usable pad %s" % (label, SERVO_PINS))
-            if base not in SERVO_ROLES:
+            if base == 'safe':
+                role = 0                                         # NONE: held safe (Hi-Z)
+            elif base not in SERVO_ROLES:
                 raise DSLError("SERVO pin %s: role %r must be one of %s"
                                % (label, base, sorted(SERVO_ROLES)))
-            if base == 'dac' and pin != 'D0':
+            elif base == 'dac' and pin != 'D0':
                 raise DSLError("SERVO pin %s: dac role is only on D0/A0 (the DAC pad)" % label)
-            if base == 'oc':
+            elif base == 'oc':
                 role = _bench_role_value(label, base, mods)      # oc / oc:up
             elif mods:
                 raise DSLError("SERVO pin %s: role %r takes no modifiers, got %r" % (label, base, mods))
@@ -690,12 +788,67 @@ class Unit:
             rolebytes[SERVO_PIN_IDX[pin]] = role
         return bytes([SRVO_VERSION] + rolebytes)
 
+    def mxmp(self):
+        """MIXED fixed pin-map: [VER=1, padbyte x8] in MIXED_PINS order
+        (D0,D1,D2,D3,D7,D8,D9,D10; D6 = INT, reserved). padbyte = (debounce<<4)|role,
+        role low-nibble: 0 safe 1 in 2 in,up 3 in,down 4 out 5 oc 6 oc,up 7 adc 8 dac.
+        debounce (in-roles only): 0 none, else 2..15 ticks (x10ms) = 20..150 ms."""
+        if self.mode != MODES['MIXED']:
+            return None
+        padbyte = [0] * len(MIXED_PINS)                       # default safe
+        for label, (base, mods) in self.roles.items():
+            pin = PIN_ALIAS.get(label, label)
+            idx = MIXED_PIN_IDX[pin]                          # coverage guarantees valid+present
+            code, depth = 0, 0
+            if base == 'safe':
+                code = 0
+            elif base == 'in':
+                pull = 'none'
+                for m in mods:
+                    if m in ('up', 'down', 'none'):
+                        pull = m
+                    elif m.startswith('debounce_'):
+                        depth = self._debounce_depth(pin, m)
+                    else:
+                        raise DSLError("MIXED input %s: bad modifier %r" % (label, m))
+                code = 2 if pull == 'up' else 3 if pull == 'down' else 1
+            elif base == 'out':
+                if mods:
+                    raise DSLError("MIXED out %s: takes no modifiers" % label)
+                code = 4
+            elif base == 'oc':
+                if mods == ['up']:
+                    code = 6
+                elif mods:
+                    raise DSLError("oc on %s: only :up allowed" % label)
+                else:
+                    code = 5
+            elif base == 'adc':
+                if mods:
+                    raise DSLError("MIXED adc %s: takes no modifiers" % label)
+                code = 7
+            elif base == 'dac':
+                if pin != 'D0':
+                    raise DSLError("MIXED: dac only on D0/A0")
+                if mods:
+                    raise DSLError("MIXED dac: takes no modifiers")
+                code = 8
+            else:
+                raise DSLError("MIXED pin %s: role %r not allowed (in/out/oc/adc/dac/safe)"
+                               % (label, base))
+            padbyte[idx] = (depth << 4) | code
+        return bytes([MXMP_VERSION] + padbyte)
+
     def files(self):
         """Return {name: bytes} ready for the commission tool to write."""
+        self._check_coverage()        # SAFETY GATE: all pads explicitly assigned
         out = {'idnt': self.idnt()}
         gpmp = self.gpmp()
         if gpmp is not None:
             out['gpmp'] = gpmp
+        mxmp = self.mxmp()
+        if mxmp is not None:
+            out['mxmp'] = mxmp
         cntr = self.cntr()
         if cntr is not None:
             out['cntr'] = cntr
@@ -752,14 +905,16 @@ def load(path):
 # ---------------------------------------------------------------------------
 
 def _selftest():
-    # 1. MIXED: AND condition + drive, volts -> count (2.5/3.3*4095 = 3102)
+    # 1. MIXED: AND condition + drive, volts -> count (2.5/3.3*4095 = 3102).
+    #    Coverage requires every pad set; unused pads held safe. D8 watched -> drive D7.
     u = Unit(0x55, 'MIXED')
-    u.pins(A0='adc:oversample_16', D8='in:up', D6='out')
-    u.interlock('safe', when='A0 > 2.5V && D8', drive={'D6': 1})
+    u.pins(A0='adc', D8='in:up', D7='out',
+           D1='safe', D2='safe', D3='safe', D9='safe', D10='safe')
+    u.interlock('safe', when='A0 > 2.5V && D8', drive={'D7': 1})
     f = u.files()
     assert f['idnt'] == bytes([0x55, 3]), f['idnt']
-    exp = (b"safe;cfg[(A0):adc,oversample_16,(D8):in,up,(D6):out];"
-           b"watch[A0:gt:3102,D8:1];out_ok[D6:1];out_err[D6:0]")
+    exp = (b"safe;cfg[(A0):adc,(D7):out,(D8):in,up];"
+           b"watch[A0:gt:3102,D8:1];out_ok[D7:1];out_err[D7:0]")
     assert f['ilcf'] == exp, f['ilcf']
 
     # 2. OR + NOT -> two DNF groups; ~D8 -> ne 1
@@ -781,35 +936,41 @@ def _selftest():
     u.pins(A0='adc', D8='in:up:debounce_50ms', D6='out')
     u.interlock('s', when='A0 > 2.5V && D8', drive={'D6': 1})
     assert u.ilcf().split(';')[1] == \
-        "cfg[(A0):adc,(D8):in,up,debounce_5,(D6):out]", u.ilcf()
+        "cfg[(A0):adc,(D6):out,(D8):in,up,debounce_5]", u.ilcf()   # canonical PAD order
     # rounds to nearest tick: 24ms -> depth 2
     u = Unit(0x55, 'MIXED'); u.pins(D8='in:debounce_24ms', D6='out')
     u.interlock('s', when='D8', drive={'D6': 1})
-    assert u.ilcf().split(';')[1] == "cfg[(D8):in,debounce_2,(D6):out]", u.ilcf()
+    assert u.ilcf().split(';')[1] == "cfg[(D6):out,(D8):in,debounce_2]", u.ilcf()
 
-    # 4. IDLE: idnt only. ADC (interlock-capable) with no interlock emits the null
-    #    ilcf, like GPIO/MIXED. COUNTER/SERVO carry a config file (`cntr`/`srvo`).
+    # 4. IDLE: idnt only (no pins allowed). ADC/SERVO/COUNTER now require every
+    #    configurable pad to be set (use 'safe'); ADC-with-no-interlock emits the
+    #    null ilcf, COUNTER/SERVO carry a config file (`cntr`/`srvo`).
     assert Unit(0x60, 'IDLE').files() == {'idnt': bytes([0x60, 0])}, Unit(0x60, 'IDLE').files()
-    assert Unit(0x60, 'ADC').files() == {'idnt': bytes([0x60, 2]), 'ilcf': b'off'}
-    # bare SERVO -> srvo with all 8 pads role 0 (D6 = e-stop, implicit)
-    assert Unit(0x60, 'SERVO').files() == {'idnt': bytes([0x60, 4]),
-                                           'srvo': bytes([1] + [0] * 8)}, Unit(0x60, 'SERVO').files()
-    # SERVO with declared pads: D0/D1 servo, D8 adc, D9 out; role byte per pad.
-    #   order D0,D1,D2,D3,D7,D8,D9,D10 -> [5,5,0,0,0,3,2,0]
+    adc_safe = {'D2': 'safe', 'D3': 'safe', 'D7': 'safe', 'D8': 'safe', 'D9': 'safe', 'D10': 'safe'}
+    assert Unit(0x60, 'ADC').pins(**adc_safe).files() == {'idnt': bytes([0x60, 2]), 'ilcf': b'off'}
+    # all-safe SERVO -> srvo with all 8 pads role 0 (D6 = e-stop, implicit)
+    servo_safe = {p: 'safe' for p in SERVO_PINS}
+    assert Unit(0x60, 'SERVO').servo().pins(**servo_safe).files() == {
+        'idnt': bytes([0x60, 4]), 'srvo': bytes([1] + [0] * 8)}
+    # SERVO with declared pads: D0/D1 servo, D8 adc, D9 out, rest safe; role byte per
+    #   pad. order D0,D1,D2,D3,D7,D8,D9,D10 -> [5,5,0,0,0,3,2,0]
     u = Unit(0x55, 'SERVO').servo()
-    u.pins(D0='servo', D1='servo', D8='adc', D9='out')
+    u.pins(D0='servo', D1='servo', D8='adc', D9='out',
+           D2='safe', D3='safe', D7='safe', D10='safe')
     assert u.srvo() == bytes([1, 5, 5, 0, 0, 0, 3, 2, 0]), list(u.srvo())
 
     # 4b. COUNTER cntr: D1 up/rising + D2 down/both at 2 kHz; D0 free (DAC pad).
     #     ch byte = bit0 enable | pull<<1 | edge<<3. D1=idx1: 1|1<<1=0x03;
     #     D2=idx2: 1|2<<1|2<<3 = 1|4|16 = 0x15. rate 2000 = 0x07D0.
     u = Unit(0x55, 'COUNTER').counter(rate=2000)
-    u.pins(D1='count:up:rising', D2='count:down:both')
+    u.pins(D1='count:up:rising', D2='count:down:both',
+           D0='safe', D3='safe', D7='safe', D8='safe', D9='safe', D10='safe', D6='safe')
     exp = bytes([1, 0xD0, 0x07, 0x00, 0x03, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
     assert u.files()['cntr'] == exp, list(u.files()['cntr'])
     assert u.files()['idnt'] == bytes([0x55, 5])
-    # bare COUNTER -> cntr with all channels disabled, default 1 kHz
-    assert Unit(0x60, 'COUNTER').cntr() == bytes([1, 0xE8, 0x03] + [0] * 9)
+    # all-safe COUNTER -> cntr with all channels disabled (role 0), default 1 kHz
+    cnt_safe = {p: 'safe' for p in COUNTER_PINS}
+    assert Unit(0x60, 'COUNTER').pins(**cnt_safe).cntr() == bytes([1, 0xE8, 0x03] + [0] * 9)
 
     # 5. error cases
     for fn in (
@@ -912,6 +1073,7 @@ def _selftest():
     # 11. ADC mode interlock: single-channel (A1) stream selectors (.stat.window)
     #     with the khz1/hz100/hz10 downsample windows + default instantaneous.
     u = Unit(0x30, 'ADC')
+    u.pins(**{p: 'safe' for p in ('D2', 'D3', 'D7', 'D8', 'D9', 'D10')})  # coverage
     u.interlock('ov', 'A1.avg.khz1 > 1.5V || A1.rms.hz100 > 0.5V', drive={'D6': 1})
     f = u.files()
     assert f['idnt'] == bytes([0x30, 2]), f['idnt']

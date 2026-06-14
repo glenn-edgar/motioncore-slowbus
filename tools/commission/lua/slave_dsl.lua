@@ -37,6 +37,10 @@ local SERVO_PIN_IDX = {}; for i,p in ipairs(SERVO_PINS) do SERVO_PIN_IDX[p]=i-1 
 local SERVO_PIN_ALIAS = { A0="D0",A1="D1",A2="D2",A3="D3",A7="D7",A8="D8",A9="D9",A10="D10" }
 local SERVO_ROLES = { ["in"]=1, out=2, adc=3, dac=4, servo=5, oc=6 }
 
+local MXMP_VERSION = 1
+local MIXED_PINS = { "D0","D1","D2","D3","D7","D8","D9","D10" }   -- D6 = INT line (reserved)
+local MIXED_PIN_IDX = {}; for i,p in ipairs(MIXED_PINS) do MIXED_PIN_IDX[p]=i-1 end
+
 local ADC_FULLSCALE = 4095
 local VREF_DEFAULT = 3.3
 local GPIO_PINS = { "D0","D1","D2","D3","D7","D8","D9","D10" }
@@ -45,11 +49,34 @@ local GPMP_VERSION = 2
 
 local OP_FROM_SYM = { [">"]="gt", ["<"]="lt", [">="]="ge", ["<="]="le", ["=="]="eq", ["!="]="ne" }
 local OP_INVERT = { gt="le", le="gt", lt="ge", ge="lt", eq="ne", ne="eq" }
-local ROLE_BASES = { ["in"]=true, out=true, adc=true, dac=true, count=true, servo=true, oc=true }
+local ROLE_BASES = { ["in"]=true, out=true, adc=true, dac=true, count=true, servo=true, oc=true, safe=true }
 
 local ADC_STATS = { avg=true, min=true, max=true, rms=true }
 local ADC_WINDOWS = { khz1=true, hz100=true, hz10=true }
 local ADC_WATCH_PINS = { A1=true, D1=true }
+
+-- The configurable GP pads per mode. D4/D5 = I2C (always reserved); D6's role is
+-- mode-specific (interlock output in GPIO/ADC/MIXED, e-stop input in SERVO, a free
+-- counter/bench pad in COUNTER); ADC also reserves A0/D0 (DAC) + A1/D1 (sample).
+-- SAFETY RULE: every pad listed here must be EXPLICITLY assigned a role (a real
+-- role or `safe` = held Hi-Z) -- enforced by Unit:_check_coverage. The I2C master
+-- is read-only, so a commissioned pin state can never be changed on the bus.
+local CONFIG_PADS = {
+    [MODES.GPIO]    = { "D0","D1","D2","D3","D7","D8","D9","D10" },         -- D6 = INT output
+    [MODES.MIXED]   = { "D0","D1","D2","D3","D7","D8","D9","D10" },         -- D6 = INT output
+    [MODES.ADC]     = { "D2","D3","D7","D8","D9","D10" },                   -- D0=DAC, D1=sample, D6=INT
+    [MODES.SERVO]   = { "D0","D1","D2","D3","D7","D8","D9","D10" },         -- D6 = e-stop input
+    [MODES.COUNTER] = { "D0","D1","D2","D3","D7","D8","D9","D10","D6" },    -- D6 = free pad (no interlock)
+}
+-- Why a pad is reserved, per mode -- for a clear DSL error if the user declares it.
+local RESERVED_WHY = {
+    [MODES.GPIO]    = { D6="the interlock/INT output" },
+    [MODES.MIXED]   = { D6="the interlock/INT output" },
+    [MODES.ADC]     = { D0="the A0 DAC output", D1="the A1 ADC sample channel", D6="the interlock/INT output" },
+    [MODES.SERVO]   = { D6="the e-stop input" },
+    [MODES.COUNTER] = {},
+}
+local PIN_ALIAS = { A0="D0",A1="D1",A2="D2",A3="D3",A6="D6",A7="D7",A8="D8",A9="D9",A10="D10" }
 
 M.MODES, M.MODE_NAME = MODES, MODE_NAME
 
@@ -317,6 +344,7 @@ function Unit:pins(tbl)
         local base = parts[1]
         local mods = {}; for j = 2, #parts do mods[#mods+1] = parts[j] end
         if not ROLE_BASES[base] then err("pin " .. label .. ": bad role base " .. base) end
+        if base == "safe" and #mods > 0 then err("pin " .. label .. ": 'safe' takes no modifiers") end
         self.roles[label:upper()] = { base = base, mods = mods }
     end
     return self
@@ -327,6 +355,36 @@ function Unit:interlock(name, when, drive)
     if drive then for k, v in pairs(drive) do d[k:upper()] = v end end
     self.il = { name = name, when = when, drive = d }
     return self
+end
+
+-- SAFETY GATE: every configurable pad for this mode must be explicitly assigned
+-- (a real role or `safe`), no reserved pad may be declared, and no pad declared
+-- twice. A hardware environment must never be left with a pad in an unspecified
+-- state, and the I2C master cannot change a commissioned pin -- so completeness is
+-- proven here, at config time. Run first in :files().
+function Unit:_check_coverage()
+    local pads = CONFIG_PADS[self.mode]
+    if not pads then                                   -- IDLE: idnt-only, no pins
+        if next(self.roles) then err(MODE_NAME[self.mode] .. " mode takes no pins()") end
+        return
+    end
+    local want = {}; for _, p in ipairs(pads) do want[p] = true end
+    local why  = RESERVED_WHY[self.mode] or {}
+    local have = {}
+    for label in pairs(self.roles) do
+        local p = PIN_ALIAS[label] or label                       -- roles keys are already upper
+        if p == "D4" or p == "D5" then err(MODE_NAME[self.mode] .. ": " .. label .. " is the I2C bus, not user I/O") end
+        if why[p] then err(MODE_NAME[self.mode] .. ": " .. label .. " is " .. why[p] .. ", not user I/O") end
+        if not want[p] then err(MODE_NAME[self.mode] .. ": " .. label .. " is not a configurable pad") end
+        if have[p] then err(MODE_NAME[self.mode] .. ": pad " .. p .. " declared twice (alias?)") end
+        have[p] = true
+    end
+    for _, p in ipairs(pads) do
+        if not have[p] then
+            err(MODE_NAME[self.mode] .. ": pad " .. p ..
+                " is unassigned -- every configurable pad must be set (use 'safe' to hold it Hi-Z)")
+        end
+    end
 end
 
 function Unit:idnt() return bytestr({ self.addr, self.mode }) end
@@ -371,6 +429,8 @@ function Unit:_out_cfg_token(pin)
         if #r.mods > 0 then err("oc on " .. pin .. ": only :up allowed") end
         return "(" .. pin .. "):oc"
     end
+    if r.base ~= "out" then err("pin " .. pin .. " drives an interlock output but is declared '" ..
+                                 r.base .. "'; must be out or oc") end
     return "(" .. pin .. "):out"
 end
 local function clause(pin, op, thr)
@@ -399,14 +459,20 @@ function Unit:gpmp()
             if #mods == 1 and mods[1] == "up" then pullen_bm = pullen_bm + b
             elseif #mods > 0 then err("oc on " .. pin .. ": only :up allowed") end
         elseif base == "in" then
-            local pull = mods[1] or "none"
-            if pull ~= "up" and pull ~= "down" and pull ~= "none" then err("input " .. pin .. " bad pull") end
+            local pull = "none"                          -- iterate all mods (don't silently drop extras)
+            for _, m in ipairs(mods) do
+                if m == "up" or m == "down" or m == "none" then pull = m
+                elseif m:sub(1, 9) == "debounce_" then err("debounce on " .. pin .. " is MIXED-only")
+                else err("GPIO input " .. pin .. ": bad modifier " .. m) end
+            end
             if pull ~= "none" then
                 pullen_bm = pullen_bm + b
                 if pull == "up" then out_bm = out_bm + b end
             end
+        elseif base == "safe" then
+            -- held safe: input, no pull (dir/pullen/out/od bits all stay 0)
         else
-            err("GPIO pin " .. pin .. ": role " .. base .. " not allowed (in/out/oc)")
+            err("GPIO pin " .. pin .. ": role " .. base .. " not allowed (in/out/oc/safe)")
         end
     end
     local intcfg = self.il and 0x01 or 0x00
@@ -433,8 +499,10 @@ function Unit:cntr()
             local role = bench_role_value(label, base, mods)
             if base == "dac" and pin ~= "D0" then err("COUNTER " .. label .. ": dac only on D0/A0") end
             chbytes[idx + 1] = role * 2
+        elseif base == "safe" then
+            chbytes[idx + 1] = 0                         -- NONE: held safe (firmware leaves it Hi-Z)
         else
-            err("COUNTER pin " .. label .. ": role " .. base .. " must be count or a bench role")
+            err("COUNTER pin " .. label .. ": role " .. base .. " must be count, a bench role, or safe")
         end
     end
     local r = self.cntr_rate
@@ -451,16 +519,63 @@ function Unit:srvo()
         if pin == "D6" or pin == "A6" then err("SERVO pin " .. label .. " is the e-stop; can't declare") end
         if SERVO_PIN_IDX[pin] == nil then err("SERVO pin " .. label .. " not a usable pad") end
         local base, mods = r.base, r.mods
-        if not SERVO_ROLES[base] then err("SERVO pin " .. label .. ": bad role " .. base) end
-        if base == "dac" and pin ~= "D0" then err("SERVO " .. label .. ": dac only on D0/A0") end
         local role
-        if base == "oc" then role = bench_role_value(label, base, mods)
+        if base == "safe" then role = 0                  -- NONE: held safe (firmware leaves it Hi-Z)
+        elseif not SERVO_ROLES[base] then err("SERVO pin " .. label .. ": bad role " .. base)
+        elseif base == "dac" and pin ~= "D0" then err("SERVO " .. label .. ": dac only on D0/A0")
+        elseif base == "oc" then role = bench_role_value(label, base, mods)
         elseif #mods > 0 then err("SERVO pin " .. label .. ": role takes no modifiers")
         else role = SERVO_ROLES[base] end
         rolebytes[SERVO_PIN_IDX[pin] + 1] = role
     end
     local out = { SRVO_VERSION }
     for _, b in ipairs(rolebytes) do out[#out + 1] = b end
+    return bytestr(out)
+end
+
+-- mxmp v1 -- the MIXED fixed pin-map: [VER, padbyte x8] in MIXED_PINS order
+-- (D0,D1,D2,D3,D7,D8,D9,D10; D6 = INT, reserved). padbyte = (debounce<<4) | role,
+-- role low-nibble: 0 safe 1 in 2 in,up 3 in,down 4 out 5 oc 6 oc,up 7 adc 8 dac.
+-- debounce (in-roles only): 0 none, else 2..15 ticks (x10ms) = 20..150 ms. The
+-- firmware applies this at MIXED mode-entry and ENFORCES it (the I2C master is
+-- read-only); the interlock operates WITHIN this pin environment. D0 role=dac also
+-- gates the DAC register bank (0x20-0x2C).
+function Unit:mxmp()
+    if self.mode ~= MODES.MIXED then return nil end
+    local padbyte = {}; for k = 1, #MIXED_PINS do padbyte[k] = 0 end       -- default safe
+    for label, r in pairs(self.roles) do
+        local pin = PIN_ALIAS[label] or label
+        local idx = MIXED_PIN_IDX[pin]                                      -- coverage guarantees valid+present
+        local base, mods = r.base, r.mods
+        local code, depth = 0, 0
+        if base == "safe" then code = 0
+        elseif base == "in" then
+            local pull = "none"
+            for _, m in ipairs(mods) do
+                if m == "up" or m == "down" or m == "none" then pull = m
+                elseif m:sub(1, 9) == "debounce_" then depth = self:_debounce_depth(pin, m)
+                else err("MIXED input " .. label .. ": bad modifier " .. m) end
+            end
+            code = (pull == "up" and 2) or (pull == "down" and 3) or 1
+        elseif base == "out" then
+            if #mods > 0 then err("MIXED out " .. label .. ": takes no modifiers") end
+            code = 4
+        elseif base == "oc" then
+            if #mods == 1 and mods[1] == "up" then code = 6
+            elseif #mods > 0 then err("oc on " .. label .. ": only :up allowed")
+            else code = 5 end
+        elseif base == "adc" then
+            if #mods > 0 then err("MIXED adc " .. label .. ": takes no modifiers") end
+            code = 7
+        elseif base == "dac" then
+            if pin ~= "D0" then err("MIXED: dac only on D0/A0") end
+            if #mods > 0 then err("MIXED dac: takes no modifiers") end
+            code = 8
+        else err("MIXED pin " .. label .. ": role " .. base .. " not allowed (in/out/oc/adc/dac/safe)") end
+        padbyte[idx + 1] = depth * 16 + code
+    end
+    local out = { MXMP_VERSION }
+    for _, b in ipairs(padbyte) do out[#out + 1] = b end
     return bytestr(out)
 end
 
@@ -525,7 +640,11 @@ function Unit:ilcf()
 
     local cfg_pins
     if self.mode == MODES.MIXED then
-        cfg_pins = sorted_keys(self.roles)
+        cfg_pins = {}                                    -- interlock pins; pin HW config lives in mxmp,
+        for _, p in ipairs(sorted_keys(self.roles)) do   -- so skip safe (Hi-Z) and dac (DAC bank)
+            local b = self.roles[p].base
+            if b ~= "safe" and b ~= "dac" then cfg_pins[#cfg_pins + 1] = p end
+        end
     else
         cfg_pins = {}
         for _, p in ipairs(inputs) do cfg_pins[#cfg_pins+1] = p end
@@ -556,8 +675,10 @@ function Unit:ilcf()
 end
 
 function Unit:files()
+    self:_check_coverage()                               -- SAFETY GATE: all pads explicitly assigned
     local out = { idnt = self:idnt() }
     local gpmp = self:gpmp(); if gpmp then out.gpmp = gpmp end
+    local mxmp = self:mxmp(); if mxmp then out.mxmp = mxmp end
     local cntr = self:cntr(); if cntr then out.cntr = cntr end
     local srvo = self:srvo(); if srvo then out.srvo = srvo end
     local ilcf = self:ilcf(); if ilcf then out.ilcf = ilcf end   -- ascii string == bytes
