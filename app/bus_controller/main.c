@@ -56,6 +56,8 @@
 #include "board.h"
 #include "opcodes.h"
 #include "commission.h"
+#include "variants.h"        // shared product/variant enum + role derivation
+#include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
 
 // core1 chain_tree engine (KB0)
 #include "cfl_runtime.h"
@@ -1340,6 +1342,14 @@ int main(void) {
     else if (watchdog_enable_caused_reboot()) g_crash.last_cause = RST_WDT;
     g_crash.boot_count++;
 
+    // ---- per-unit identity from the config FS (two-step flash) --------------
+    // Step 1: cfg_load() is stubbed -> reads ABSENT, so id_rc = IDENT_ERR_MISSING
+    // and we fall back to the baked defaults below (no behavior change). When the
+    // LittleFS region lands (Step 2) this validates chip/variant/uuid/addr; Step 4
+    // turns a mismatch into a hard refuse. For now we only log the result.
+    identity_t ident; (void)ident;
+    int id_rc = boot_read_identity(&ident);
+
     bus_phy_init(BUS_DEFAULT_BAUD);   // installs the RX IRQ on core0
     bus_asm_init(&g_bc, BUS_ADDR_MASTER, true);
 
@@ -1354,8 +1364,8 @@ int main(void) {
     host_link_set_callbacks(&g_hl, on_bus_msg, on_local_shell, NULL);
 
     // Boot banner as an OP_DBG_LOG frame (the Pi controller logs it).
-    { char b[48]; int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s",
-                                   (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause]);
+    { char b[64]; int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d",
+                                   (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], id_rc);
       (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n); }
 
     g_lock = xSemaphoreCreateMutex();

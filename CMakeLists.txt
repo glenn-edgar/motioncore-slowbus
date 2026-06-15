@@ -76,6 +76,8 @@ file(GLOB KB0_INCR_SRCS   CONFIGURE_DEPENDS ${BC_DIR}/kb0/incr/*.c)
 
 add_executable(bus_controller
     ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/main.c
+    ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/boot_identity.c
+    ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/cfg_file.c
     ${CMAKE_CURRENT_LIST_DIR}/core/host_link.c
     ${CMAKE_CURRENT_LIST_DIR}/app/chassis/commission.c
     ${PORT_DIR}/phy_pio_rs485.c
