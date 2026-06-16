@@ -119,6 +119,7 @@ APP_SRCS := \
   $(HERE)/flash_storage.c \
   $(HERE)/shell_commands.c \
   $(HERE)/samd21_commands.c \
+  $(HERE)/sd_spi.c \
   $(HERE)/samd21_hal.c \
   $(HERE)/samd21_hal_pin.c \
   $(HERE)/samd21_pin_table.c \
