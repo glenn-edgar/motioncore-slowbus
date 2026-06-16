@@ -193,17 +193,14 @@ shell, 0xFB appcore, 0x01 s2m). CLI `pico.lua`: `info` (decode OP_REGISTER),
 `ping` (appcore KB0 round-trip), `listen [secs]` (passive DBG_LOG/frame decode),
 `port`. Run on the Pi: `cd ~/slow_bus/tools/commission/lua && luajit pico.lua`.
 
-### Caveat — the `ident=-1` boot banner is NOT observable over USB yet
-The `[boot] … ident=-1` line is emitted ONCE at startup (main.c ~1369) into the
-host-link TX ring *before any host can attach*; the SDK drops CDC output while
-disconnected, so opening the port later never sees it — you get fresh
-`OP_REGISTER` re-announcements instead. Step-1 substance is still verified (BC
-boots, API works = graceful fallback), and `ident=-1` is a build-time certainty
-(`cfg_load` stub → `IDENT_ERR_MISSING`). **Recommended micro-fix:** in
-`uplink_task`, on the `conn` false→true edge (new attach), re-emit the boot
-banner via `host_link_s2m(&g_hl, 1, OP_DBG_LOG, …)` so `ident` is visible every
-time `pico.lua listen` opens the port. Small, isolated — do before Step 2 if we
-want the banner as live evidence.
+### `ident=-1` boot banner now observable over USB (fixed 2026-06-16)
+The `[boot] … ident=-1` line is emitted once at startup into the host-link TX
+ring *before any host can attach* (SDK drops disconnected CDC output). Fixed:
+`uplink_task` now re-emits the banner on the `conn` false→true edge via
+`bc_emit_boot_banner()` (shared with the boot path; `g_id_rc` holds the identity
+result). HW-verified — `pico.lua listen` shows `[boot] bus_controller boot#2
+rst=POWER ident=-1` on every fresh open. Remote reboot also works:
+`sudo picotool reboot -f -u` drops it to BOOTSEL (the fw exposes the reset iface).
 
 ## Build reminders (legacy host self-test still valid)
 ```sh
