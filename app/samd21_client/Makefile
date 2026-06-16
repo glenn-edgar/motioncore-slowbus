@@ -79,6 +79,9 @@ OPT  := -Os -ffunction-sections -fdata-sections
 INC := \
   -I$(HERE) \
   -I$(HERE)/fatfs \
+  -I$(TOP)/drivers/c/i2c \
+  -I$(TOP)/drivers/c/pcf8563 \
+  -I$(TOP)/drivers/c/ssd1306 \
   -I$(LIBCOMM) \
   -I$(SRC) \
   -I$(TUSB)/hw \
@@ -151,10 +154,15 @@ TUSB_SRCS := \
 
 VENDOR_SRCS := $(BSP_SRCS) $(TUSB_SRCS)
 
+# slow_bus C driver library — only the gateway's own RTC + OLED (gc'd otherwise)
+DRIVERS     := $(TOP)/drivers/c
+DRIVER_SRCS := $(DRIVERS)/pcf8563/pcf8563.c $(DRIVERS)/ssd1306/ssd1306.c
+
 APP_OBJS     := $(patsubst $(HERE)/%.c,$(BUILD)/app/%.o,$(APP_SRCS))
 VENDOR_OBJS  := $(patsubst $(TOP)/%.c,$(BUILD)/vendor/%.o,$(VENDOR_SRCS))
 LIBCOMM_OBJS := $(patsubst $(LIBCOMM)/%.c,$(BUILD)/libcomm/%.o,$(LIBCOMM_SRCS))
-OBJS         := $(APP_OBJS) $(VENDOR_OBJS) $(LIBCOMM_OBJS)
+DRIVER_OBJS  := $(patsubst $(DRIVERS)/%.c,$(BUILD)/drivers/%.o,$(DRIVER_SRCS))
+OBJS         := $(APP_OBJS) $(VENDOR_OBJS) $(LIBCOMM_OBJS) $(DRIVER_OBJS)
 
 DEPS := $(OBJS:.o=.d)
 
@@ -197,6 +205,11 @@ $(BUILD)/app/%.o: $(HERE)/%.c
 
 # Vendor/SDK/TinyUSB sources -> build/vendor/...
 $(BUILD)/vendor/%.o: $(TOP)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# slow_bus C drivers -> build/drivers/...
+$(BUILD)/drivers/%.o: $(DRIVERS)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
