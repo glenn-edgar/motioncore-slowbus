@@ -185,6 +185,18 @@ const shell_cmd_entry_t* shell_find_cmd(uint16_t command_id);
 #define CMD_I2C_WRITE_READ    ((uint16_t)0x0132)  // write reg, repeated START, read N
 #define CMD_I2C_SCAN          ((uint16_t)0x0133)  // probe 0x08..0x77, return ACK list
 
+// 0x0134..0x0138: SD-card text logging (gateway only; FatFs on the XIAO base microSD).
+//   LOG_OPEN   name[1..12]      -> [size:u32]   select + create the active file
+//   LOG_CLOSE  ()               -> ()           deselect
+//   LOG_WRITE  text[..200]      -> ()           append "<stamp> text\n"
+//   LOG_READ   off:u32, len:u8  -> [bytes..]    short read = EOF
+//   LOG_DELETE name[1..12]      -> ()
+#define CMD_LOG_OPEN          ((uint16_t)0x0134)
+#define CMD_LOG_CLOSE         ((uint16_t)0x0135)
+#define CMD_LOG_WRITE         ((uint16_t)0x0136)
+#define CMD_LOG_READ          ((uint16_t)0x0137)
+#define CMD_LOG_DELETE        ((uint16_t)0x0138)
+
 // 0x0150..0x015F: RS-485 passthrough (SERCOM4 9-bit MPCM on D6=TX / D7=RX).
 // Always compiled into the dongle build as permanent diagnostics — my_addr=0xFF
 // sniffer mode stays invaluable for bus debugging. Received frames are pushed
