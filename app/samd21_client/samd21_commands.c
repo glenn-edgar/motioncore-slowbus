@@ -3785,15 +3785,81 @@ static uint8_t cmd_i2c_scan(shell_reader_t* args, shell_writer_t* result) {
 // last-log land with the pcf8563/ssd1306 binding.
 #ifndef I2C_CLIENT
 #include "ff.h"
+#include "i2c_bus.h"
+#include "pcf8563.h"
+#include "ssd1306.h"
 
-static FATFS    s_log_fs;
-static bool     s_log_mounted;
-static char     s_log_name[13];     // active 8.3 file (+NUL); empty = none
-static uint32_t s_log_seq;          // placeholder timestamp source
+#define RTC_ADDR   0x51u
+#define OLED_ADDR  0x3Cu
+
+// i2c_bus_t bound to the gateway's own SERCOM2 I2C master (wraps the static
+// primitives) so the mirrored pcf8563/ssd1306 C drivers run on-chip.
+static int gw_i2c_w(void *c, uint8_t a, const uint8_t *b, size_t n, bool nostop) {
+    (void)c;
+    if (!i2c_start(a, false)) { i2c_stop(); return -1; }
+    for (size_t i = 0; i < n; i++) if (!i2c_write_byte(b[i])) { i2c_stop(); return -1; }
+    if (!nostop) i2c_stop();
+    return 0;
+}
+static int gw_i2c_r(void *c, uint8_t a, uint8_t *b, size_t n) {
+    (void)c;
+    if (!i2c_start(a, true)) { i2c_stop(); return -1; }
+    for (size_t i = 0; i < n; i++) b[i] = i2c_read_byte(i == n - 1);
+    i2c_stop();
+    return 0;
+}
+static const i2c_bus_t gw_bus = { .ctx = 0, .write = gw_i2c_w, .read = gw_i2c_r };
+
+static FATFS     s_log_fs;
+static bool      s_log_mounted;
+static char      s_log_name[13];    // active 8.3 file (+NUL); empty = none
+static ssd1306_t s_oled;
+static bool      s_oled_ok;
+
+// "YYYY-MM-DD HH:MM:SS " from the RTC -> out[20]. Fallback marker on bus error.
+static int log_stamp(char *out) {
+    pcf8563_time_t t;
+    if (!pcf8563_get(&gw_bus, RTC_ADDR, &t)) {
+        const char *f = "0000-00-00 --:--:-- "; for (int i = 0; i < 20; i++) out[i] = f[i]; return 20;
+    }
+    int p = 0;
+    out[p++] = (char)('0' + (t.year / 1000) % 10); out[p++] = (char)('0' + (t.year / 100) % 10);
+    out[p++] = (char)('0' + (t.year / 10) % 10);   out[p++] = (char)('0' + t.year % 10);
+    out[p++] = '-'; out[p++] = (char)('0' + t.month / 10); out[p++] = (char)('0' + t.month % 10);
+    out[p++] = '-'; out[p++] = (char)('0' + t.mday  / 10); out[p++] = (char)('0' + t.mday  % 10);
+    out[p++] = ' '; out[p++] = (char)('0' + t.hour  / 10); out[p++] = (char)('0' + t.hour  % 10);
+    out[p++] = ':'; out[p++] = (char)('0' + t.min   / 10); out[p++] = (char)('0' + t.min   % 10);
+    out[p++] = ':'; out[p++] = (char)('0' + t.sec   / 10); out[p++] = (char)('0' + t.sec   % 10);
+    out[p++] = ' ';
+    return p;   // 20
+}
+
+// Last log on the OLED: HH:MM:SS on the top row, text word-wrapped below (21 cols/row).
+static void oled_last(const char *stamp, const char *text, int textlen) {
+    if (!s_oled_ok) return;
+    ssd1306_clear(&s_oled);
+    char hms[9]; for (int i = 0; i < 8; i++) hms[i] = stamp[11 + i]; hms[8] = 0;   // HH:MM:SS
+    ssd1306_text(&s_oled, 0, 0, hms);
+    int y = 12, col = 0;
+    for (int i = 0; i < textlen; i++) {
+        if (col >= 21) { col = 0; y += 10; }
+        if (y > 52) break;
+        ssd1306_char(&s_oled, col * 6, y, text[i]);
+        col++;
+    }
+    ssd1306_show(&s_oled);
+}
 
 void sd_log_init(void) {
     s_log_name[0] = 0;
     s_log_mounted = (f_mount(&s_log_fs, "", 1) == FR_OK);   // forces card init now
+    s_oled_ok = ssd1306_init(&s_oled, &gw_bus, OLED_ADDR, 128, 64);
+    if (s_oled_ok) {
+        ssd1306_clear(&s_oled);
+        ssd1306_text(&s_oled, 0, 0,  "slow_bus gateway");
+        ssd1306_text(&s_oled, 0, 12, s_log_mounted ? "SD: ready" : "SD: no card");
+        ssd1306_show(&s_oled);
+    }
 }
 
 // pull an 8.3 name (1..12 chars) from args into out[13]; false on bad/empty
@@ -3830,21 +3896,19 @@ static uint8_t cmd_log_write(shell_reader_t* args, shell_writer_t* result) {
     uint16_t n = sr_remaining(args);
     if (n > 200) return SHELL_STATUS_BAD_ARGS;              // text fits one USB block
     char line[224];
-    uint32_t v = s_log_seq;
-    line[0] = '[';                                          // "[NNNNNNNNNN] " placeholder stamp
-    for (int i = 10; i >= 1; i--) { line[i] = (char)('0' + (v % 10)); v /= 10; }
-    line[11] = ']'; line[12] = ' ';
-    int p = 13;
+    int ts = log_stamp(line);                              // "YYYY-MM-DD HH:MM:SS " (20)
+    int p = ts;
     for (uint16_t i = 0; i < n; i++) line[p++] = (char)sr_u8(args);
-    line[p++] = '\n';
     if (args->overflow) return SHELL_STATUS_BAD_ARGS;
+    line[p++] = '\n';
     FIL fp;
     if (f_open(&fp, s_log_name, FA_OPEN_APPEND | FA_WRITE) != FR_OK) return SHELL_STATUS_CMD_FAILED;
     UINT bw = 0;
     FRESULT fr = f_write(&fp, line, (UINT)p, &bw);
     f_close(&fp);                                           // close = flush (durable)
-    s_log_seq++;
-    return (fr == FR_OK && bw == (UINT)p) ? SHELL_STATUS_OK : SHELL_STATUS_CMD_FAILED;
+    if (fr != FR_OK || bw != (UINT)p) return SHELL_STATUS_CMD_FAILED;
+    oled_last(line, &line[ts], (int)n);                    // last log -> OLED
+    return SHELL_STATUS_OK;
 }
 
 static uint8_t cmd_log_read(shell_reader_t* args, shell_writer_t* result) {
