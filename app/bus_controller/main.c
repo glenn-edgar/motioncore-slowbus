@@ -175,6 +175,19 @@ static SemaphoreHandle_t g_lock;
 #define UNLOCK() xSemaphoreGive(g_lock)
 
 static host_link_t g_hl;
+static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitted on each host (re)attach
+
+// Boot banner as an OP_DBG_LOG frame. Emitted once at boot AND re-emitted on every
+// host-attach edge (uplink_task): the cold-boot emit happens before any host can
+// attach, and the SDK drops CDC output while disconnected, so the attach-time
+// re-emit is what actually makes `ident` observable over USB. Caller serializes
+// host_link access (boot path is pre-scheduler; uplink holds g_lock).
+static void bc_emit_boot_banner(void) {
+    char b[64];
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d",
+                     (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc);
+    (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
+}
 
 #define ROSTER_MAX 16
 typedef struct {
@@ -446,6 +459,7 @@ static void uplink_task(void *arg) {
             g_poll_enabled = 0; g_cmd_pending = false; g_roster_n = 0; g_cursor = 0;
             UNLOCK();
         }
+        bool attached = (!prev_conn && conn);  // host just attached -> banner becomes deliverable
         prev_conn = conn;
         g_host_connected = conn;                   // core0-published condition for core1
 
@@ -455,6 +469,7 @@ static void uplink_task(void *arg) {
         while ((c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT)
             host_link_feed(&g_hl, (uint8_t)c);     // may invoke on_bus_msg/on_local_shell
         host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), conn);
+        if (attached) bc_emit_boot_banner();   // re-announce identity to the freshly-attached host
         while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)   // relay core1 replies/reports
             (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
         n = host_link_tx_drain(&g_hl, out, sizeof out);
@@ -1348,7 +1363,7 @@ int main(void) {
     // LittleFS region lands (Step 2) this validates chip/variant/uuid/addr; Step 4
     // turns a mismatch into a hard refuse. For now we only log the result.
     identity_t ident; (void)ident;
-    int id_rc = boot_read_identity(&ident);
+    g_id_rc = boot_read_identity(&ident);
 
     bus_phy_init(BUS_DEFAULT_BAUD);   // installs the RX IRQ on core0
     bus_asm_init(&g_bc, BUS_ADDR_MASTER, true);
@@ -1363,10 +1378,9 @@ int main(void) {
     host_link_init(&g_hl, &cfg);
     host_link_set_callbacks(&g_hl, on_bus_msg, on_local_shell, NULL);
 
-    // Boot banner as an OP_DBG_LOG frame (the Pi controller logs it).
-    { char b[64]; int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d",
-                                   (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], id_rc);
-      (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n); }
+    // Boot banner as an OP_DBG_LOG frame (the Pi controller logs it). Also
+    // re-emitted on each host-attach edge in uplink_task (see bc_emit_boot_banner).
+    bc_emit_boot_banner();
 
     g_lock = xSemaphoreCreateMutex();
     if (!g_lock) chassis_panic(RST_PANIC, 1);
