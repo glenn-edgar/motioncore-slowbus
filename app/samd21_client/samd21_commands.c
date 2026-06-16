@@ -304,7 +304,9 @@ static void tc3_start_at_period(uint16_t period) {
     BOUNDED_SPIN(TC3->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
+#ifdef I2C_CLIENT
 static void adc_isr_service(void);   // ADC step, keyed off this tone clock (defined below)
+#endif
 
 // TC3 is the master clock: it generates the DAC waveform AND, in ADC mode, keys
 // the ADC sampler. Both run from this one ISR.
@@ -335,7 +337,9 @@ void TC3_Handler(void) {
         }
     }
 
+#ifdef I2C_CLIENT
     adc_isr_service();                    // ADC step (no-op unless the ADC engine is running)
+#endif
 }
 
 // ---------- CMD_DAC_WAVEFORM_WRITE ---------------------------------------
