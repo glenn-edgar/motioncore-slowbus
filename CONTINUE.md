@@ -197,9 +197,18 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
       matched). Negative test: wrong-UID image → `ident=-6` (IDENT_ERR_UUID), so
       the mis-flash guard is real. Flash recipe: `picotool reboot -f -u` →
       `picotool load cfg.uf2` (no -x) → `picotool reboot`.
-      **NEXT: 2c / Step 4** = ACT on the identity — use `ident.addr` instead of the
-      baked master default, and turn a mismatch (chip/variant/uuid/addr) into a
-      hard refuse (`chassis_panic`) instead of today's log-only `ident=<code>`.
+- [x] **Step 2c / Step 4 DONE + HW-verified (2026-06-16).** `main.c` now ACTS on
+      the identity: OK → operate using `ident.addr` (0x00 for a master); MISSING →
+      tolerate (baked defaults), with `-DIDENT_REQUIRE_PRESENT` to refuse instead
+      (production lockdown); MISMATCH (FORMAT/SCHEMA/CHIP/VARIANT/UUID/ADDR) →
+      **REFUSE**. Refuse is a *quarantine*, NOT `chassis_panic` (that
+      watchdog_reboots → a persistent mismatch boot-loops, undiagnosable): the unit
+      boots far enough to stay diagnosable (banner shows `ident=<code> REFUSED`,
+      ping answers) but `bus_control_task` early-continues so the arbiter never
+      drives the wire. Verified: good→`ident=0` operational; wrong-UID→`ident=-6
+      REFUSED` with ping still OK; restored→`ident=0`.
+      **NEXT** = Step 5 workbench regression pass, then the SLAVE image + `slvr`
+      roster (which first needs the `g_roster` vs `core/bus_roster.c` reconcile).
 - [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
       `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
       OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over
