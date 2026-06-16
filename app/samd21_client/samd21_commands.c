@@ -3778,6 +3778,102 @@ static uint8_t cmd_i2c_scan(shell_reader_t* args, shell_writer_t* result) {
     return SHELL_STATUS_OK;
 }
 
+// ---------- SD-card text logging (gateway only; FatFs on the XIAO base) ----
+// Host-driven: open/close/write/read/delete one file at a time, no directories.
+// Each write/read does open->op->close so every record is flushed (power-safe).
+// STEP A: timestamp is a per-boot sequence number; the real RTC stamp + OLED
+// last-log land with the pcf8563/ssd1306 binding.
+#ifndef I2C_CLIENT
+#include "ff.h"
+
+static FATFS    s_log_fs;
+static bool     s_log_mounted;
+static char     s_log_name[13];     // active 8.3 file (+NUL); empty = none
+static uint32_t s_log_seq;          // placeholder timestamp source
+
+void sd_log_init(void) {
+    s_log_name[0] = 0;
+    s_log_mounted = (f_mount(&s_log_fs, "", 1) == FR_OK);   // forces card init now
+}
+
+// pull an 8.3 name (1..12 chars) from args into out[13]; false on bad/empty
+static bool log_name(shell_reader_t* args, char* out) {
+    uint16_t n = sr_remaining(args);
+    if (n == 0 || n > 12) return false;
+    for (uint16_t i = 0; i < n; i++) out[i] = (char)sr_u8(args);
+    out[n] = 0;
+    return !args->overflow;
+}
+
+static uint8_t cmd_log_open(shell_reader_t* args, shell_writer_t* result) {
+    char name[13];
+    if (!log_name(args, name)) return SHELL_STATUS_BAD_ARGS;
+    if (!s_log_mounted)        return SHELL_STATUS_CMD_FAILED;
+    FIL fp;
+    if (f_open(&fp, name, FA_OPEN_ALWAYS | FA_READ) != FR_OK) return SHELL_STATUS_CMD_FAILED;
+    uint32_t sz = (uint32_t)f_size(&fp);
+    f_close(&fp);
+    for (int i = 0; i < 13; i++) s_log_name[i] = name[i];   // becomes the active file
+    sw_u32(result, sz);
+    return SHELL_STATUS_OK;
+}
+
+static uint8_t cmd_log_close(shell_reader_t* args, shell_writer_t* result) {
+    (void)args; (void)result;
+    s_log_name[0] = 0;
+    return SHELL_STATUS_OK;
+}
+
+static uint8_t cmd_log_write(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    if (!s_log_mounted || s_log_name[0] == 0) return SHELL_STATUS_CMD_FAILED;
+    uint16_t n = sr_remaining(args);
+    if (n > 200) return SHELL_STATUS_BAD_ARGS;              // text fits one USB block
+    char line[224];
+    uint32_t v = s_log_seq;
+    line[0] = '[';                                          // "[NNNNNNNNNN] " placeholder stamp
+    for (int i = 10; i >= 1; i--) { line[i] = (char)('0' + (v % 10)); v /= 10; }
+    line[11] = ']'; line[12] = ' ';
+    int p = 13;
+    for (uint16_t i = 0; i < n; i++) line[p++] = (char)sr_u8(args);
+    line[p++] = '\n';
+    if (args->overflow) return SHELL_STATUS_BAD_ARGS;
+    FIL fp;
+    if (f_open(&fp, s_log_name, FA_OPEN_APPEND | FA_WRITE) != FR_OK) return SHELL_STATUS_CMD_FAILED;
+    UINT bw = 0;
+    FRESULT fr = f_write(&fp, line, (UINT)p, &bw);
+    f_close(&fp);                                           // close = flush (durable)
+    s_log_seq++;
+    return (fr == FR_OK && bw == (UINT)p) ? SHELL_STATUS_OK : SHELL_STATUS_CMD_FAILED;
+}
+
+static uint8_t cmd_log_read(shell_reader_t* args, shell_writer_t* result) {
+    uint32_t off = sr_u32(args);
+    uint8_t  len = sr_u8(args);
+    if (args->overflow) return SHELL_STATUS_BAD_ARGS;
+    if (!s_log_mounted || s_log_name[0] == 0) return SHELL_STATUS_CMD_FAILED;
+    if (len > 60) len = 60;                                 // result-budget cap
+    FIL fp;
+    if (f_open(&fp, s_log_name, FA_READ) != FR_OK) return SHELL_STATUS_CMD_FAILED;
+    if (f_lseek(&fp, off) != FR_OK) { f_close(&fp); return SHELL_STATUS_CMD_FAILED; }
+    uint8_t buf[60]; UINT br = 0;
+    FRESULT fr = f_read(&fp, buf, len, &br);
+    f_close(&fp);
+    if (fr != FR_OK) return SHELL_STATUS_CMD_FAILED;
+    sw_bytes(result, buf, (uint16_t)br);                    // br < len => EOF
+    return SHELL_STATUS_OK;
+}
+
+static uint8_t cmd_log_delete(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    char name[13];
+    if (!log_name(args, name)) return SHELL_STATUS_BAD_ARGS;
+    if (!s_log_mounted)        return SHELL_STATUS_CMD_FAILED;
+    s_log_name[0] = 0;                                      // deleting clears the active file
+    return (f_unlink(name) == FR_OK) ? SHELL_STATUS_OK : SHELL_STATUS_CMD_FAILED;
+}
+#endif // !I2C_CLIENT
+
 // ---------- CMD_TEST_HANG -------------------------------------------------
 // Layer-2 WDT bench probe. Disables IRQs and spins; the layer-2 WDT bites
 // after ~4 s and the chip resets. Never returns a reply frame.
@@ -3889,6 +3985,13 @@ static const shell_cmd_entry_t g_chip_commands[] = {
     { CMD_I2C_READ,            "i2c_read",           cmd_i2c_read           },
     { CMD_I2C_WRITE_READ,      "i2c_write_read",     cmd_i2c_write_read     },
     { CMD_I2C_SCAN,            "i2c_scan",           cmd_i2c_scan           },
+#ifndef I2C_CLIENT
+    { CMD_LOG_OPEN,            "log_open",           cmd_log_open           },
+    { CMD_LOG_CLOSE,           "log_close",          cmd_log_close          },
+    { CMD_LOG_WRITE,           "log_write",          cmd_log_write          },
+    { CMD_LOG_READ,            "log_read",           cmd_log_read           },
+    { CMD_LOG_DELETE,          "log_delete",         cmd_log_delete         },
+#endif
 #ifdef I2C_CLIENT
     { CMD_FILE_BEGIN,          "file_begin",         cmd_file_begin         },
     { CMD_FILE_DATA,           "file_data",          cmd_file_data          },
@@ -3933,5 +4036,6 @@ void samd21_peripherals_init(void) {
     i2c_slave_init();   // SERCOM2 = I2C slave to the Pico master (D4/D5)
 #else
     i2c_init();         // SERCOM2 = I2C master for the dongle's own devices
+    sd_log_init();      // gateway: SD card + FatFs mount for host logging
 #endif
 }
