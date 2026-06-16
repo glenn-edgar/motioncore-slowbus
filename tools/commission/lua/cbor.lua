@@ -6,6 +6,12 @@
 local bit = require("bit")
 local M = {}
 
+-- Wrap a Lua string so enc() emits it as a CBOR byte string (major 2) instead of
+-- a text string (major 3) -- e.g. the idnt `id` UUID, which the Pico reads via
+-- cbor_str(CBOR_BYTES). Usage: cbor.encode({ id = cbor.bytes(raw8) }).
+M._bytes_mt = {}
+function M.bytes(s) return setmetatable({ s }, M._bytes_mt) end
+
 local function head(major, n)
     local mb = major * 32                       -- major type in the top 3 bits
     if n < 24 then return string.char(mb + n)
@@ -35,7 +41,9 @@ local function enc(v)
     elseif t == "boolean" then
         return string.char(v and 0xf5 or 0xf4)  -- simple: true/false
     elseif t == "table" then
-        if is_array(v) then
+        if getmetatable(v) == M._bytes_mt then
+            return head(2, #v[1]) .. v[1]        -- major 2: byte string
+        elseif is_array(v) then
             local parts = { head(4, #v) }       -- major 4: array
             for i = 1, #v do parts[#parts + 1] = enc(v[i]) end
             return table.concat(parts)
