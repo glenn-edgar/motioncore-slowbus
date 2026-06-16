@@ -78,6 +78,7 @@ OPT  := -Os -ffunction-sections -fdata-sections
 
 INC := \
   -I$(HERE) \
+  -I$(HERE)/fatfs \
   -I$(LIBCOMM) \
   -I$(SRC) \
   -I$(TUSB)/hw \
@@ -124,7 +125,9 @@ APP_SRCS := \
   $(HERE)/samd21_hal_pin.c \
   $(HERE)/samd21_pin_table.c \
   $(HERE)/samd21_interlocks.c \
-  $(HERE)/samd21_interlock_dsl.c
+  $(HERE)/samd21_interlock_dsl.c \
+  $(HERE)/fatfs/ff.c \
+  $(HERE)/fatfs/diskio.c
 
 LIBCOMM_SRCS := \
   $(LIBCOMM)/frame.c
