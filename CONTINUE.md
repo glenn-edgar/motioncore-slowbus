@@ -186,9 +186,20 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
       ≤240 B), latest-seq-wins, pure XIP reads (no flash writes → no dual-core
       hazard). Boot-time `cfg_layout_ok(&__flash_binary_end)` guard → PANIC 0x10 if
       the image overlaps the region. Verified: erased region → `ident=-1`,
-      `rst=POWER` (guard passed). **NEXT: 2b** = Lua image builder (`cfg_image.lua`)
-      → emit a 64 KB region with a real `idnt` entry, flash at the region base,
-      confirm `cfg_load` finds it. Then 2c = wire real `idnt` values + self-test.
+      `rst=POWER` (guard passed).
+- [x] **Step 2b DONE + HW-verified (2026-06-16).** Host image builder
+      `tools/commission/lua/cfg_image.lua` builds the `idnt` CBOR
+      `{v,ch,vr,ad,id}` (cbor.lua gained `cbor.bytes()` for the byte-string UID),
+      frames it into a 256-B store entry, emits a UF2 at the region base
+      (0x101F0000), and **auto-detects the board UID over libcomm** (picolink
+      OP_REGISTER) so the image is bound to the unit. Two-step flash verified on
+      the Pico W: firmware UF2 + separate `cfg.uf2` → `ident=0` (IDENT_OK, UUID
+      matched). Negative test: wrong-UID image → `ident=-6` (IDENT_ERR_UUID), so
+      the mis-flash guard is real. Flash recipe: `picotool reboot -f -u` →
+      `picotool load cfg.uf2` (no -x) → `picotool reboot`.
+      **NEXT: 2c / Step 4** = ACT on the identity — use `ident.addr` instead of the
+      baked master default, and turn a mismatch (chip/variant/uuid/addr) into a
+      hard refuse (`chassis_panic`) instead of today's log-only `ident=<code>`.
 - [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
       `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
       OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over
