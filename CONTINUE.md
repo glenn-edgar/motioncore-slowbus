@@ -179,8 +179,31 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
 - [x] All Step-1 work committed on `samd21-namespace-db` (EOD 2026-06-15).
 - [x] Pi has today's source (rsynced) + a clean `bus_controller.uf2` build.
 - [x] Memory updated (`pico-restructure`, `pico-build-deploy`) → loads each session.
-- [ ] Tomorrow: flash + verify Step 1 on a free Pico, then start **Step 2**
-      (config-FS region + real `cfg_load`).
+- [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
+      `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
+      OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over
+      the link matches `pico_get_unique_board_id()` == the future `idnt` `id`
+      field. Tooling: `tools/commission/lua/pico.lua` (+ `picolink.lua`).
+- [ ] **NEXT: Step 2** — config-FS region + real `cfg_load`.
+
+### Pico host tooling (LuaJIT — matches the stock-Pi, no-pip toolchain)
+`tools/commission/lua/picolink.lua` is the Pico USB-CDC libcomm client (SEPARATE
+from the departing SAMD21 `libcomm.lua`; frame addr is a parameter — 0x00 local
+shell, 0xFB appcore, 0x01 s2m). CLI `pico.lua`: `info` (decode OP_REGISTER),
+`ping` (appcore KB0 round-trip), `listen [secs]` (passive DBG_LOG/frame decode),
+`port`. Run on the Pi: `cd ~/slow_bus/tools/commission/lua && luajit pico.lua`.
+
+### Caveat — the `ident=-1` boot banner is NOT observable over USB yet
+The `[boot] … ident=-1` line is emitted ONCE at startup (main.c ~1369) into the
+host-link TX ring *before any host can attach*; the SDK drops CDC output while
+disconnected, so opening the port later never sees it — you get fresh
+`OP_REGISTER` re-announcements instead. Step-1 substance is still verified (BC
+boots, API works = graceful fallback), and `ident=-1` is a build-time certainty
+(`cfg_load` stub → `IDENT_ERR_MISSING`). **Recommended micro-fix:** in
+`uplink_task`, on the `conn` false→true edge (new attach), re-emit the boot
+banner via `host_link_s2m(&g_hl, 1, OP_DBG_LOG, …)` so `ident` is visible every
+time `pico.lua listen` opens the port. Small, isolated — do before Step 2 if we
+want the banner as live evidence.
 
 ## Build reminders (legacy host self-test still valid)
 ```sh
