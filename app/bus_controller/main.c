@@ -177,6 +177,7 @@ static SemaphoreHandle_t g_lock;
 
 static host_link_t g_hl;
 static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitted on each host (re)attach
+static volatile bool g_identity_refused;   // mismatch (or missing+IDENT_REQUIRE_PRESENT) -> bus arbiter quarantined
 
 // Boot banner as an OP_DBG_LOG frame. Emitted once at boot AND re-emitted on every
 // host-attach edge (uplink_task): the cold-boot emit happens before any host can
@@ -184,9 +185,10 @@ static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitte
 // re-emit is what actually makes `ident` observable over USB. Caller serializes
 // host_link access (boot path is pre-scheduler; uplink holds g_lock).
 static void bc_emit_boot_banner(void) {
-    char b[64];
-    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d",
-                     (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc);
+    char b[72];
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s",
+                     (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc,
+                     g_identity_refused ? " REFUSED" : "");
     (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
 }
 
@@ -364,6 +366,10 @@ static void bus_control_task(void *arg) {
     uint32_t sweep_next_ms = 0;
     for (;;) {
         g_hb[HB_BUS]++; g_hb_us[HB_BUS] = time_us_32();
+        // Identity refused -> quarantine: never drive the bus. Heartbeat keeps
+        // ticking (above) so the watchdog is satisfied; the monitor/uplink stay
+        // alive so the host can attach and read the refusal. (No bus_send here.)
+        if (g_identity_refused) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
         uint32_t now = to_ms_since_boot(get_absolute_time());
         bus_frame_t rf;
 
@@ -1366,11 +1372,31 @@ int main(void) {
     // Guard first: refuse to run if the firmware image overlaps the config region.
     extern char __flash_binary_end;   // SDK linker symbol: end of the .uf2 image
     if (!cfg_layout_ok(&__flash_binary_end)) chassis_panic(RST_PANIC, 0x10);
-    identity_t ident; (void)ident;
+    identity_t ident;
     g_id_rc = boot_read_identity(&ident);
 
+    // Identity policy (Step 2c / Step 4):
+    //   OK       -> operate, using the per-unit RS-485 address from idnt.
+    //   MISSING  -> tolerate: fall back to baked defaults. -DIDENT_REQUIRE_PRESENT
+    //               makes an absent config a refuse too (production lockdown).
+    //   MISMATCH -> REFUSE. A unit must never operate wearing the wrong identity.
+    //               We do NOT chassis_panic (that watchdog_reboots -> a persistent
+    //               mismatch boot-loops, so the host can never read why); instead we
+    //               boot far enough to stay diagnosable (banner + ping report the
+    //               code) and quarantine the bus arbiter so it never drives the wire.
+    if (g_id_rc == IDENT_OK) {
+        /* operational; addr taken from ident below */
+    } else if (g_id_rc == IDENT_ERR_MISSING) {
+#ifdef IDENT_REQUIRE_PRESENT
+        g_identity_refused = true;
+#endif
+    } else {
+        g_identity_refused = true;   // FORMAT/SCHEMA/CHIP/VARIANT/UUID/ADDR mismatch
+    }
+    uint8_t self_addr = (g_id_rc == IDENT_OK) ? ident.addr : BUS_ADDR_MASTER;
+
     bus_phy_init(BUS_DEFAULT_BAUD);   // installs the RX IRQ on core0
-    bus_asm_init(&g_bc, BUS_ADDR_MASTER, true);
+    bus_asm_init(&g_bc, self_addr, true);
 
     host_link_cfg_t cfg = {
         .class_id = CLASS_ID_BUS_CONTROLLER, .instance_id = BC_INSTANCE_ID,
