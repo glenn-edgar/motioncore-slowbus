@@ -179,6 +179,16 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
 - [x] All Step-1 work committed on `samd21-namespace-db` (EOD 2026-06-15).
 - [x] Pi has today's source (rsynced) + a clean `bus_controller.uf2` build.
 - [x] Memory updated (`pico-restructure`, `pico-build-deploy`) → loads each session.
+- [x] **Step 2a DONE + HW-verified (2026-06-16).** Config-FS format decided:
+      **reuse the SAMD21 boot-store entry format, READ-ONLY** (not LittleFS, not a
+      new blob) — `app/bus_controller/cfg_file.c` scans the top 64 KB of flash
+      (256×256-B rows, magic `0x10C0FFEE` + seq + name[4] + len + CRC-8/AUTOSAR +
+      ≤240 B), latest-seq-wins, pure XIP reads (no flash writes → no dual-core
+      hazard). Boot-time `cfg_layout_ok(&__flash_binary_end)` guard → PANIC 0x10 if
+      the image overlaps the region. Verified: erased region → `ident=-1`,
+      `rst=POWER` (guard passed). **NEXT: 2b** = Lua image builder (`cfg_image.lua`)
+      → emit a 64 KB region with a real `idnt` entry, flash at the region base,
+      confirm `cfg_load` finds it. Then 2c = wire real `idnt` values + self-test.
 - [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
       `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
       OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over

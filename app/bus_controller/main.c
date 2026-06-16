@@ -58,6 +58,7 @@
 #include "commission.h"
 #include "variants.h"        // shared product/variant enum + role derivation
 #include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
+#include "cfg_file.h"        // read-only config store (cfg_load / cfg_layout_ok)
 
 // core1 chain_tree engine (KB0)
 #include "cfl_runtime.h"
@@ -1358,10 +1359,13 @@ int main(void) {
     g_crash.boot_count++;
 
     // ---- per-unit identity from the config FS (two-step flash) --------------
-    // Step 1: cfg_load() is stubbed -> reads ABSENT, so id_rc = IDENT_ERR_MISSING
-    // and we fall back to the baked defaults below (no behavior change). When the
-    // LittleFS region lands (Step 2) this validates chip/variant/uuid/addr; Step 4
-    // turns a mismatch into a hard refuse. For now we only log the result.
+    // Step 2a: cfg_load() now scans the read-only config region. Until an image is
+    // flashed there (Step 2b) the region reads erased -> id_rc = IDENT_ERR_MISSING
+    // and we fall back to baked defaults (no behavior change). Step 4 turns a
+    // chip/variant/uuid/addr mismatch into a hard refuse; for now we only log it.
+    // Guard first: refuse to run if the firmware image overlaps the config region.
+    extern char __flash_binary_end;   // SDK linker symbol: end of the .uf2 image
+    if (!cfg_layout_ok(&__flash_binary_end)) chassis_panic(RST_PANIC, 0x10);
     identity_t ident; (void)ident;
     g_id_rc = boot_read_identity(&ident);
 
