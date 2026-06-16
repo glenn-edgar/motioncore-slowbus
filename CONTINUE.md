@@ -1,22 +1,27 @@
 # CONTINUE — slow_bus pick-up doc
 
 Read first on any session resume. Companion to `README.md` (orientation) and
-`docs/README.md` (full spec). Last updated **2026-06-15 (end of day)**.
+`docs/README.md` (full spec). Last updated **2026-06-16**.
 
 ---
 
 ## TL;DR — where we are
 
 The bus + 5 SAMD21 modes + commission toolchain are **done and HW-verified**
-(see git history + memory). Today began a **major restructure** and the first
-firmware in the new model. Branch: **`samd21-namespace-db`** (work committed at
-EOD today).
+(see git history + memory). The **restructure** to the shared Pico/Pico2 model is
+underway. Branch: **`samd21-namespace-db`** (not pushed).
 
-**Tomorrow's first action:** start integration on the Pi. Step 1 firmware is
-already built there (`~/slow_bus/build/bus_controller.uf2`, builds clean). Flash
-it when a Pico is free (today the USB bus was occupied by xiao_blocks SAMD21s),
-confirm the boot log reads `ident=-1` and the bench API is unchanged, then start
-**Step 2** (config-FS region + real `cfg_load`).
+**TEST #1 is COMPLETE + HW-verified (2026-06-16):** single USB bus controller,
+two-step flash, per-unit identity from a read-only config-FS, all 5 steps done.
+The Pico boots, reads/validates `idnt` from the config region (`ident=0`),
+refuses a mis-flashed identity as a diagnosable quarantine (`ident=-6 REFUSED`),
+and passes an 11/11 workbench regression. See the checklist at the bottom for the
+per-step detail (config-FS format = SAMD21 boot-store, read-only).
+
+**Next options:** (1) the **SLAVE image + `slvr` roster** — first reconcile the
+`main.c` local `g_roster` vs `core/bus_roster.c` (see Deferred); (2) push the
+branch. The LuaJIT Pico toolchain lives in `tools/commission/lua/`
+(`pico.lua`, `picolink.lua`, `cfg_image.lua`, `pico_regress.lua`).
 
 ---
 
@@ -207,8 +212,14 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
       ping answers) but `bus_control_task` early-continues so the arbiter never
       drives the wire. Verified: good→`ident=0` operational; wrong-UID→`ident=-6
       REFUSED` with ping still OK; restored→`ident=0`.
-      **NEXT** = Step 5 workbench regression pass, then the SLAVE image + `slvr`
-      roster (which first needs the `g_roster` vs `core/bus_roster.c` reconcile).
+- [x] **Step 5 workbench regression DONE + HW-verified (2026-06-16).**
+      `tools/commission/lua/pico_regress.lua` — 11/11 PASS, exit 0. Covers both
+      frame routes (appcore 0xFB: REGISTER identity + MON_PING; local shell 0x00:
+      ECHO with SLIP-escape-heavy payload byte-exact round-trip, unknown-cmd error
+      path, roster CRUD with class_id round-trip, SET_POLL/POLL_ENABLE). No slaves,
+      no HIL pins -> bench-safe. **TEST #1 COMPLETE (all 5 steps done + HW-verified).**
+      **NEXT** = the SLAVE image + `slvr` roster (which first needs the `g_roster`
+      vs `core/bus_roster.c` reconcile), and/or push the branch.
 - [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
       `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
       OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over
