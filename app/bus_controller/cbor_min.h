@@ -21,8 +21,11 @@ static inline void cbor_init(cbor_t *c, const uint8_t *b, uint32_t n) { c->p = b
 // past the header only. False on truncation or an unsupported encoding.
 static inline bool cbor_hdr(cbor_t *c, int *major, uint64_t *arg) {
     if (c->p >= c->end) return false;
-    uint8_t b = *c->p++; *major = b >> 5; uint8_t n = b & 0x1F; uint64_t v = n;
+    uint8_t b = *c->p++; *major = b >> 5; uint8_t n = b & 0x1F;
     if (n >= 28) return false;                       // reserved / indefinite
+    // n in 0..23 is the value itself; n in 24..27 means the value is the next
+    // 1/2/4/8 bytes (n is only the length indicator, NOT part of the value).
+    uint64_t v = (n < 24) ? n : 0;
     int nb = (n == 24) ? 1 : (n == 25) ? 2 : (n == 26) ? 4 : (n == 27) ? 8 : 0;
     for (int i = 0; i < nb; i++) { if (c->p >= c->end) return false; v = (v << 8) | *c->p++; }
     *arg = v; return true;
