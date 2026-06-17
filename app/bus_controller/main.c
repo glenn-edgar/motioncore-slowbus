@@ -58,6 +58,7 @@
 #include "commission.h"
 #include "variants.h"        // shared product/variant enum + role derivation
 #include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
+#include "boot_roster.h"     // read the master's slave roster ('slvr' config file)
 #include "cfg_file.h"        // read-only config store (cfg_load / cfg_layout_ok)
 
 // core1 chain_tree engine (KB0)
@@ -178,6 +179,9 @@ static SemaphoreHandle_t g_lock;
 static host_link_t g_hl;
 static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitted on each host (re)attach
 static volatile bool g_identity_refused;   // mismatch (or missing+IDENT_REQUIRE_PRESENT) -> bus arbiter quarantined
+static uint8_t g_cfg_roster_n;   // slaves loaded from the 'slvr' config file at boot (0 if none)
+static uint16_t g_poll_period_ms = 500;
+static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
 
 // Boot banner as an OP_DBG_LOG frame. Emitted once at boot AND re-emitted on every
 // host-attach edge (uplink_task): the cold-boot emit happens before any host can
@@ -185,10 +189,10 @@ static volatile bool g_identity_refused;   // mismatch (or missing+IDENT_REQUIRE
 // re-emit is what actually makes `ident` observable over USB. Caller serializes
 // host_link access (boot path is pre-scheduler; uplink holds g_lock).
 static void bc_emit_boot_banner(void) {
-    char b[72];
-    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s",
+    char b[88];
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s slvr=%u",
                      (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc,
-                     g_identity_refused ? " REFUSED" : "");
+                     g_identity_refused ? " REFUSED" : "", (unsigned)g_cfg_roster_n);
     (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
 }
 
@@ -200,9 +204,6 @@ typedef struct {
 } slave_t;
 static slave_t  g_roster[ROSTER_MAX];
 static uint8_t  g_roster_n, g_cursor;
-static uint16_t g_poll_period_ms = 500;
-static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
-
 // one injected command in flight (host -> slave), set by on_bus_msg under lock.
 static bool     g_cmd_pending;
 static uint8_t  g_cmd_slave; static uint16_t g_cmd_op, g_cmd_req_id;
@@ -453,6 +454,27 @@ static void bus_control_task(void *arg) {
 }
 
 // ---- uplink thread: USB-CDC libcomm host link ------------------------------
+// (Re)load the commissioned roster from the 'slvr' config file into g_roster and
+// arm the poll schedule. Called at boot AND on every host-disconnect re-arm, so a
+// commissioned BC keeps polling its bus autonomously (host registrations are
+// transient session overrides; the config roster is the persistent baseline).
+// Caller serializes g_roster access (boot is pre-scheduler; uplink holds g_lock).
+static void bc_load_cfg_roster(void) {
+    g_roster_n = 0; g_cursor = 0; g_cfg_roster_n = 0;
+    if (g_identity_refused) { g_poll_enabled = 0; return; }   // quarantine: no polling
+    roster_cfg_t rc;
+    if (boot_read_roster(&rc) != ROSTER_OK) { g_poll_enabled = 0; return; }
+    for (uint8_t i = 0; i < rc.n && g_roster_n < ROSTER_MAX; i++) {
+        slave_t *s = &g_roster[g_roster_n++]; memset(s, 0, sizeof *s);
+        s->addr = rc.s[i].addr; s->class_id = rc.s[i].variant; s->flags = rc.s[i].flags;
+    }
+    if (rc.grant_period_ms) g_poll_period_ms   = rc.grant_period_ms;
+    if (rc.max_misses)      g_poll_max_misses  = rc.max_misses;
+    if (rc.tcp_retries)     g_poll_tcp_retries = rc.tcp_retries;
+    g_cfg_roster_n = g_roster_n;
+    g_poll_enabled = (g_roster_n > 0);   // a config roster -> poll immediately
+}
+
 static void uplink_task(void *arg) {
     (void)arg;
     bool prev_conn = false;
@@ -463,7 +485,8 @@ static void uplink_task(void *arg) {
         if (prev_conn && !conn) {              // host went away -> re-arm
             LOCK();
             host_link_reset_boot(&g_hl);
-            g_poll_enabled = 0; g_cmd_pending = false; g_roster_n = 0; g_cursor = 0;
+            g_cmd_pending = false;
+            bc_load_cfg_roster();   // drop host-registered slaves; restore the commissioned roster
             UNLOCK();
         }
         bool attached = (!prev_conn && conn);  // host just attached -> banner becomes deliverable
@@ -1407,6 +1430,12 @@ int main(void) {
     memcpy(cfg.chip_uid, uid.id, sizeof uid.id);
     host_link_init(&g_hl, &cfg);
     host_link_set_callbacks(&g_hl, on_bus_msg, on_local_shell, NULL);
+
+    // Master roster from the config-FS ('slvr'): a commissioned BC comes up polling
+    // its bus on its own, without waiting for the host to register slaves. Absent
+    // 'slvr' -> empty roster (the host can still register over USB). Re-run on every
+    // host-disconnect re-arm so the commissioned roster survives host churn.
+    bc_load_cfg_roster();
 
     // Boot banner as an OP_DBG_LOG frame (the Pi controller logs it). Also
     // re-emitted on each host-attach edge in uplink_task (see bc_emit_boot_banner).

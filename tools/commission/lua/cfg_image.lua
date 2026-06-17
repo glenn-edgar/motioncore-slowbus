@@ -67,7 +67,11 @@ local function hex_to_bytes(h)
 end
 
 -- ---- args -----------------------------------------------------------------
-local opt = { out = "cfg.uf2", chip = 0, variant = 1, addr = 0, flash_size = 2 * 1024 * 1024 }
+-- --slvr "addr:variant:flags,addr:variant:flags"   (variant default 3=SLAVE_RS485,
+--                                                   flags default 2=ENABLED)
+-- --poll "period_ms:max_misses:tcp_retries[:window_us]"   (default 200:3:2:0)
+local opt = { out = "cfg.uf2", chip = 0, variant = 1, addr = 0, flash_size = 2 * 1024 * 1024,
+              poll = "200:3:2" }
 local i = 1
 while i <= #arg do
     local a = arg[i]
@@ -77,6 +81,8 @@ while i <= #arg do
     elseif a == "--chip"       then opt.chip = tonumber(nextval())
     elseif a == "--variant"    then opt.variant = tonumber(nextval())
     elseif a == "--addr"       then opt.addr = tonumber(nextval())
+    elseif a == "--slvr"       then opt.slvr = nextval()
+    elseif a == "--poll"       then opt.poll = nextval()
     elseif a == "--flash-size" then opt.flash_size = tonumber(nextval())
     elseif a == "--port"       then opt.port = nextval()
     else error("unknown arg: " .. a) end
@@ -96,19 +102,51 @@ if not opt.uid then
     io.write("[cfg_image] auto-detected UID " .. opt.uid .. " from " .. port .. "\n")
 end
 
--- ---- build idnt -> entry -> UF2 -------------------------------------------
+-- ---- build the config entries --------------------------------------------
+-- All entries share one 4 KB flash sector, so they MUST go in one UF2 (a separate
+-- picotool load of one row would erase the sector and wipe the others).
+local function split(s, sep) local t = {}; for x in (s or ""):gmatch("([^" .. sep .. "]+)") do t[#t+1] = x end; return t end
+
+local entries = {}   -- { {name=..., data=...}, ... } in row order
+
+-- idnt (always)
 local uid_raw = hex_to_bytes(opt.uid)
 assert(#uid_raw == 8, "Pico UID must be 8 bytes (16 hex chars), got " .. #uid_raw)
-
 local idnt = cbor.encode({ v = 1, ch = opt.chip, vr = opt.variant, ad = opt.addr,
                            id = cbor.bytes(uid_raw) })
 assert(#idnt <= STORE_DATA_MAX, "idnt CBOR too big: " .. #idnt)
+entries[#entries + 1] = { name = "idnt", data = idnt }
 
+-- slvr (optional, master roster)
+local slvr_desc = ""
+if opt.slvr then
+    local pp = split(opt.poll, ":")
+    local slaves = {}
+    for _, e in ipairs(split(opt.slvr, ",")) do
+        local f = split(e, ":")
+        local addr = tonumber(f[1])
+        assert(addr, "bad --slvr entry: " .. e)
+        slaves[#slaves + 1] = { addr, tonumber(f[2]) or 3, tonumber(f[3]) or 0x02 }  -- addr,variant,flags
+    end
+    local slvr = cbor.encode({
+        v = 1, p = tonumber(pp[1]) or 200, m = tonumber(pp[2]) or 3,
+        r = tonumber(pp[3]) or 2, w = tonumber(pp[4]) or 0, s = slaves })
+    assert(#slvr <= STORE_DATA_MAX, "slvr CBOR too big: " .. #slvr .. " B (>" .. STORE_DATA_MAX .. ")")
+    entries[#entries + 1] = { name = "slvr", data = slvr }
+    slvr_desc = (" + slvr{%d slaves, poll %s}"):format(#slaves, opt.poll)
+end
+
+-- ---- entries -> rows -> multi-block UF2 ------------------------------------
 local base = 0x10000000 + opt.flash_size - 0x10000   -- top 64 KB of flash
-local row  = build_entry("idnt", 1, idnt)
-local uf2  = uf2_block(base, row, 0, 1, UF2_FAMILY_RP2040)
+local blocks = {}
+for n, e in ipairs(entries) do
+    local row = build_entry(e.name, n, e.data)        -- seq = row index (all distinct names anyway)
+    blocks[#blocks + 1] = uf2_block(base + (n - 1) * 256, row, n - 1, #entries, UF2_FAMILY_RP2040)
+end
+local uf2 = table.concat(blocks)
 
 local f = assert(io.open(opt.out, "wb")); f:write(uf2); f:close()
 io.write(string.format(
-    "[cfg_image] %s: idnt{v=1,ch=%d,vr=%d,ad=%d,id=%s} %d B -> 256-B entry -> UF2 @ 0x%08X (%d B)\n",
-    opt.out, opt.chip, opt.variant, opt.addr, opt.uid, #idnt, base, #uf2))
+    "[cfg_image] %s: idnt{v=1,ch=%d,vr=%d,ad=%d,id=%s}%s -> %d entr%s -> UF2 @ 0x%08X (%d B)\n",
+    opt.out, opt.chip, opt.variant, opt.addr, opt.uid, slvr_desc,
+    #entries, #entries == 1 and "y" or "ies", base, #uf2))
