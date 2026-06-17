@@ -9,6 +9,7 @@
 // it to the PIO PHY and a single FreeRTOS task. NODE_ADDR is a build-time stand-in
 // until commissioning/identity is ported.
 // ============================================================================
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "FreeRTOS.h"
@@ -25,9 +26,37 @@
 #define NODE_ADDR 0x01u   // fallback when no idnt is flashed (uncommissioned)
 #endif
 
-// Example application hook: echo any DATA back to its sender.
+// Minimal node command responder. The BC injects a host shell-exec to this node
+// as DATA = [opcode u16][req_id u16][cmd u16][args]; we answer with
+// DATA = [OP_SHELL_REPLY u16][req_id u16][status u8][result...], which the BC
+// relays to the host as OP_SHELL_REPLY. Handles CMD_ECHO (returns the args); any
+// other cmd -> SHELL_UNKNOWN_CMD. (Skeleton app -- grows into the real node logic.)
+#define OP_SHELL_EXEC       0x0109u
+#define OP_SHELL_REPLY      0x0011u
+#define NODE_CMD_ECHO       0x0001u
+#define NODE_SHELL_OK       0u
+#define NODE_SHELL_UNKNOWN  1u
+
 void bus_node_on_data(uint8_t src, const uint8_t *payload, uint8_t len) {
-    bus_node_queue(src, BUS_FT_DATA, payload, len);
+    if (len < 6) return;
+    uint16_t op = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    if (op != OP_SHELL_EXEC) return;
+    uint16_t req = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    uint16_t cmd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+    const uint8_t *args = &payload[6];
+    uint8_t alen = (uint8_t)(len - 6);
+
+    uint8_t r[BUS_PAYLOAD_MAX]; uint8_t n = 0;
+    r[n++] = (uint8_t)(OP_SHELL_REPLY & 0xFF); r[n++] = (uint8_t)(OP_SHELL_REPLY >> 8);
+    r[n++] = (uint8_t)(req & 0xFF);            r[n++] = (uint8_t)(req >> 8);
+    if (cmd == NODE_CMD_ECHO) {
+        r[n++] = NODE_SHELL_OK;
+        if (alen > (uint8_t)(BUS_PAYLOAD_MAX - n)) alen = (uint8_t)(BUS_PAYLOAD_MAX - n);
+        memcpy(&r[n], args, alen); n = (uint8_t)(n + alen);
+    } else {
+        r[n++] = NODE_SHELL_UNKNOWN;
+    }
+    bus_node_queue(src, BUS_FT_DATA, r, n);
 }
 
 static void node_task(void *arg) {
