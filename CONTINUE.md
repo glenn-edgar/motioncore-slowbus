@@ -253,9 +253,23 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
       (`bus_node.c` is slave-only — the BC has its own arbiter — so the BC is
       untouched; regression still 11/11.) Driver `pico_slave.lua`; verified across
       payloads → `status=0`, exact echo.
-      **NEXT** = (a) the `slvr` roster (master loads its roster from a config file;
-      needs the `g_roster` vs `core/bus_roster.c` reconcile); (b) hoist the identity
-      stack to a shared `node/` dir; (c) push the local commits.
+- [x] **`slvr` roster from config-FS DONE + HW-verified (2026-06-16).** The BC loads
+      its slave roster + poll schedule from the `slvr` config file at boot and polls
+      autonomously — no host registration. `app/bus_controller/boot_roster.c` parses
+      `slvr` CBOR `{v,p,w,m,r,s:[[addr,variant,flags],…]}`; `bc_load_cfg_roster()`
+      populates `g_roster`/poll params and is re-run on every host-disconnect re-arm
+      so the commissioned roster survives host churn (host registrations are
+      transient overrides). `cfg_image.lua` now emits a MULTI-entry image (idnt+slvr
+      in one UF2 — they share a 4 KB sector, so a separate load would wipe the
+      other). Verified: BC boots `slvr=1`, polls slave `0x09` ALIVE with no host
+      register, round-trip OK, regression 11/11.
+      **Found+fixed a latent CBOR bug** (`cbor_min.h`): `cbor_hdr` initialized the
+      value to the additional-info nibble for n≥24, so any value/length/count ≥24
+      decoded wrong (200 → `0x18C8` = 6344). idnt dodged it (all values <24); `slvr`
+      period 200 was the first to hit it. Fix: `v = (n<24)?n:0`. Tools:
+      `pico_roster.lua`; `cfg_image.lua --slvr "addr:variant:flags" --poll p:m:r`.
+      **NEXT** = (a) hoist the identity/config stack to a shared `node/` dir;
+      (b) push the local commits; (c) the `g_roster`/`core/bus_roster.c` reconcile.
 - [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
       `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
       OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over
