@@ -10,6 +10,7 @@
 // until commissioning/identity is ported.
 // ============================================================================
 #include "pico/stdlib.h"
+#include "hardware/watchdog.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -50,6 +51,10 @@ int main(void) {
 }
 
 // --- FreeRTOS static-allocation hooks (SMP) ---------------------------------
+// configASSERT() -> chassis_assert() (FreeRTOSConfig.h). The skeleton has no
+// crash slot / panic plumbing yet, so reboot to recover (matches the BC's
+// watchdog_reboot policy) rather than wedging the node on the bus.
+void chassis_assert(int line) { (void)line; watchdog_reboot(0, 0, 0); for (;;) { tight_loop_contents(); } }
 void vApplicationMallocFailedHook(void) { for (;;); }
 void vApplicationStackOverflowHook(TaskHandle_t t, char *n) { (void)t; (void)n; for (;;); }
 
