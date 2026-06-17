@@ -116,11 +116,18 @@ if(I2C_SELFTEST)
     target_compile_definitions(bus_controller PRIVATE I2C_SELFTEST)
 endif()
 
-# Slave node: null uplink, node role, WiFi off.
+# Slave node: null uplink, node role, WiFi off. Shares the config-FS identity
+# stack with the BC (boot_identity/cfg_file/cbor_min/variants currently live in
+# app/bus_controller/ -- TODO: hoist to a shared node/ dir). BUILD_VARIANT marks
+# this image as the RS-485 slave product so boot_identity validates it.
 slow_bus_image(slave
     SRCS ${CMAKE_CURRENT_LIST_DIR}/app/slave/main.c
          ${PORT_DIR}/uplink_none.c
-    DEFS ROLE_SLAVE=1)
+         ${BC_DIR}/boot_identity.c
+         ${BC_DIR}/cfg_file.c
+    DEFS ROLE_SLAVE=1 BUILD_VARIANT=VARIANT_SLAVE_RS485)
+target_include_directories(slave PRIVATE ${BC_DIR})
+target_link_libraries(slave pico_unique_id hardware_flash)
 
 # ---------------------------------------------------------------------------
 # Chassis bring-up image (Pico W / RP2040): pure FreeRTOS-SMP + heartbeat-gated
