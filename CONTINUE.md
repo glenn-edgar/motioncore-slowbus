@@ -1,7 +1,7 @@
 # CONTINUE — slow_bus pick-up doc
 
 Read first on any session resume. Companion to `README.md` (orientation) and
-`docs/README.md` (full spec). Last updated **2026-06-16**.
+`docs/README.md` (full spec). Last updated **2026-06-16 (end of day)**.
 
 ---
 
@@ -9,19 +9,51 @@ Read first on any session resume. Companion to `README.md` (orientation) and
 
 The bus + 5 SAMD21 modes + commission toolchain are **done and HW-verified**
 (see git history + memory). The **restructure** to the shared Pico/Pico2 model is
-underway. Branch: **`samd21-namespace-db`** (not pushed).
+well underway. Branch: **`samd21-namespace-db`** — **pushed through `ef2a606`**
+(working tree clean).
 
-**TEST #1 is COMPLETE + HW-verified (2026-06-16):** single USB bus controller,
-two-step flash, per-unit identity from a read-only config-FS, all 5 steps done.
-The Pico boots, reads/validates `idnt` from the config region (`ident=0`),
-refuses a mis-flashed identity as a diagnosable quarantine (`ident=-6 REFUSED`),
-and passes an 11/11 workbench regression. See the checklist at the bottom for the
-per-step detail (config-FS format = SAMD21 boot-store, read-only).
+**A FULLY COMMISSIONED TWO-PICO RS-485 BUS IS WORKING + HW-verified (2026-06-16):**
+- **Test #1 complete**: single USB bus controller, two-step flash, per-unit
+  identity from a read-only config-FS (`ident=0`; mis-flash → `ident=-6 REFUSED`
+  quarantine), 11/11 workbench regression.
+- **Two-Pico bus**: BC (Pico W) + slave (plain Pico) over RS-485 (auto-direction
+  transceivers, TX=GP15/RX=GP16). Liveness (ALIVE/DEAD), **slave identity
+  commissioned from the config-FS** (slave moved to addr `0x09` via its `idnt`),
+  **DATA round-trip** (BC↔slave `CMD_ECHO`), and the **`slvr` roster** (BC loads
+  its roster from config and polls autonomously, no host register).
+- **Found+fixed a latent CBOR decoder bug** (`cbor_min.h`, n≥24 values decoded
+  wrong — surfaced as a 6.3 s poll period); added a host vector test
+  (`make -C tools test`). Confirmed the bug is NOT in `~/xiao_blocks` (no on-device
+  CBOR decoder there).
 
-**Next options:** (1) the **SLAVE image + `slvr` roster** — first reconcile the
-`main.c` local `g_roster` vs `core/bus_roster.c` (see Deferred); (2) push the
-branch. The LuaJIT Pico toolchain lives in `tools/commission/lua/`
-(`pico.lua`, `picolink.lua`, `cfg_image.lua`, `pico_regress.lua`).
+**Config-FS format = SAMD21 boot-store entries, READ-ONLY** (picotool-flashed, no
+runtime writes → the RP2040/RP2350 XIP-vs-multicore-lockout hazard never arises).
+
+**Tomorrow's options (pick one):** (1) **hoist** the identity/config stack
+(`boot_identity`, `boot_roster`, `cfg_file`, `cbor_min`, `variants`) from
+`app/bus_controller/` to a shared `node/` dir — it's now used by BOTH the BC and
+the slave (the slave reaches into `app/bus_controller/` via a CMake include, which
+is the one ugliness left); (2) the `g_roster` (cap 16) vs `core/bus_roster.c`
+(cap 32) reconcile; (3) more node app logic (real commands beyond CMD_ECHO).
+
+The LuaJIT Pico toolchain lives in `tools/commission/lua/`: `pico.lua`,
+`picolink.lua`, `cfg_image.lua`, `pico_regress.lua`, `pico_bus.lua`,
+`pico_slave.lua`, `pico_roster.lua`.
+
+### Hardware bench state (the two Picos on the Pi)
+- **BC** = Pico W, serial **`E6616408437D6628`**, runs `bus_controller.uf2`; config
+  region has idnt (vr=1 USB-BC, addr 0x00) + slvr (polls slave 0x09).
+- **Slave** = plain Pico (RP2040), serial **`E6605481DB611135`**, runs `slave.uf2`;
+  config region has idnt (vr=3 SLAVE_RS485, addr `0x09`).
+- Wired RS-485 (auto-direction): each `GP15`=TX→transceiver, `GP16`=RX←transceiver.
+- **Multi-Pico flashing (picotool v2.2.0):** target by serial — `sudo picotool
+  load -x -f --ser <serial> <uf2>`. The `reboot` subcmd rejects `--ser`/`--bus`,
+  but `load -f --ser …` works. Find the BC's ttyACM by serial:
+  `for t in /dev/ttyACM*; do … /sys/class/tty/$(basename $t)/device/../serial …`.
+- Build on the Pi: `slow_bus/tools/pi-build.sh {bus_controller|slave}`.
+- Quick checks (run on Pi in `tools/commission/lua/`): `luajit pico.lua listen 2
+  <bc_port>` (banner), `luajit pico_roster.lua <bc_port> 3` (roster, watch mode),
+  `luajit pico_slave.lua <bc_port> 9 hello` (round-trip).
 
 ---
 
