@@ -242,9 +242,20 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
       2nd Pico: (A) no config → fallback `0x01` ALIVE; (B) flash `idnt{vr=3,ad=9,
       id=E660…1135}` → addr `0x09` ALIVE, old `0x01` DEAD (the slave *moved* to the
       commissioned addr). `cfg_image.lua --uid <hex> --variant 3 --addr N`.
-      **NEXT** = (a) DATA round-trip (BC → slave CMD_ECHO → reply); (b) the `slvr`
-      roster (master loads its roster from a config file; needs the `g_roster` vs
-      `core/bus_roster.c` reconcile); (c) hoist the identity stack to `node/`.
+- [x] **DATA round-trip DONE + HW-verified (2026-06-16).** Full command path:
+      host → BC (USB) → RS-485 → slave → RS-485 → BC → host. `app/slave/main.c`
+      `bus_node_on_data` is now a minimal responder (parses the BC-injected
+      `[opcode][req_id][cmd][args]`, handles `CMD_ECHO` → `OP_SHELL_REPLY`).
+      **Protocol fix in `core/bus_node.c`:** the skeleton emitted its reply
+      in-window *immediately* on a DATA grant, but the BC's `BS_CMD_INJECT` is
+      async two-phase — it wants a `BUS_FT_ACK` first (40 ms), then POLLs to
+      collect. Node now ACKs a BC DATA grant and ships the reply on the next POLL.
+      (`bus_node.c` is slave-only — the BC has its own arbiter — so the BC is
+      untouched; regression still 11/11.) Driver `pico_slave.lua`; verified across
+      payloads → `status=0`, exact echo.
+      **NEXT** = (a) the `slvr` roster (master loads its roster from a config file;
+      needs the `g_roster` vs `core/bus_roster.c` reconcile); (b) hoist the identity
+      stack to a shared `node/` dir; (c) push the local commits.
 - [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
       `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
       OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over
