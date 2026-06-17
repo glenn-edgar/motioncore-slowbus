@@ -229,9 +229,22 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
       DEAD→ALIVE emits `OP_BUS_SLAVE_UP` — check roster state, not the event.)
       Multi-device picotool: target by serial with `-f --ser <serial>` (the v2.2.0
       `reboot` subcmd rejects `--ser`/`--bus`, but `load -f --ser …` works).
-      **NEXT** = (a) DATA round-trip (BC → slave CMD_ECHO → reply, via the skeleton's
-      bus_node echo); (b) port identity to the slave (`NODE_ADDR` from `idnt`); (c)
-      the `slvr` roster (needs the `g_roster` vs `core/bus_roster.c` reconcile).
+- [x] **Slave identity from config-FS DONE + HW-verified (2026-06-16).** The slave
+      now reads its RS-485 address from `idnt` (same config-FS as the BC — the "one
+      base" goal). Wiring: `app/slave/main.c` calls `boot_read_identity` →
+      OK=use `ident.addr`, MISSING=fall back to baked `NODE_ADDR`, MISMATCH=refuse
+      (don't init the node → stays silent → BC ages it DEAD). CMake: the slave
+      target compiles `boot_identity.c`+`cfg_file.c` (from `app/bus_controller/` —
+      TODO hoist to a shared `node/` dir), `-DBUILD_VARIANT=VARIANT_SLAVE_RS485`,
+      links `pico_unique_id`. `cfg_file.c` now uses `core`'s `bus_crc8_update`
+      (byte-identical to the vendored libcomm CRC) so it links into the slave too —
+      no BC regression (re-verified `ident=0` + 11/11). Two-stage HW proof on the
+      2nd Pico: (A) no config → fallback `0x01` ALIVE; (B) flash `idnt{vr=3,ad=9,
+      id=E660…1135}` → addr `0x09` ALIVE, old `0x01` DEAD (the slave *moved* to the
+      commissioned addr). `cfg_image.lua --uid <hex> --variant 3 --addr N`.
+      **NEXT** = (a) DATA round-trip (BC → slave CMD_ECHO → reply); (b) the `slvr`
+      roster (master loads its roster from a config file; needs the `g_roster` vs
+      `core/bus_roster.c` reconcile); (c) hoist the identity stack to `node/`.
 - [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
       `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
       OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over

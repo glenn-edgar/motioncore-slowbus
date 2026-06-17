@@ -16,6 +16,7 @@
 #include <string.h>
 #include "pico.h"                       // PICO_FLASH_SIZE_BYTES (board header)
 #include "hardware/regs/addressmap.h"   // XIP_BASE
+#include "bus_crc8.h"                   // bus_crc8_update: CRC-8/AUTOSAR (core; shared BC+slave)
 
 #define CFG_STORE_MAGIC     0x10C0FFEEu
 #define CFG_STORE_ROW_SZ    256u
@@ -35,15 +36,13 @@ typedef struct {
 } cfg_entry_t;                       // exactly one 256-B flash row
 _Static_assert(sizeof(cfg_entry_t) == CFG_STORE_ROW_SZ, "cfg_entry_t must be one 256-B row");
 
-extern uint8_t crc8_autosar_update(uint8_t crc, uint8_t byte);   // vendored libcomm
-
 // CRC-8/AUTOSAR over [name[4], len, data[len]] — byte-identical to the SAMD21
 // store's store_crc(), so the same host tooling builds both images.
 static uint8_t entry_crc(const uint8_t name[CFG_NAME_LEN], uint8_t len, const uint8_t *data) {
     uint8_t c = 0xFFu;
-    for (uint8_t i = 0; i < CFG_NAME_LEN; i++) c = crc8_autosar_update(c, name[i]);
-    c = crc8_autosar_update(c, len);
-    for (uint8_t i = 0; i < len; i++)         c = crc8_autosar_update(c, data[i]);
+    for (uint8_t i = 0; i < CFG_NAME_LEN; i++) c = bus_crc8_update(c, name[i]);
+    c = bus_crc8_update(c, len);
+    for (uint8_t i = 0; i < len; i++)         c = bus_crc8_update(c, data[i]);
     return (uint8_t)(c ^ 0xFFu);
 }
 
