@@ -218,8 +218,20 @@ and drive the KB0/KB1 API (commands to appcore `0xFB`).
       ECHO with SLIP-escape-heavy payload byte-exact round-trip, unknown-cmd error
       path, roster CRUD with class_id round-trip, SET_POLL/POLL_ENABLE). No slaves,
       no HIL pins -> bench-safe. **TEST #1 COMPLETE (all 5 steps done + HW-verified).**
-      **NEXT** = the SLAVE image + `slvr` roster (which first needs the `g_roster`
-      vs `core/bus_roster.c` reconcile), and/or push the branch.
+- [x] **Two-Pico RS-485 bus bring-up DONE + HW-verified (2026-06-16).** 2nd Pico
+      (plain Pico, RP2040, serial `E6605481DB611135` @ ttyACM1) flashed with the
+      `slave` image (`NODE_ADDR=0x01`, echoes DATA; needed a one-line `chassis_assert`
+      to link). Wiring: TX=GP15, RX=GP16, **auto-direction transceivers (no DE pin
+      — firmware already DE-less), so no fw change.** BC (ttyACM0) driven over USB by
+      `tools/commission/lua/pico_bus.lua`: register slave ENABLED + poll. Result:
+      addr 0x01 → `state=ALIVE misses=0`; absent addr 0x05 → `state=DEAD` +
+      `OP_BUS_SLAVE_DOWN`. (Note: a fresh UNKNOWN→ALIVE is announced SILENTLY; only
+      DEAD→ALIVE emits `OP_BUS_SLAVE_UP` — check roster state, not the event.)
+      Multi-device picotool: target by serial with `-f --ser <serial>` (the v2.2.0
+      `reboot` subcmd rejects `--ser`/`--bus`, but `load -f --ser …` works).
+      **NEXT** = (a) DATA round-trip (BC → slave CMD_ECHO → reply, via the skeleton's
+      bus_node echo); (b) port identity to the slave (`NODE_ADDR` from `idnt`); (c)
+      the `slvr` roster (needs the `g_roster` vs `core/bus_roster.c` reconcile).
 - [x] **Step 1 flashed + HW-verified on a Pico W (2026-06-16).** UID
       `E6616408437D6628`. Live libcomm round-trip works (appcore MON_PING reply;
       OP_REGISTER decoded: class 0x5E589000, fw 256, build 20260607). The UID over
