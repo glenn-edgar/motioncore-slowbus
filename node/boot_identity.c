@@ -1,11 +1,13 @@
 // ============================================================================
 // boot_identity.c — read & validate 'idnt' at boot.
 //
-// One generic image per (chip x variant); this file personalizes the unit
-// (addr) and DOUBLE-CHECKS the config landed on the right silicon / product /
-// physical board. chip / variant / uuid / addr mismatch is a MIS-FLASH — the
-// caller hard-refuses (a unit must not run wearing the wrong identity). The
-// refuse-vs-warn policy lives in the caller; this only reports a code.
+// One generic image per CHIP, serving every variant it implements (the boot
+// role — master vs slave — is chosen from this file's 'vr'). This file
+// personalizes the unit (addr) and DOUBLE-CHECKS the config landed on the right
+// silicon / a variant this image implements / the right physical board. chip /
+// variant / uuid / addr mismatch is a MIS-FLASH — the caller hard-refuses (a
+// unit must not run wearing the wrong identity). The refuse-vs-warn policy lives
+// in the caller; this only reports a code.
 //
 // idnt shape:  { "v":1, "ch":<chip>, "vr":<variant>, "ad":<addr>, "id":h'..8..' }
 // ============================================================================
@@ -48,7 +50,9 @@ int boot_read_identity(identity_t *out) {
 
     if (v  != IDENT_SCHEMA_VER) return IDENT_ERR_SCHEMA;    // contract guard
     if (ch != BUILD_CHIP)       return IDENT_ERR_CHIP;      // silicon family
-    if (vr != BUILD_VARIANT)    return IDENT_ERR_VARIANT;   // product / hw layout
+    // ONE image serves multiple variants (role chosen at boot from 'vr'), so the
+    // variant must be one THIS image implements — not a single BUILD_VARIANT.
+    if (!variant_supported((uint8_t)vr)) return IDENT_ERR_VARIANT;
 
     pico_unique_board_id_t board; pico_get_unique_board_id(&board);   // this board
     if (uidn != PICO_UNIQUE_BOARD_ID_SIZE_BYTES || memcmp(uid, board.id, uidn))

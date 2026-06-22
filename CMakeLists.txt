@@ -71,16 +71,21 @@ endfunction()
 # hardening, not the bus_sched/bus_node skeleton. WiFi uplink + core1 app deferred.
 # core1 chain_tree engine (static-link) + the KB0 generated chain (gc-sections trims).
 set(BC_DIR ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller)
+# Shared node stack (identity/config/roster/CBOR), used by BOTH the BC and slave.
+set(NODE_DIR ${CMAKE_CURRENT_LIST_DIR}/node)
 file(GLOB KB0_ENGINE_SRCS CONFIGURE_DEPENDS ${BC_DIR}/engine/src/*.c)
 file(GLOB KB0_INCR_SRCS   CONFIGURE_DEPENDS ${BC_DIR}/kb0/incr/*.c)
 
 add_executable(bus_controller
     ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/main.c
-    ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/boot_identity.c
-    ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/boot_roster.c
-    ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/cfg_file.c
+    ${NODE_DIR}/boot_identity.c
+    ${NODE_DIR}/boot_roster.c
+    ${NODE_DIR}/cfg_file.c
+    ${NODE_DIR}/node_role.c          # slave/node role (one image, role from config)
+    ${CORE_DIR}/bus_node.c           # node responder core (used by the slave role)
     ${CMAKE_CURRENT_LIST_DIR}/core/host_link.c
     ${CMAKE_CURRENT_LIST_DIR}/app/chassis/commission.c
+    ${PORT_DIR}/board.c              # board_init (used by the node/slave role)
     ${PORT_DIR}/phy_pio_rs485.c
     ${PORT_DIR}/cfl_timer_rp2040.c
     ${CORE_DIR}/bus_frame.c
@@ -93,7 +98,7 @@ pico_generate_pio_header(bus_controller ${PORT_DIR}/rs485.pio)
 pico_generate_pio_header(bus_controller ${PORT_DIR}/servo_bank.pio)          # 8-servo bank
 pico_generate_pio_header(bus_controller ${PORT_DIR}/quadrature_encoder.pio)  # quad decoder
 target_include_directories(bus_controller PRIVATE
-    ${COMMON_INC} ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
+    ${COMMON_INC} ${NODE_DIR} ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
     ${BC_DIR}/engine/include ${BC_DIR}/kb0/incr)
 target_compile_definitions(bus_controller PRIVATE
     PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0 CFL_32BIT=1)
@@ -117,18 +122,12 @@ if(I2C_SELFTEST)
     target_compile_definitions(bus_controller PRIVATE I2C_SELFTEST)
 endif()
 
-# Slave node: null uplink, node role, WiFi off. Shares the config-FS identity
-# stack with the BC (boot_identity/cfg_file/cbor_min/variants currently live in
-# app/bus_controller/ -- TODO: hoist to a shared node/ dir). BUILD_VARIANT marks
-# this image as the RS-485 slave product so boot_identity validates it.
-slow_bus_image(slave
-    SRCS ${CMAKE_CURRENT_LIST_DIR}/app/slave/main.c
-         ${PORT_DIR}/uplink_none.c
-         ${BC_DIR}/boot_identity.c
-         ${BC_DIR}/cfg_file.c
-    DEFS ROLE_SLAVE=1 BUILD_VARIANT=VARIANT_SLAVE_RS485)
-target_include_directories(slave PRIVATE ${BC_DIR})
-target_link_libraries(slave pico_unique_id hardware_flash)
+# NOTE (2026-06-22): the separate `slave` target is GONE. One image now serves
+# both roles -- the `bus_controller` target above builds the unified binary, and
+# main() dispatches to the slave node role (node/node_role.c) at boot when the
+# config 'vr' is a non-master variant. Same .uf2 on every board; only the flashed
+# config (idnt: variant + address) differs. (The old app/slave/main.c was folded
+# into node/node_role.c.)
 
 # ---------------------------------------------------------------------------
 # Chassis bring-up image (Pico W / RP2040): pure FreeRTOS-SMP + heartbeat-gated

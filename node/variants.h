@@ -29,6 +29,16 @@ static inline bool variant_is_master(uint8_t v) {
     return v == VARIANT_BUS_CTRL_USB || v == VARIANT_BUS_CTRL_WIFI;
 }
 
+// Which variants THIS single image actually implements. One image now serves
+// BOTH roles (Glenn 2026-06-22: same binary, the config 'vr' picks master/slave),
+// so boot_identity validates the config's variant against this SET instead of a
+// single BUILD_VARIANT. The chip + UUID checks remain the load-bearing mis-flash
+// guards. Append a variant here once its role code is compiled into the image.
+static inline bool variant_supported(uint8_t v) {
+    return v == VARIANT_BUS_CTRL_USB   // master: USB bus controller
+        || v == VARIANT_SLAVE_RS485;   // slave:  RS-485 node responder
+}
+
 // The product THIS image was built as. Override per build with -DBUILD_VARIANT;
 // defaults to the USB bus controller (the test-#1 image).
 #ifndef BUILD_VARIANT
