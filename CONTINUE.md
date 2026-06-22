@@ -1,11 +1,54 @@
 # CONTINUE — slow_bus pick-up doc
 
 Read first on any session resume. Companion to `README.md` (orientation) and
-`docs/README.md` (full spec). Last updated **2026-06-16 (end of day)**.
+`docs/README.md` (full spec). Last updated **2026-06-22**.
 
 ---
 
-## TL;DR — where we are
+## UPDATE 2026-06-22 — SINGLE IMAGE (role from config) DONE + HW-VERIFIED
+
+**ONE binary now serves BOTH roles** (Glenn: "same image; the flashed config picks
+master/slave + bus speed"). Flash the same `bus_controller.uf2` to every board; the
+per-unit `idnt` config's variant (`vr`) decides master vs slave at boot.
+
+What changed:
+- **Hoist**: the shared identity/config stack moved `app/bus_controller/` → `node/`
+  (`boot_identity`, `boot_roster`, `cfg_file`, `cbor_min`, `variants`). The slave no
+  longer reaches into the BC dir. Host CBOR test now builds with `-I../node`.
+- **node/node_role.{c,h}**: the slave/node role (responder + `node_role_run()`),
+  lifted from the old `app/slave/main.c` (DELETED), minus its main()/FreeRTOS hooks.
+- **app/bus_controller/main.c**: after `boot_read_identity`, a ROLE BRANCH — a
+  commissioned slave (`!variant_is_master(ident.variant)`) calls `node_role_run()`
+  (never returns); master variants + uncommissioned/refused units fall through to the
+  (UNCHANGED) master path, which self-quarantines its arbiter on a bad identity.
+- **node/boot_identity.c + variants.h**: the variant check `vr == BUILD_VARIANT` →
+  `variant_supported(vr)` (the SET of variants this image implements: USB-ctrl master
+  + RS-485 slave). Chip + UUID guards UNCHANGED — those are the real mis-flash guards.
+- **CMakeLists.txt**: the `bus_controller` target is now the unified image (added
+  `node/node_role.c`, `core/bus_node.c`, `port/rp2040/board.c`); the separate `slave`
+  target is REMOVED.
+
+Size: unified text 167,932 B (+1.3 KB vs the old master), bss 101,672 B (+2.2 KB).
+~160 KB `.bin` = ~8% of the RP2040's 2 MB flash; ~155 KB of 264 KB SRAM free.
+(Pico / Pico W = RP2040 = 264 KB SRAM; Pico 2 = RP2350 = 520 KB. Bench builds rp2040.)
+
+**HW-VERIFIED 2026-06-22** on the two bench Picos (built on the Pi):
+- Flash (same .uf2 to both): `sudo picotool load -x -f --ser <serial> ~/slow_bus/build/bus_controller.uf2`.
+  Master = Pico W `E6616408437D6628` (ttyACM2); slave = plain Pico `E6605481DB611135` (ttyACM3).
+- Master banner: `boot#2 rst=POWER ident=0 slvr=1` (read vr=1 → master, roster loaded).
+- Master roster: `addr=0x09 variant=3 state=ALIVE misses=0` (the SAME image on the
+  plain Pico booted as the slave from vr=3, answering RS-485 polls).
+- Round-trip: `CMD_ECHO -> addr 0x09: status=0 result="hello"` — DATA path OK.
+- Configs SURVIVE the firmware flash (config region = top 64 KB, a separate flash region).
+
+**NEXT**: (a) config-driven BUS SPEED — `node_role_run()` and the master both still
+call `bus_phy_init(BUS_DEFAULT_BAUD)`; add a speed field to `idnt` (or a new cfg file)
+and read it at boot. (b) Pico2/RP2350 build of the same source. (c) more node app
+logic beyond CMD_ECHO. (d) `g_roster`(cap 16) vs `core/bus_roster.c`(cap 32) reconcile.
+
+---
+
+## TL;DR — where we are (as of 2026-06-16)
 
 The bus + 5 SAMD21 modes + commission toolchain are **done and HW-verified**
 (see git history + memory). The **restructure** to the shared Pico/Pico2 model is

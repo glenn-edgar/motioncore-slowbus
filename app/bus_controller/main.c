@@ -57,6 +57,7 @@
 #include "opcodes.h"
 #include "commission.h"
 #include "variants.h"        // shared product/variant enum + role derivation
+#include "node_role.h"       // slave/node role entry (single image, role from config)
 #include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
 #include "boot_roster.h"     // read the master's slave roster ('slvr' config file)
 #include "cfg_file.h"        // read-only config store (cfg_load / cfg_layout_ok)
@@ -1418,7 +1419,17 @@ int main(void) {
     }
     uint8_t self_addr = (g_id_rc == IDENT_OK) ? ident.addr : BUS_ADDR_MASTER;
 
-    bus_phy_init(BUS_DEFAULT_BAUD);   // installs the RX IRQ on core0
+    // ROLE DISPATCH (one image; role chosen from the config 'vr'): a COMMISSIONED
+    // SLAVE runs only the node responder (node_role_run never returns) and skips
+    // ALL the master machinery below. Master variants -- and uncommissioned
+    // (MISSING) or refused (MISMATCH) units -- fall through to the master path,
+    // which self-quarantines its arbiter when g_identity_refused (a bad/absent
+    // identity stays inert rather than guessing a slave address).
+    if (g_id_rc == IDENT_OK && !variant_is_master(ident.variant)) {
+        node_role_run(self_addr);   // PHY + node responder + scheduler; never returns
+    }
+
+    bus_phy_init(BUS_DEFAULT_BAUD);   // installs the RX IRQ on core0  (MASTER path)
     bus_asm_init(&g_bc, self_addr, true);
 
     host_link_cfg_t cfg = {

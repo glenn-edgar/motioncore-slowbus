@@ -2,7 +2,7 @@
 CC ?= cc
 CFLAGS ?= -Wall -Wextra -O2 -I../core
 HLFLAGS ?= -Wall -Wextra -O2 -I../core -I../port/rp2040/vendor/libcomm
-CBORFLAGS ?= -Wall -Wextra -O2 -I../app/bus_controller
+CBORFLAGS ?= -Wall -Wextra -O2 -I../node
 
 st: frame_selftest.c ../core/bus_crc8.c ../core/bus_frame.c
 	$(CC) $(CFLAGS) $^ -o $@
@@ -13,7 +13,7 @@ hl: host_link_selftest.c ../core/host_link.c ../port/rp2040/vendor/libcomm/frame
 
 # Boot-config CBOR decoder self-test (header-only cbor_min.h -> list it as a
 # prerequisite so editing the header retriggers the build).
-cbor: cbor_selftest.c ../app/bus_controller/cbor_min.h
+cbor: cbor_selftest.c ../node/cbor_min.h
 	$(CC) $(CBORFLAGS) cbor_selftest.c -o $@
 
 .PHONY: test hltest cbortest clean
