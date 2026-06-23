@@ -107,13 +107,15 @@ Module is built in isolation by the `il_thread2_check` object lib (CMake,
 - **Stage 3 — DSL parser ✅ (2026-06-23).** `interlock_dsl.c` (includes-only swap)
   + `il_pin_table.{c,h}` resolving ilcf names `gp0..gp29` / `adc0..2` (== `ain0..2`)
   to phys_id (== GPIO) + ADC channel. Whole module compiles clean in `il_thread2_check`.
-- **Stage 4 — config + wire-in (NEXT; needs HW to verify).** `ilcf` config-FS reader
-  (DSL text, sibling to `idnt`/`hwio`); implement the `il_plat_*` seam in main.c
-  against `g_hwio_role` + the shared `g_adc_latest[]` (+ the `board_millis` /
-  `g_stack_hwm_bytes` / `g_last_m2s_rx_ms` externs the VIRTUAL inputs use); the
-  Thread-2 task on Core A calling `interlock_tick_all()`; veto on GP0; LINK the
-  module into `bus_controller`. This is the go-live step — verify trip→latch→manual
-  reset on the bench Picos.
+- **Stage 4 — config + wire-in ◐ software-complete (2026-06-23); HW-verify pending.**
+  `ilcf` reader arms slot 0 from the flashed DSL text; the `il_plat_*` seam in main.c
+  binds the HAL to `g_hwio_role` + the shared `g_adc_latest[]`; `interlock_boot_decide()`
+  + `interlock_thread2_start()` (warm-restore / arm) run in `app_engine_task`; the
+  `il_tick_task` ticks on core1; veto on GP0; module LINKED into `bus_controller`
+  (builds clean). `cfg_image.lua --ilcf` flashes the DSL. **Still TODO:** verify
+  trip→latch→manual-reset on the bench Picos; the hard ADC-ISR fast-veto path; final
+  core affinity; role-agnostic placement (master-path only today, slave is a stub);
+  feed the VIRTUAL-input externs from real sources.
 
 ### Key adaptation decisions (locked)
 - **phys_id == GPIO number** (flat); HAL table size 30.

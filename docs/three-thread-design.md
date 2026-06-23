@@ -226,8 +226,10 @@ to Thread 3*.
    master/slave, slave-side hwio_apply) is still to do.
 3. The I²C service (periodic-sample → shared area + intermixed async; inventory config).
    **DEFERRED** by request — build the I²C framework later.
-4. **Thread 2 — the SAMD21 interlock port** (HAL→RP2040, shared-status coupling,
-   I²C-mirror input + freshness fail-safe). *The safety-critical part — do it right.*
-   Port map captured in `interlock-port-map.md`. (I²C-mirror input arrives with the
-   deferred I²C service; the ADC/GPIO/virtual inputs + veto port do not depend on it.)
+4. ◐ **Thread 2 — the SAMD21 interlock port.** **Software-complete 2026-06-23**
+   (Stages 1–4 in `interlock-port-map.md`): HAL + framework + DSL + pin table ported
+   and LINKED into the image, arming from `ilcf`, ticking on core1, veto on GP0 —
+   builds clean. **HW-verify pending** (trip→latch→reset on the bench). Still TODO:
+   the hard ADC-ISR fast-veto path; I²C-mirror input (with the deferred I²C service);
+   role-agnostic placement; final core affinity.
 5. Thread 3 — the chain-tree application (non-bench events in, RS-485 out).
