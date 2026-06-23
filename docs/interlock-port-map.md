@@ -97,21 +97,23 @@ cfg modes: `in[,up|,down|,debounce_N]`, `adc[,oversample_N|,sh_N|,hyst_N]`,
 Module is built in isolation by the `il_thread2_check` object lib (CMake,
 `-Werror`) so the main image stays green until the wire-in stage.
 
-- **Stage 1 — pin HAL ✅ (2026-06-23).** `il_hal.h` (contract, SAMD21-compatible
-  names) + `il_hal_rp2040.c` (ownership-table port on RP2040 SIO). Compiles clean.
-- **Stage 2 — vendored framework.** Copy `samd21_interlocks.{c,h}` → `interlock.{c,h}`;
-  swap `samd21.h`/CMSIS → `il_platform.h` (reset-cause + `panic()` via
-  `watchdog_reboot`; persist in `.uninitialized_data`); swap `samd21_pin_table.h` →
-  `il_pin_table.h` (DSL pin name → GPIO; ADC channel map); replace the libcomm
-  `OP_EVENT`/`interlock_build_status_v2`/repush wire surface with the **shared-status
-  coupling** (status word out, `rearm` flag in — no queue on the safety path).
-- **Stage 3 — DSL parser.** Vendor `samd21_interlock_dsl.c` → `interlock_dsl.c`
-  against `il_pin_table.h`. Pin-naming for `ilcf`: by GP number + ADC channel.
-- **Stage 4 — config + wire-in.** `ilcf` config-FS reader (DSL text, sibling to
-  `idnt`/`hwio`); the platform seam (`il_plat_pin_reserved/cap/adc_channel/adc_latest`)
-  implemented in main.c against `g_hwio_role` + the shared `g_adc_latest[]`; Thread 2
-  task on Core A calling `interlock_tick_all()`; veto on GP0; link the module into
-  `bus_controller`.
+- **Stage 1 — pin HAL ✅ (2026-06-23).** `il_hal.h` + `il_hal_rp2040.c`
+  (ownership-table port on RP2040 SIO + the `il_plat_*` seam). Compiles clean.
+- **Stage 2 — vendored framework ✅ (2026-06-23).** `interlock.{c,h}` from
+  `samd21_interlocks.{c,h}`; logic unchanged, platform swapped: `.noinit` →
+  `.uninitialized_data`; `panic()` → `il_panic()` via `watchdog_reboot`;
+  `NVIC_SystemReset`/`PM->RCAUSE`/HardFault override dropped (chassis owns faults);
+  `emit_op_event` → shared-status stub (no queue on the safety path).
+- **Stage 3 — DSL parser ✅ (2026-06-23).** `interlock_dsl.c` (includes-only swap)
+  + `il_pin_table.{c,h}` resolving ilcf names `gp0..gp29` / `adc0..2` (== `ain0..2`)
+  to phys_id (== GPIO) + ADC channel. Whole module compiles clean in `il_thread2_check`.
+- **Stage 4 — config + wire-in (NEXT; needs HW to verify).** `ilcf` config-FS reader
+  (DSL text, sibling to `idnt`/`hwio`); implement the `il_plat_*` seam in main.c
+  against `g_hwio_role` + the shared `g_adc_latest[]` (+ the `board_millis` /
+  `g_stack_hwm_bytes` / `g_last_m2s_rx_ms` externs the VIRTUAL inputs use); the
+  Thread-2 task on Core A calling `interlock_tick_all()`; veto on GP0; LINK the
+  module into `bus_controller`. This is the go-live step — verify trip→latch→manual
+  reset on the bench Picos.
 
 ### Key adaptation decisions (locked)
 - **phys_id == GPIO number** (flat); HAL table size 30.
