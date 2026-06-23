@@ -20,10 +20,11 @@ enum {
 };
 
 typedef struct {
-    uint8_t chip;
-    uint8_t variant;
-    uint8_t addr;             // own RS-485 address (master = 0x00)
-    uint8_t uuid[PICO_UNIQUE_BOARD_ID_SIZE_BYTES];
+    uint8_t  chip;
+    uint8_t  variant;
+    uint8_t  addr;            // own RS-485 address (master = 0x00)
+    uint32_t baud;            // configured RS-485 baud from 'sp' (0 = absent -> caller uses BUS_DEFAULT_BAUD)
+    uint8_t  uuid[PICO_UNIQUE_BOARD_ID_SIZE_BYTES];
 } identity_t;
 
 // Load 'idnt', validate it against this image's baked identity + this board's

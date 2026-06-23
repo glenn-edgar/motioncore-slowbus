@@ -9,7 +9,9 @@
 // unit must not run wearing the wrong identity). The refuse-vs-warn policy lives
 // in the caller; this only reports a code.
 //
-// idnt shape:  { "v":1, "ch":<chip>, "vr":<variant>, "ad":<addr>, "id":h'..8..' }
+// idnt shape:  { "v":1, "ch":<chip>, "vr":<variant>, "ad":<addr>, "sp":<baud,opt>, "id":h'..8..' }
+// 'sp' (RS-485 baud) is OPTIONAL: absent -> the node uses BUS_DEFAULT_BAUD. Must
+// match across every node on a bus (the operator sets the same speed in each idnt).
 // ============================================================================
 #include "boot_identity.h"
 #include "cfg_file.h"
@@ -32,7 +34,7 @@ int boot_read_identity(identity_t *out) {
     cbor_t c; cbor_init(&c, buf, len);
     uint64_t np; if (!cbor_open(&c, CBOR_MAP, &np)) return IDENT_ERR_FORMAT;
 
-    uint64_t v = 0, ch = ~0ull, vr = ~0ull, ad = ~0ull;
+    uint64_t v = 0, ch = ~0ull, vr = ~0ull, ad = ~0ull, sp = 0;
     const uint8_t *uid = 0; uint32_t uidn = 0;
     enum { S_V = 1, S_CH = 2, S_VR = 4, S_AD = 8, S_ID = 16 }; uint8_t seen = 0;
 
@@ -43,6 +45,7 @@ int boot_read_identity(identity_t *out) {
         else if (CBOR_KEY(k, kn, "ch")) { if (!cbor_uint(&c, &ch)) return IDENT_ERR_FORMAT; seen |= S_CH; }
         else if (CBOR_KEY(k, kn, "vr")) { if (!cbor_uint(&c, &vr)) return IDENT_ERR_FORMAT; seen |= S_VR; }
         else if (CBOR_KEY(k, kn, "ad")) { if (!cbor_uint(&c, &ad)) return IDENT_ERR_FORMAT; seen |= S_AD; }
+        else if (CBOR_KEY(k, kn, "sp")) { if (!cbor_uint(&c, &sp)) return IDENT_ERR_FORMAT; }   // OPTIONAL bus baud
         else if (CBOR_KEY(k, kn, "id")) { if (!cbor_str(&c, CBOR_BYTES, &uid, &uidn)) return IDENT_ERR_FORMAT; seen |= S_ID; }
         else if (!cbor_skip(&c)) return IDENT_ERR_FORMAT;   // unknown key -> fwd-compat
     }
@@ -65,6 +68,7 @@ int boot_read_identity(identity_t *out) {
     }
 
     out->chip = (uint8_t)ch; out->variant = (uint8_t)vr; out->addr = (uint8_t)ad;
+    out->baud = (uint32_t)sp;   // 0 when 'sp' absent -> caller falls back to BUS_DEFAULT_BAUD
     memcpy(out->uuid, uid, uidn);
     return IDENT_OK;
 }

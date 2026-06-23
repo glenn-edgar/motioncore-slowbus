@@ -3,7 +3,7 @@
 -- two-step flash) as a UF2 targeted at the top-64KB config region.
 --
 --   luajit cfg_image.lua [--uid HEX] [--out cfg.uf2]
---                        [--chip 0] [--variant 1] [--addr 0]
+--                        [--chip 0] [--variant 1] [--addr 0] [--speed BAUD]
 --                        [--flash-size 2097152] [--port /dev/ttyACMx]
 --
 -- With no --uid it auto-detects the connected Pico's UID over libcomm (OP_REGISTER
@@ -11,7 +11,7 @@
 -- the mis-flash guard boot_identity enforces. Emits one SAMD21-boot-store-format
 -- entry (`idnt`) into a UF2 block at the region base; flash with `picotool load`.
 --
--- idnt CBOR: { v:1, ch:<chip>, vr:<variant>, ad:<addr>, id:<8-byte UUID> }.
+-- idnt CBOR: { v:1, ch:<chip>, vr:<variant>, ad:<addr>, sp:<baud,opt>, id:<8-byte UUID> }.
 
 package.path = (arg[0]:match("^(.*/)") or "./") .. "?.lua;" .. package.path
 local bit  = require("bit")
@@ -81,6 +81,7 @@ while i <= #arg do
     elseif a == "--chip"       then opt.chip = tonumber(nextval())
     elseif a == "--variant"    then opt.variant = tonumber(nextval())
     elseif a == "--addr"       then opt.addr = tonumber(nextval())
+    elseif a == "--speed" or a == "--baud" then opt.baud = tonumber(nextval())  -- optional RS-485 bus speed -> idnt 'sp'
     elseif a == "--slvr"       then opt.slvr = nextval()
     elseif a == "--poll"       then opt.poll = nextval()
     elseif a == "--flash-size" then opt.flash_size = tonumber(nextval())
@@ -112,8 +113,10 @@ local entries = {}   -- { {name=..., data=...}, ... } in row order
 -- idnt (always)
 local uid_raw = hex_to_bytes(opt.uid)
 assert(#uid_raw == 8, "Pico UID must be 8 bytes (16 hex chars), got " .. #uid_raw)
-local idnt = cbor.encode({ v = 1, ch = opt.chip, vr = opt.variant, ad = opt.addr,
-                           id = cbor.bytes(uid_raw) })
+local idnt_map = { v = 1, ch = opt.chip, vr = opt.variant, ad = opt.addr,
+                   id = cbor.bytes(uid_raw) }
+if opt.baud then idnt_map.sp = opt.baud end   -- optional bus speed; absent -> firmware default
+local idnt = cbor.encode(idnt_map)
 assert(#idnt <= STORE_DATA_MAX, "idnt CBOR too big: " .. #idnt)
 entries[#entries + 1] = { name = "idnt", data = idnt }
 
@@ -147,6 +150,7 @@ local uf2 = table.concat(blocks)
 
 local f = assert(io.open(opt.out, "wb")); f:write(uf2); f:close()
 io.write(string.format(
-    "[cfg_image] %s: idnt{v=1,ch=%d,vr=%d,ad=%d,id=%s}%s -> %d entr%s -> UF2 @ 0x%08X (%d B)\n",
-    opt.out, opt.chip, opt.variant, opt.addr, opt.uid, slvr_desc,
+    "[cfg_image] %s: idnt{v=1,ch=%d,vr=%d,ad=%d,%sid=%s}%s -> %d entr%s -> UF2 @ 0x%08X (%d B)\n",
+    opt.out, opt.chip, opt.variant, opt.addr,
+    opt.baud and string.format("sp=%d,", opt.baud) or "", opt.uid, slvr_desc,
     #entries, #entries == 1 and "y" or "ies", base, #uf2))
