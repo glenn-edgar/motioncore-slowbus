@@ -217,9 +217,17 @@ to Thread 3*.
   spec'ing Thread 3).
 
 ## Suggested build order
-1. `hwio` config (schema + host builder + boot reader applying pin roles).
-2. Thread 1 — router + bench surface (operate-only HIL, validated against `hwio`).
+1. ✅ `hwio` config (schema + host builder + boot reader applying pin roles). **DONE
+   2026-06-23** — `node/boot_hwio.{c,h}`, `cfg_image.lua --io/--adc`, `hwio_apply()`
+   at boot. CMD_GPIO_CONFIG retired; HIL is operate-only, validated per frozen role.
+2. ◐ Thread 1 — router + bench surface (operate-only HIL, validated against `hwio`).
+   **Partial** — the HIL command surface is now operate-only/role-validated. The full
+   router unification (one tagged event type, per-consumer queues, role-agnostic
+   master/slave, slave-side hwio_apply) is still to do.
 3. The I²C service (periodic-sample → shared area + intermixed async; inventory config).
+   **DEFERRED** by request — build the I²C framework later.
 4. **Thread 2 — the SAMD21 interlock port** (HAL→RP2040, shared-status coupling,
    I²C-mirror input + freshness fail-safe). *The safety-critical part — do it right.*
+   Port map captured in `interlock-port-map.md`. (I²C-mirror input arrives with the
+   deferred I²C service; the ADC/GPIO/virtual inputs + veto port do not depend on it.)
 5. Thread 3 — the chain-tree application (non-bench events in, RS-485 out).
