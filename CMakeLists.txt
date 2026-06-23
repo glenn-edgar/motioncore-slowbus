@@ -128,9 +128,10 @@ endif()
 # seam externs (il_plat_*) are resolved later when Thread 2 is wired into the
 # image. Build with: tools/pi-build.sh il_thread2_check
 add_library(il_thread2_check OBJECT
-    ${NODE_DIR}/interlock/il_hal_rp2040.c)
+    ${NODE_DIR}/interlock/il_hal_rp2040.c
+    ${NODE_DIR}/interlock/interlock.c)
 target_include_directories(il_thread2_check PRIVATE ${NODE_DIR}/interlock)
-target_link_libraries(il_thread2_check PRIVATE pico_stdlib hardware_gpio)
+target_link_libraries(il_thread2_check PRIVATE pico_stdlib hardware_gpio hardware_watchdog)
 target_compile_options(il_thread2_check PRIVATE -Wall -Wextra -Werror)
 
 # NOTE (2026-06-22): the separate `slave` target is GONE. One image now serves
