@@ -122,6 +122,17 @@ if(I2C_SELFTEST)
     target_compile_definitions(bus_controller PRIVATE I2C_SELFTEST)
 endif()
 
+# ---- Thread 2 (interlock) compile-check ------------------------------------
+# Builds the ported interlock module in ISOLATION so the main image stays green
+# while the port is staged. An OBJECT library (no link step), so the platform-
+# seam externs (il_plat_*) are resolved later when Thread 2 is wired into the
+# image. Build with: tools/pi-build.sh il_thread2_check
+add_library(il_thread2_check OBJECT
+    ${NODE_DIR}/interlock/il_hal_rp2040.c)
+target_include_directories(il_thread2_check PRIVATE ${NODE_DIR}/interlock)
+target_link_libraries(il_thread2_check PRIVATE pico_stdlib hardware_gpio)
+target_compile_options(il_thread2_check PRIVATE -Wall -Wextra -Werror)
+
 # NOTE (2026-06-22): the separate `slave` target is GONE. One image now serves
 # both roles -- the `bus_controller` target above builds the unified binary, and
 # main() dispatches to the slave node role (node/node_role.c) at boot when the
