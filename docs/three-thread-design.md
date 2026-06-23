@@ -33,8 +33,9 @@ Consequence: the old runtime `GPIO_CONFIG` and servo-mode-switch commands are
 - The **single** place that touches wire formats. Ingests messages from the **bus,
   USB, and bench**; converts each to an internal event.
 - **Handles the bench surface itself** — monitor (system health/telemetry),
-  HIL-**operate** (GPIO read/write, ADC read, pulse/PWM/quad, I²C read/write/scan —
+  HIL-**operate** (GPIO read/write, ADC read, pulse-count, I²C read/write/scan —
   operate-only, **validated against the `hwio` pin roles**), and commission.
+  (PWM + quadrature were dropped to the Pico2/RP2350; GP14/17/18 are now spare.)
 - **Routes only non-bench (application) messages** to the chain-tree as events.
 - **Role-agnostic** (master/slave identical) — the role difference lives in the
   transport, not here.
