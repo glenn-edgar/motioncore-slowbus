@@ -180,6 +180,7 @@ static SemaphoreHandle_t g_lock;
 static host_link_t g_hl;
 static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitted on each host (re)attach
 static volatile bool g_identity_refused;   // mismatch (or missing+IDENT_REQUIRE_PRESENT) -> bus arbiter quarantined
+static uint32_t g_bus_baud;   // resolved RS-485 baud (config 'sp', else BUS_DEFAULT_BAUD); shown in the banner
 static uint8_t g_cfg_roster_n;   // slaves loaded from the 'slvr' config file at boot (0 if none)
 static uint16_t g_poll_period_ms = 500;
 static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
@@ -191,9 +192,10 @@ static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
 // host_link access (boot path is pre-scheduler; uplink holds g_lock).
 static void bc_emit_boot_banner(void) {
     char b[88];
-    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s slvr=%u",
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s slvr=%u baud=%u",
                      (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc,
-                     g_identity_refused ? " REFUSED" : "", (unsigned)g_cfg_roster_n);
+                     g_identity_refused ? " REFUSED" : "", (unsigned)g_cfg_roster_n,
+                     (unsigned)g_bus_baud);
     (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
 }
 
@@ -1418,6 +1420,9 @@ int main(void) {
         g_identity_refused = true;   // FORMAT/SCHEMA/CHIP/VARIANT/UUID/ADDR mismatch
     }
     uint8_t self_addr = (g_id_rc == IDENT_OK) ? ident.addr : BUS_ADDR_MASTER;
+    // Bus speed from config ('sp'); absent/uncommissioned -> BUS_DEFAULT_BAUD.
+    // Must match across every node on the wire (set the same 'sp' in each idnt).
+    g_bus_baud = (g_id_rc == IDENT_OK && ident.baud) ? ident.baud : BUS_DEFAULT_BAUD;
 
     // ROLE DISPATCH (one image; role chosen from the config 'vr'): a COMMISSIONED
     // SLAVE runs only the node responder (node_role_run never returns) and skips
@@ -1426,10 +1431,10 @@ int main(void) {
     // which self-quarantines its arbiter when g_identity_refused (a bad/absent
     // identity stays inert rather than guessing a slave address).
     if (g_id_rc == IDENT_OK && !variant_is_master(ident.variant)) {
-        node_role_run(self_addr);   // PHY + node responder + scheduler; never returns
+        node_role_run(self_addr, g_bus_baud);   // PHY + node responder + scheduler; never returns
     }
 
-    bus_phy_init(BUS_DEFAULT_BAUD);   // installs the RX IRQ on core0  (MASTER path)
+    bus_phy_init(g_bus_baud);   // installs the RX IRQ on core0  (MASTER path)
     bus_asm_init(&g_bc, self_addr, true);
 
     host_link_cfg_t cfg = {

@@ -10,7 +10,8 @@
 #include <stdint.h>
 
 // Run the node/slave role: board + PHY init, the bus_node responder task, then
-// the FreeRTOS scheduler. NEVER RETURNS. `addr` = this node's RS-485 address
-// (from the config-FS identity). The caller (main) has already done
-// stdio_init_all() and read+validated the identity.
-void node_role_run(uint8_t addr);
+// the FreeRTOS scheduler. NEVER RETURNS. `addr` = this node's RS-485 address and
+// `baud` = the configured bus speed (both from the config-FS identity; baud 0 ->
+// BUS_DEFAULT_BAUD). The caller (main) has already done stdio_init_all() and
+// read+validated the identity.
+void node_role_run(uint8_t addr, uint32_t baud);

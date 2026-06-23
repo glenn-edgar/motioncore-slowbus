@@ -63,11 +63,11 @@ static void node_task(void *arg) {
     }
 }
 
-void node_role_run(uint8_t addr) {
+void node_role_run(uint8_t addr, uint32_t baud) {
     // stdio_init_all() + the identity read already ran in main(); do the
     // node-specific init in the same order the standalone slave used.
     board_init();
-    bus_phy_init(BUS_DEFAULT_BAUD);   // TODO: config-driven bus speed (next step)
+    bus_phy_init(baud ? baud : BUS_DEFAULT_BAUD);   // config 'sp', else default
     bus_node_init(addr);
 
     TaskHandle_t t;
