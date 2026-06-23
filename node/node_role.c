@@ -58,8 +58,14 @@ void bus_node_on_data(uint8_t src, const uint8_t *payload, uint8_t len) {
 static void node_task(void *arg) {
     (void)arg;
     for (;;) {
-        bus_node_task();
-        taskYIELD();
+        bus_node_task();        // drain the IRQ-fed RX ring; ship queued replies
+        // Sleep one tick (1 ms) rather than taskYIELD(): taskYIELD only yields to
+        // EQUAL-or-higher priority, which starved the lower-priority USB worker so
+        // the picotool reset interface went dead (a slave couldn't be reflashed
+        // without the BOOTSEL button). A real sleep lets the USB worker (and idle)
+        // run. RX is IRQ-buffered so nothing is missed in the gap, and the 1 ms wake
+        // latency sits well inside the ~2 ms per-node POLL window (window_us=2000).
+        vTaskDelay(1);
     }
 }
 
