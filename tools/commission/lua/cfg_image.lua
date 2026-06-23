@@ -86,6 +86,7 @@ while i <= #arg do
     elseif a == "--poll"       then opt.poll = nextval()
     elseif a == "--io"         then opt.io = nextval()    -- hwio HIL roles: "r0,r1,..,r7" (GP2..GP9; HWIO_ROLE_* 0..6)
     elseif a == "--adc"        then opt.adc = nextval()   -- hwio ADC annotation: "label:unit:num:den,..." (<=3 chans)
+    elseif a == "--ilcf"       then opt.ilcf = nextval()  -- Thread-2 interlock DSL text (slot 0), raw, <=128 B
     elseif a == "--flash-size" then opt.flash_size = tonumber(nextval())
     elseif a == "--port"       then opt.port = nextval()
     else error("unknown arg: " .. a) end
@@ -183,6 +184,16 @@ if opt.io or opt.adc then
     hwio_desc = (" + hwio{io=%d,adc=%d}"):format(hw.io and #hw.io or 0, hw.ad and #hw.ad or 0)
 end
 
+-- ilcf (optional, Thread-2 interlock DSL for slot 0) ------------------------
+-- Raw DSL text (NOT CBOR): name;cfg[(pin):mode,..];watch[..];out_ok[..];out_err[..].
+-- Pin names: gp0..gp29 (veto = gp0) and adc0..2 (== ain0..2 -> GP26/27/28).
+local ilcf_desc = ""
+if opt.ilcf then
+    assert(#opt.ilcf <= 128, "--ilcf text is " .. #opt.ilcf .. " B (max 128, IL_DSL_MAX)")
+    entries[#entries + 1] = { name = "ilcf", data = opt.ilcf }
+    ilcf_desc = (" + ilcf{%dB}"):format(#opt.ilcf)
+end
+
 -- ---- entries -> rows -> multi-block UF2 ------------------------------------
 local base = 0x10000000 + opt.flash_size - 0x10000   -- top 64 KB of flash
 local blocks = {}
@@ -196,5 +207,5 @@ local f = assert(io.open(opt.out, "wb")); f:write(uf2); f:close()
 io.write(string.format(
     "[cfg_image] %s: idnt{v=1,ch=%d,vr=%d,ad=%d,%sid=%s}%s -> %d entr%s -> UF2 @ 0x%08X (%d B)\n",
     opt.out, opt.chip, opt.variant, opt.addr,
-    opt.baud and string.format("sp=%d,", opt.baud) or "", opt.uid, slvr_desc .. hwio_desc,
+    opt.baud and string.format("sp=%d,", opt.baud) or "", opt.uid, slvr_desc .. hwio_desc .. ilcf_desc,
     #entries, #entries == 1 and "y" or "ies", base, #uf2))

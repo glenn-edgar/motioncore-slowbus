@@ -59,6 +59,8 @@
 #include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
 #include "boot_hwio.h"       // read the frozen HIL pin-role map ('hwio' config file)
 #include "boot_roster.h"     // read the master's slave roster ('slvr' config file)
+#include "interlock/interlock.h"  // Thread 2: ported SAMD21 interlock framework
+#include "interlock/il_hal.h"     //          + its pin HAL (platform seam below)
 #include "cfg_file.h"        // read-only config store (cfg_load / cfg_layout_ok)
 
 // core1 chain_tree engine (KB0)
@@ -159,7 +161,7 @@ static void chassis_panic(uint32_t cause, uint32_t code);   // defined below
 // ---- monitored-thread heartbeats -------------------------------------------
 enum { HB_BUS = 0, HB_UPLINK, HB_APP, HB_COUNT };
 static volatile uint32_t g_hb[HB_COUNT], g_hb_us[HB_COUNT];
-static TaskHandle_t t_bus, t_up, t_app, t_wd, t_i2c;
+static TaskHandle_t t_bus, t_up, t_app, t_wd, t_i2c, t_il;
 
 #define WD_PERIOD_MS      100
 #define WD_HW_TIMEOUT_MS 4000
@@ -174,6 +176,8 @@ static host_link_t g_hl;
 static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitted on each host (re)attach
 static int g_hwio_rc; // boot_read_hwio() result (HWIO_OK / _MISSING benign; other = present-but-bad)
 static hwio_t g_hwio; // frozen HIL pin-role map + ADC annotation (always usable; defaults all-UNUSED)
+static int g_ilcf_rc = -2; // Thread-2 'ilcf' bring-up for the banner: -2 pending, -1 absent,
+                           // 0 armed/warm-restored, >0 = DSL parse-error category
 static volatile bool g_identity_refused;   // mismatch (or missing+IDENT_REQUIRE_PRESENT) -> bus arbiter quarantined
 static uint32_t g_bus_baud;   // resolved RS-485 baud (config 'sp', else BUS_DEFAULT_BAUD); shown in the banner
 static uint8_t g_cfg_roster_n;   // slaves loaded from the 'slvr' config file at boot (0 if none)
@@ -186,10 +190,10 @@ static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
 // re-emit is what actually makes `ident` observable over USB. Caller serializes
 // host_link access (boot path is pre-scheduler; uplink holds g_lock).
 static void bc_emit_boot_banner(void) {
-    char b[96];
-    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d slvr=%u baud=%u",
+    char b[112];
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d il=%d slvr=%u baud=%u",
                      (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc,
-                     g_identity_refused ? " REFUSED" : "", g_hwio_rc, (unsigned)g_cfg_roster_n,
+                     g_identity_refused ? " REFUSED" : "", g_hwio_rc, g_ilcf_rc, (unsigned)g_cfg_roster_n,
                      (unsigned)g_bus_baud);
     (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
 }
@@ -1264,8 +1268,88 @@ void cfl_embed_pre_tick(void) {
     }
 }
 
+// ============================ Thread 2 — interlock ===========================
+// The ported SAMD21 interlock (node/interlock/). It reads LOCAL I/O only and
+// drives the hard veto on GP0; coupling to the rest of the system is SHARED
+// STATUS ONLY (g_il_status_buffer) — no queue touches the safety path. Lives on
+// core1 alongside the ADC ISR + its decimated data.
+//
+// NOTE (deferred to the thread-review / Stage 5): (a) the hard "1-clock" ADC fast
+// veto path (driven from the ADC ISR) is not ported yet — the tick below is the
+// SUPERVISORY rate; (b) ideal core affinity isolates interlock + ADC ISR on their
+// own core (engine moved off); (c) Thread 2 runs on the master path only for now
+// (the slave is still a stub) — it becomes role-agnostic with the Thread-1
+// unification. (d) NOT yet HW-verified — trip/latch/reset proving needs the bench.
+
+// Platform externs the framework's VIRTUAL inputs read. board_millis() is in
+// board.c. These two back _stack_hwm / _t_since_m2s; fed minimally for now (only
+// matter when a DSL references those virtuals — wire real sources when used).
+volatile uint16_t g_stack_hwm_bytes = 0;
+volatile uint32_t g_last_m2s_rx_ms  = 0;
+
+// ---- il_hal platform seam — bind the HAL to the frozen hwio roles + shared ADC.
+// Pins the interlock may bind: GP0 (veto output), GP2..GP9 (HIL block, per hwio
+// role), GP26/27/28 (ADC). Everything else is fixed-function → reserved.
+bool il_plat_pin_reserved(uint8_t gpio) {
+    if (gpio == INTERLOCK_VETO_PIN) return false;                            // GP0 veto
+    if (gpio >= HIL_GPIO_BASE && gpio < HIL_GPIO_BASE + HIL_GPIO_COUNT) return false; // GP2..9
+    if (gpio >= ADC0_GPIO && gpio < ADC0_GPIO + ADC_NCH) return false;       // GP26..28
+    return true;
+}
+bool il_plat_pin_cap(uint8_t gpio, hal_pin_mode_t mode) {
+    if (mode == HAL_PIN_MODE_GPIO_OUT) {
+        if (gpio == INTERLOCK_VETO_PIN) return true;                         // the veto
+        if (gpio >= HIL_GPIO_BASE && gpio < HIL_GPIO_BASE + HIL_GPIO_COUNT)
+            return g_hwio_role[gpio - HIL_GPIO_BASE] == HWIO_ROLE_OUTPUT;
+        return false;
+    }
+    // input modes: must be an hwio input-roled HIL pin (interlock reads, never reconfigures)
+    if (gpio >= HIL_GPIO_BASE && gpio < HIL_GPIO_BASE + HIL_GPIO_COUNT) {
+        uint8_t r = g_hwio_role[gpio - HIL_GPIO_BASE];
+        return r == HWIO_ROLE_INPUT || r == HWIO_ROLE_INPUT_PULLUP || r == HWIO_ROLE_INPUT_PULLDOWN;
+    }
+    return false;
+}
+uint8_t il_plat_adc_channel(uint8_t gpio) {
+    if (gpio >= ADC0_GPIO && gpio < ADC0_GPIO + ADC_NCH) return (uint8_t)(gpio - ADC0_GPIO);
+    return 0xFFu;
+}
+uint16_t il_plat_adc_latest(uint8_t ch) {
+    return (ch < ADC_NCH) ? g_adc_latest[ch] : 0u;   // 1 kHz decimated mean (lock-free read)
+}
+
+static void il_tick_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        interlock_tick_all();
+        vTaskDelay(pdMS_TO_TICKS(20));   // supervisory cadence (see NOTE above)
+    }
+}
+
+// Run from app_engine_task AFTER adc_service_init + hwio_apply (peripherals up).
+// Re-claims warm-restored slots; on a cold boot, arms slot 0 from the 'ilcf' DSL
+// text. Then spawns the periodic tick task on core1.
+static void interlock_thread2_start(void) {
+    interlock_warm_restore();
+    if (interlock_armed_count() == 0) {                  // cold boot → arm from config
+        uint8_t buf[CFG_FILE_MAX]; uint32_t len;
+        if (cfg_load("ilcf", buf, sizeof buf, &len) == 0 && len > 0) {
+            uint8_t err[3];
+            uint8_t st = interlock_set_slot_dsl(0, (const char *)buf, (uint16_t)len, err);
+            g_ilcf_rc = (st == SHELL_OK) ? 0 : (int)err[0];   // 0 = ok, else parse category
+        } else {
+            g_ilcf_rc = -1;                                   // no ilcf → no interlock armed
+        }
+    } else {
+        g_ilcf_rc = 0;                                        // warm-restored
+    }
+    xTaskCreate(il_tick_task, "il", configMINIMAL_STACK_SIZE * 4, NULL, 2, &t_il);
+    vTaskCoreAffinitySet(t_il, 1u << 1);                      // core1, with the ADC ISR
+}
+
 static void app_engine_task(void *arg) {
     (void)arg;
+    interlock_boot_decide();   // Thread 2: validate persist + bootloop guard (before peripherals)
     const chaintree_handle_t *h = &g_chaintree_handle;
     chaintree_handle_bb_init_hashes();   // blackboard field name-hashes are static-init'd to 0
     cfl_runtime_create_params_t p; memset(&p, 0, sizeof p);
@@ -1282,6 +1366,7 @@ static void app_engine_task(void *arg) {
 #ifdef I2C_SELFTEST
     i2c_loopback_init(); // opt-in self-test: i2c0 slave 0x42 on GP20/21
 #endif
+    interlock_thread2_start(); // Thread 2: warm-restore / arm from 'ilcf', start the tick task (core1)
 
     g_rt = cfl_runtime_create(&g_perm, &p, h);
     if (!g_rt) chassis_panic(RST_PANIC, 3);

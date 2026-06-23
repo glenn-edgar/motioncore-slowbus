@@ -82,6 +82,10 @@ add_executable(bus_controller
     ${NODE_DIR}/boot_hwio.c          # frozen HIL pin-role map ('hwio' config file)
     ${NODE_DIR}/boot_roster.c
     ${NODE_DIR}/cfg_file.c
+    ${NODE_DIR}/interlock/interlock.c       # Thread 2: ported SAMD21 interlock framework
+    ${NODE_DIR}/interlock/interlock_dsl.c   #           DSL parser ('ilcf' text)
+    ${NODE_DIR}/interlock/il_hal_rp2040.c   #           pin HAL (RP2040 SIO + shared ADC)
+    ${NODE_DIR}/interlock/il_pin_table.c    #           DSL pin-name resolution
     ${NODE_DIR}/node_role.c          # slave/node role (one image, role from config)
     ${CORE_DIR}/bus_node.c           # node responder core (used by the slave role)
     ${CMAKE_CURRENT_LIST_DIR}/core/host_link.c
@@ -98,7 +102,7 @@ add_executable(bus_controller
 pico_generate_pio_header(bus_controller ${PORT_DIR}/rs485.pio)
 pico_generate_pio_header(bus_controller ${PORT_DIR}/servo_bank.pio)          # 8-servo bank
 target_include_directories(bus_controller PRIVATE
-    ${COMMON_INC} ${NODE_DIR} ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
+    ${COMMON_INC} ${NODE_DIR} ${NODE_DIR}/interlock ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
     ${BC_DIR}/engine/include ${BC_DIR}/kb0/incr)
 target_compile_definitions(bus_controller PRIVATE
     PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0 CFL_32BIT=1)

@@ -62,7 +62,8 @@ int boot_read_hwio(hwio_t *out) {
         const uint8_t *k; uint32_t kn;
         if (!cbor_str(&c, CBOR_TEXT, &k, &kn)) return HWIO_ERR_FORMAT;
         if (CBOR_KEY(k, kn, "v")) {
-            if (!cbor_uint(&c, &v)) return HWIO_ERR_FORMAT; seen_v = true;
+            if (!cbor_uint(&c, &v)) return HWIO_ERR_FORMAT;
+            seen_v = true;
         } else if (CBOR_KEY(k, kn, "io")) {
             uint64_t n; if (!cbor_open(&c, CBOR_ARRAY, &n)) return HWIO_ERR_FORMAT;
             if (n > HIL_GPIO_COUNT) return HWIO_ERR_ROLE;     // too many roles for the block
