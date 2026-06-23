@@ -1,9 +1,9 @@
 // ============================================================================
 // board.h — RP2040 / Pico W board glue + pin map shared by the port layer.
 //
-// One bus, one tree. Bus speed and BC-master/slave role are selected by two
-// boot straps (GP0/GP1, worst-case jumper pins; mechanism TBD). The default
-// baud below is the fall-through until the strap is read.
+// One bus, one tree. Bus speed and BC-master/slave role come from the flashed
+// `idnt` config (idnt.sp / idnt.vr), read at boot — so the old GP0/GP1 boot
+// straps are RETIRED and GP0/GP1 are now free (spare/expansion).
 //
 // "pico1" role: GPIO interface + I2C manager. Reduced HIL set vs. the old map —
 // NO SPI, ONE I2C, ONE HIL UART, ONE PWM, ONE quadrature decoder, plus an 8-pin
@@ -22,11 +22,11 @@
 #define BUS_PIN_RO         16u       // RS-485 RX = GP16 (header pin 21, bottom-RIGHT)
 // (no BUS_PIN_DE: auto-direction transceivers / bare TTL)
 
-#define BUS_DEFAULT_BAUD   115200u   // fall-through default; GP0 strap selects speed
+#define BUS_DEFAULT_BAUD   115200u   // fall-through default; idnt.sp selects the speed
 
-// --- Boot straps (read once at init; worst-case jumper pins) ----------------
-#define BUS_PIN_SPEED_SEL  0u        // GP0 (pin 1): bus speed select
-#define BUS_PIN_ROLE_SEL   1u        // GP1 (pin 2): BC master vs slave
+// GP0/GP1 (header pins 1/2) are FREE — role/speed moved to the idnt config
+// (idnt.vr / idnt.sp), so the old GP0/GP1 boot straps are retired. Available as
+// spare/expansion GPIO (a future hwio role map may assign them).
 
 // --- HIL GPIO block (8 pins, contiguous GP2..GP9 = header pins 4..12) -------
 #define HIL_GPIO_BASE      2u        // first GPIO = GP2 (pin 4)
@@ -68,7 +68,7 @@
 #define HIL_PIN_ADC1       27u
 #define HIL_PIN_ADC2       28u
 
-// Spare/expansion GPIO: GP19, GP20, GP21, GP22 (header pins 25/26/27/29).
+// Spare/expansion GPIO: GP0, GP1, GP19, GP20, GP21, GP22 (header pins 1/2/25/26/27/29).
 
 uint32_t board_millis(void);   // ms since boot (used by the scheduler)
 void     board_init(void);
