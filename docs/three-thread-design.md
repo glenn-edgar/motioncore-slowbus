@@ -103,6 +103,20 @@ contended by ad-hoc traffic.
 
 ---
 
+## ADC — three GENERAL channels, dual-tier
+- **3 channels (GP26/27/28), one SAR round-robin, single ISR writer** (lock-free readers).
+- **All three are general-purpose** — none firmware-reserved; both the interlock and
+  telemetry read the same decimated outputs (read-only, no contention).
+- **Two tiers:**
+  - **Stage A — ~1 kHz `latest[3]`** (boxcar mean): the FAST tier, the interlock's
+    hard-threshold input (the "1-clock veto" path).
+  - **Stage B — 10 Hz windows: mean / max / RMS** per channel (100 ms windows; RMS = the
+    AC component with DC removed — for CT/transformer AC current; ~440 Hz bandwidth).
+    Feeds telemetry + `CMD_ADC_STATS`.
+- **Per-channel meaning = `hwio`** (frozen config): a label + scaling/units per deployment.
+- **Per-watch channel + stat mode = `ilcf`**: `now` (1 kHz latest — fast threshold) vs
+  `avg/min/max/rms` (10 Hz window — e.g. overcurrent on RMS).
+
 ## Core mapping (RP2040 dual-core SMP)
 - **Core A:** interlock thread **+ the 1 kHz ADC decimation ISR** — deterministic,
   isolated, nothing else competes.
