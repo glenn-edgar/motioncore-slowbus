@@ -34,15 +34,13 @@
 #include "hardware/irq.h"
 #include "hardware/structs/adc.h"   // adc_hw, ADC_FCS_OVER_BITS (overflow resync)
 #include "hardware/structs/sio.h"   // sio_hw->gpio_in (1 kHz pulse sampling)
-#include "hardware/pio.h"           // servo bank + quad PIO
+#include "hardware/pio.h"           // servo bank PIO
 #include "hardware/clocks.h"        // clock_get_hz (servo 1 us/tick)
-#include "hardware/pwm.h"           // HIL PWM on GP14
 #include "hardware/i2c.h"           // HIL I2C manager on GP10/11
 #ifdef I2C_SELFTEST
 #include "pico/i2c_slave.h"         // i2c0 loopback self-test fixture (opt-in)
 #endif
 #include "servo_bank.pio.h"         // generated: servo_bank_program
-#include "quadrature_encoder.pio.h" // generated: quad decoder (GP17/18)
 #include <string.h>   // strcmp for KB lookup by name
 #include "FreeRTOS.h"
 #include "task.h"
@@ -110,9 +108,7 @@
 #define CMD_GPIO_READ            0x0102u // [port u8][pin u8] -> [level u8]
 #define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
 #define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
-#define CMD_PWM_SET              0x0109u // [duty u16 LE] 0..HIL_PWM_TOP on GP14 (fixed 20 kHz)
-#define CMD_QUAD_READ            0x010Au // [] -> [count s32 LE] (GP17 A / GP18 B)
-#define CMD_QUAD_CLEAR           0x010Bu // [] -> zero the quad count
+// 0x0109 (PWM) / 0x010A-0x010B (quad) RETIRED 2026-06-23 — PWM + quad moved to Pico2.
 #define CMD_I2C_SCAN             0x010Cu // [] -> [addr u8]... (7-bit ACKing devices)
 #define CMD_I2C_WRITE            0x010Du // [addr u8][data...] -> []
 #define CMD_I2C_READ             0x010Eu // [addr u8][len u8] -> [data...]
@@ -128,8 +124,10 @@
 #define GPIO_MODE_INPUT_PULLDOWN 3u
 #define GPIO_MODE_SERVO          4u
 #define GPIO_MODE_PULSE_COUNT    5u      // 1 kHz-sampled edge counter, GP2..GP9 only
-// Pins the HIL GPIO/pulse commands must never touch: straps GP0/1, I2C GP10/11,
-// PWM GP14, RS-485 GP15/16, quad GP17/18, ADC GP26/27/28.
+// Pins the HIL GPIO/pulse commands must never touch: veto GP0, I2C GP10/11,
+// RS-485 GP15/16, ADC GP26/27/28, plus now-spare GP1/14/17/18 (PWM/quad retired —
+// kept reserved until the hwio role map governs). (GP20/21 = polled-I2C; add when
+// the I2C service lands.)
 #define GPIO_RESERVED_MASK ((1u<<0)|(1u<<1)|(1u<<10)|(1u<<11)|(1u<<14)|(1u<<15)|(1u<<16)|(1u<<17)|(1u<<18)|(1u<<26)|(1u<<27)|(1u<<28))
 #define KB0_VER                  1u
 // KB0 report opcodes (s2m, src=0xFB). Common header: [batch u16][seq u8][total u8][ver u8].
@@ -933,32 +931,8 @@ static void servo_feeder_task(void *arg) {
     }
 }
 
-// ---- PWM (single channel, GP14, fixed 20 kHz / 11-bit) ----------------------
-// Armed at boot at 0% duty (pin held low) until CMD_PWM_SET drives it. Duty is
-// 0..HIL_PWM_TOP (2047) to match the SAMD21/RA4M1 HIL command surface.
-static uint g_pwm_slice;
-static void pwm_init_hw(void) {
-    gpio_set_function(HIL_PIN_PWM0, GPIO_FUNC_PWM);
-    g_pwm_slice = pwm_gpio_to_slice_num(HIL_PIN_PWM0);
-    pwm_config cfg = pwm_get_default_config();
-    // pwm clock = freq * (TOP+1); div = sys_clk / that.
-    pwm_config_set_clkdiv(&cfg, (float)clock_get_hz(clk_sys) / ((float)HIL_PWM_FREQ_HZ * (HIL_PWM_TOP + 1)));
-    pwm_config_set_wrap(&cfg, HIL_PWM_TOP);
-    pwm_init(g_pwm_slice, &cfg, true);
-    pwm_set_gpio_level(HIL_PIN_PWM0, 0);          // 0% duty, pin low
-}
-
-// ---- Quadrature decoder (single, PIO, GP17 A / GP18 B) ----------------------
-// pio1 = HIL block; the quad program demands PIO address 0 (computed jumps), so
-// it is added at boot BEFORE the servo bank (which then lands above it).
-static PIO     g_quad_pio = pio1;
-static uint    g_quad_sm;
-static int32_t g_quad_zero;                       // CLEAR captures the count as the new zero
-static void quad_init_hw(void) {
-    g_quad_sm = (uint)pio_claim_unused_sm(g_quad_pio, true);
-    pio_add_program(g_quad_pio, &quadrature_encoder_program);   // .origin 0 -> offset 0
-    quadrature_encoder_program_init(g_quad_pio, g_quad_sm, HIL_PIN_QUAD0_A, 0);
-}
+// PWM (GP14) and the quadrature decoder (GP17/18) were removed 2026-06-23 — both
+// move to the Pico2 (RP2350). The servo bank now owns pio1 outright.
 
 // ---- I2C manager (master, i2c1, GP10 SDA / GP11 SCL, 100 kHz) ---------------
 // Internal pull-ups only — fine for short bench wires / one device; a real bus
@@ -1153,22 +1127,7 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
         servo_stop_all();
         hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
     }
-    case CMD_PWM_SET: {
-        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        uint16_t duty = (uint16_t)c->args[0] | ((uint16_t)c->args[1] << 8);
-        if (duty > HIL_PWM_TOP) duty = HIL_PWM_TOP;
-        pwm_set_gpio_level(HIL_PIN_PWM0, duty);
-        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
-    }
-    case CMD_QUAD_READ: {
-        int32_t cnt = quadrature_encoder_get_count(g_quad_pio, g_quad_sm) - g_quad_zero;
-        uint8_t res[4] = { (uint8_t)cnt, (uint8_t)(cnt >> 8), (uint8_t)(cnt >> 16), (uint8_t)(cnt >> 24) };
-        hil_reply(c->req_id, SHELL_OK, res, 4); return true;
-    }
-    case CMD_QUAD_CLEAR: {
-        g_quad_zero = quadrature_encoder_get_count(g_quad_pio, g_quad_sm);
-        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
-    }
+    // CMD_PWM_SET / CMD_QUAD_READ / CMD_QUAD_CLEAR removed 2026-06-23 (moved to Pico2).
     case CMD_I2C_SCAN: {                              // -> i2c_service_task (async, off the engine)
         i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_SCAN };
         (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
@@ -1316,8 +1275,6 @@ static void app_engine_task(void *arg) {
     // Central ADC service: free-running round-robin + 1 kHz FIFO ISR on core1.
     // (Started here so ADC_IRQ_FIFO is owned by core1.)
     adc_service_init();
-    pwm_init_hw();      // GP14 PWM armed at 0% duty
-    quad_init_hw();     // GP17/18 quad decoder (pio1 offset 0, before any servo)
     i2c_init_hw();      // GP10/11 I2C manager (master, 100 kHz) — inited here; serviced on core1 task
 #ifdef I2C_SELFTEST
     i2c_loopback_init(); // opt-in self-test: i2c0 slave 0x42 on GP20/21

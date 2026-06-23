@@ -6,10 +6,10 @@
 // straps are RETIRED and GP0/GP1 are now free (spare/expansion).
 //
 // "pico1" role: GPIO interface + I2C manager. Reduced HIL set vs. the old map —
-// NO SPI, ONE I2C, ONE HIL UART, ONE PWM, ONE quadrature decoder, plus an 8-pin
-// contiguous GPIO block and the 3-channel ADC analog spine. Header exposes
-// GP0-GP22 + GP26/27/28; GP23/24/25/29 are CYW43-internal. See docs/README.md
-// for the physical two-side layout.
+// NO SPI, TWO I2C (polled + async), ONE HIL UART, plus an 8-pin contiguous GPIO
+// block and the 3-channel ADC analog spine. PWM + quadrature were dropped to the
+// Pico2 (RP2350). Header exposes GP0-GP22 + GP26/27/28; GP23/24/25/29 are
+// CYW43-internal. See docs/README.md for the physical two-side layout.
 // ============================================================================
 #pragma once
 
@@ -63,25 +63,16 @@
 #define HIL_PIN_UART_RX    13u       // uart0 RX, GP13 (pin 17)
 #define HIL_UART_INST      uart0
 
-// --- PWM — single channel ---------------------------------------------------
-// Armed at boot at 0% duty (pin held low) until driven. 11-bit (2048 steps) to
-// match the SAMD21/RA4M1 HIL command surface; divider lands a 2048-count period
-// near 20 kHz. GP14 = PWM slice 7, channel A.
-#define HIL_PIN_PWM0       14u       // GP14 (pin 19), slice 7A
-#define HIL_PWM_FREQ_HZ    20000u
-#define HIL_PWM_BITS       11u       // 2048 steps
-#define HIL_PWM_TOP        2047u
-
-// --- Quadrature decoder — single, PIO (RP2040 has no hardware QEI) -----------
-#define HIL_PIN_QUAD0_A    17u       // GP17 (pin 22)
-#define HIL_PIN_QUAD0_B    18u       // GP18 (pin 24)
+// PWM (GP14) and the quadrature decoder (GP17/18) were DROPPED from the RP2040
+// (2026-06-23) — those functions move to the Pico2 (RP2350). GP14/GP17/GP18 are
+// now free (spare/expansion).
 
 // ADC (analog inputs; one SAR, round-robin muxed, not simultaneous)
 #define HIL_PIN_ADC0       26u
 #define HIL_PIN_ADC1       27u
 #define HIL_PIN_ADC2       28u
 
-// Spare/expansion GPIO: GP1, GP19, GP22 (header pins 2/25/29).
+// Spare/expansion GPIO: GP1, GP14, GP17, GP18, GP19, GP22 (header pins 2/19/22/24/25/29).
 // (GP0 = interlock veto; GP20/21 = polled-I²C bus.)
 
 uint32_t board_millis(void);   // ms since boot (used by the scheduler)
