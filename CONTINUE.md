@@ -69,40 +69,38 @@ Size: unified text 167,932 B (+1.3 KB vs the old master), bss 101,672 B (+2.2 KB
 speed-from-config + slave USB-reflash — all HW-verified; bench reverted to the 115200 default;
 working tree clean + pushed. The working KBs are **KB0 (monitor)** and **KB1 (HIL/API surface)**.
 
-## NEXT SESSION (2026-06-23) — KB2/KB3 INTERLOCKS — the keystone, "must be done right"
+## ARCHITECTURE REVISED 2026-06-23 — THREE-THREAD MODEL → see `docs/three-thread-design.md`
 
-This is the **safety-critical** part (Glenn 2026-06-22: "this is a part that must be done
-right"). **Read `docs/core1-design.md` §Interlocks FIRST — the design is LOCKED.**
+**Read `docs/three-thread-design.md` FIRST.** The KB0–KB4-as-chain-KBs plan (and the
+KB2/KB3-chain interlock plan that was here) is **SUPERSEDED.** The firmware is now three
+threads + a transport layer below them, with **hardware FROZEN at config time** (no runtime
+reconfiguration). Headline decisions (all agreed in chat 2026-06-23):
+- **Thread 1** = I/O router + the bench surface (monitor + HIL-**operate** + commission);
+  routes only non-bench → events to the chain-tree. Absorbs old KB0+KB1.
+- **Thread 2** = the **interlock**, a **port of the proven SAMD21 design** (`~/xiao_blocks/
+  firmware/samd21/device/samd21_interlocks.*` + its DSL) — **NOT** a chain-tree KB. Tick-driven,
+  local I/O only, **GPIO veto**, **shared-status-only** coupling (status word out, `rearm` flag in).
+- **Thread 3** = the chain-tree engine, now **pure application** (non-bench events in, RS-485 out).
+- **I²C** = one service: periodic-sample (INA219, …) → shared area + intermixed async; the
+  interlock reads the mirror with a **freshness fail-safe**. Veto stays on GPIO.
+- **KB4 dropped** (frozen config → static pin-ownership, no dynamic allocation).
+- All config frozen in the config-FS: `hwio` (pin roles), `ilcf` (interlock DSL), I²C inventory.
 
-CURRENT STATE = **SEAM ONLY**: the 1 kHz ADC-decimation ISR runs; `kb2_on_fast_tick` is an
-EMPTY weak stub; the chain tree (`kb0.json`) has only KB0+KB1; there is no veto / latch /
-re-arm / state machine, no config/arm commands, and the 64-bit status word is hard-zero.
-"Interlocks boot to 0." KB2 and KB3 are IDENTICAL — two instances of one interlock module.
+SAFETY INVARIANT (preserve): **the veto never depends on any engine/thread being healthy** —
+now structural (the interlock is a separate thread + the ADC ISR). The interlock is the
+**safety-critical part — do it right.**
 
-SAFETY INVARIANT (from the SAMD21 era — preserve it): **the veto NEVER depends on the engine
-being healthy.** The **ISR is the sole writer of latch + veto**; the KB is only policy + a
-mirror of the ISR latch. The latch holds through input recovery (no auto-resume).
+**Build order** (from the design note; verify between each):
+1. `hwio` config (schema + host builder + boot reader applying pin roles).
+2. Thread 1 — router + bench (operate-only HIL, validated against `hwio`).
+3. I²C service (periodic-sample → shared area + async; inventory in config).
+4. **Thread 2 — the SAMD21 interlock port** (HAL→RP2040, shared-status coupling, I²C-mirror
+   input + freshness fail-safe).
+5. Thread 3 — the chain-tree application.
 
-Build order (core1-design.md items 2–5) — DO IN ORDER, verify between each:
-1. **ADC fast-path callbacks**: per-armed-interlock callback the decimation ISR walks —
-   `watch channel → drive veto pin to SAFE → LATCH` (ISR sole writer).
-2. **KB2/KB3 chains** in the DSL (two identical instances) → regenerate the chain IR.
-3. **Slow-path state machine** `DISARMED→ARMED→TRIPPED→ARMED`; `TRIPPED` mirrors the ISR latch
-   at 10 Hz; a config change is REFUSED while TRIPPED.
-4. **Re-arm**: host command → KB sets `rearm_request` → ISR verifies input safe + dwell next
-   tick → clear, or `rearm_refused` (ack/nack; new API command id).
-5. **Notification**: the interlock's bit in the 64-bit status word (core0 reads the ISR latch
-   on the virtual-slave POLL → `OP_BUS_SLAVE_FLAGGED` at bus-poll cadence) + the 10 Hz
-   `OP_EVENT` detail pushed north.
-6. **KB1 glue**: the config / arm / clear / status commands + pin-ownership (KB1 refuses a HIL
-   write to a pin an armed interlock claimed).
-
-(KB4 — the interlock manager: admission / allocation / supervision — is the layer AFTER the
-two interlocks run.)
-
-**Deferred until after the interlocks:** Pico2/RP2350 build (the "pico AND pico2" half — only
-rp2040 verified so far); more node app logic; `g_roster`(16) vs `core/bus_roster.c`(32)
-reconcile; retire the SAMD21 tree (→ `~/xiao_blocks`); later, the Pi wireless proxy.
+**Deferred:** final core affinities + slave-responder timing (thread-review pass); Pico2/RP2350
+build (the "pico AND pico2" half — only rp2040 verified); `g_roster`(16) vs
+`core/bus_roster.c`(32) reconcile; retire the SAMD21 tree; later, the Pi wireless proxy.
 
 ---
 
