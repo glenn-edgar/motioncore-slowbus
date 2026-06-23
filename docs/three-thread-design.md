@@ -79,24 +79,27 @@ Consequence: the old runtime `GPIO_CONFIG` and servo-mode-switch commands are
 
 ---
 
-## I²C — one service: periodic sample + async, published to a shared area
-- A **single I²C service owns the bus** (no other thread touches the wire).
-- It **periodically samples** a configured device set (e.g. INA219 current/power) and
-  **publishes results to a shared area**; **async one-off requests** (bench /
-  chain-tree) are **intermixed in the gaps**.
-- **All consumers READ the shared area** for sampled values — so the interlock gets
-  its I²C inputs as **shared status**: tick-only, never blocks on the bus.
+## I²C — TWO buses: a POLLED bus and an ASYNC bus
+Decision 2026-06-23: split I²C onto **two physical buses** so safety sampling is never
+contended by ad-hoc traffic.
+- **POLLED bus — `i2c0` on GP20/21.** The service **periodically samples** a configured
+  device set (e.g. INA219 current/power) and **publishes to a shared area**. This bus is
+  **dedicated** — nothing else touches it — so the interlock's inputs are deterministic.
+- **ASYNC bus — `i2c1` on GP10/11.** Bench + chain-tree **one-off** read/write requests.
+  This is the existing HIL I²C bus.
+- **All consumers READ the shared area** for sampled values — the interlock gets its I²C
+  inputs as **shared status**: tick-only, never blocks on the bus.
+- Because the buses are physically separate, the earlier "async could delay a sample past
+  its freshness deadline" worry is **eliminated** — the polled cadence stands alone.
 - Rules:
-  1. **Single writer** (the service); lock-free readers; **per-record seqlock /
-     double-buffer** so a reader never sees a half-updated multi-field sample.
-  2. Each value carries a **timestamp/generation + valid bit** → drives the
-     interlock freshness fail-safe (stale/failed read = fault = trip).
-  3. The **sample set + cadence + device inventory = frozen config.**
-  4. **Periodic schedule has priority** (it feeds safety); async fills the slack,
-     **bounded** so a burst can't push a sample past its freshness deadline.
-  5. The service runs on the **non-interlock core** (it blocks on I²C); the interlock
-     only **reads** the shared area.
-- **Veto stays on GPIO** — I²C is strictly for **sensed inputs**, never the veto.
+  1. **Single writer** (the service) to the shared area; lock-free readers; **per-record
+     seqlock / double-buffer** so a reader never sees a half-updated multi-field sample.
+  2. Each value carries a **timestamp/generation + valid bit** → drives the interlock
+     freshness fail-safe (stale/failed read = fault = trip).
+  3. The **polled device set + cadence + the inventory for both buses = frozen config.**
+  4. The service (both buses) runs on the **non-interlock core** (it blocks on I²C); the
+     interlock only **reads** the shared area.
+- **Veto stays on GPIO (GP0)** — I²C is strictly for **sensed inputs**, never the veto.
 
 ---
 

@@ -24,11 +24,15 @@
 
 #define BUS_DEFAULT_BAUD   115200u   // fall-through default; idnt.sp selects the speed
 
-// GP0/GP1 (header pins 1/2) are FREE — role/speed moved to the idnt config
-// (idnt.vr / idnt.sp), so the old GP0/GP1 boot straps are retired. Available as
-// spare/expansion GPIO (a future hwio role map may assign them).
+// GP0/GP1 (header pins 1/2): freed when role/speed moved to the idnt config.
+// GP0 = the interlock HARD VETO output (reserved — Thread 2 drives it; the ilcf
+// DSL / hwio must not assign it elsewhere). GP1 stays spare/expansion.
+#define INTERLOCK_VETO_PIN 0u        // GP0 (pin 1): interlock hard veto (GPIO, fail-safe)
 
 // --- HIL GPIO block (8 pins, contiguous GP2..GP9 = header pins 4..12) -------
+// The flexible HIL block — today GPIO / servo-bank / pulse-count, and MAY gain
+// ADDITIONAL MODES later. The hwio role map (frozen config) fixes each pin's mode
+// per deployment; keep that role enum append-only / extensible.
 #define HIL_GPIO_BASE      2u        // first GPIO = GP2 (pin 4)
 #define HIL_GPIO_COUNT     8u        // GP2..GP9
 #define HIL_PIN_GPIO0      2u
@@ -40,10 +44,19 @@
 #define HIL_PIN_GPIO6      8u
 #define HIL_PIN_GPIO7      9u
 
-// --- I2C — single bus, i2c1 (the "I2C manager" interface) -------------------
-#define HIL_PIN_I2C_SDA    10u       // i2c1 SDA, GP10 (pin 14)
+// --- I2C — TWO buses (split for safety; see docs/three-thread-design.md) -----
+// ASYNC bus (i2c1, GP10/11): bench + chain-tree one-off read/write requests.
+// (HIL_* names kept — the HIL I2C commands already target this bus.)
+#define HIL_PIN_I2C_SDA    10u       // i2c1 SDA, GP10 (pin 14)   [ASYNC bus]
 #define HIL_PIN_I2C_SCL    11u       // i2c1 SCL, GP11 (pin 15)
 #define HIL_I2C_INST       i2c1
+// POLLED bus (i2c0, GP20/21): periodically-sampled devices (INA219, …) → the
+// shared mirror that feeds the interlock. Isolated from async traffic so a sample
+// is never delayed past its freshness deadline. Device inventory = frozen config.
+// (Supersedes the opt-in I2C_SELFTEST fixture that used i2c0 on GP20/21.)
+#define I2C_POLLED_SDA     20u       // i2c0 SDA, GP20 (pin 26)   [POLLED bus]
+#define I2C_POLLED_SCL     21u       // i2c0 SCL, GP21 (pin 27)
+#define I2C_POLLED_INST    i2c0
 
 // --- UART — single HIL serial, uart0 (separate from the PIO RS-485 bus) ------
 #define HIL_PIN_UART_TX    12u       // uart0 TX, GP12 (pin 16)
@@ -68,7 +81,8 @@
 #define HIL_PIN_ADC1       27u
 #define HIL_PIN_ADC2       28u
 
-// Spare/expansion GPIO: GP0, GP1, GP19, GP20, GP21, GP22 (header pins 1/2/25/26/27/29).
+// Spare/expansion GPIO: GP1, GP19, GP22 (header pins 2/25/29).
+// (GP0 = interlock veto; GP20/21 = polled-I²C bus.)
 
 uint32_t board_millis(void);   // ms since boot (used by the scheduler)
 void     board_init(void);
