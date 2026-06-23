@@ -41,10 +41,34 @@ Size: unified text 167,932 B (+1.3 KB vs the old master), bss 101,672 B (+2.2 KB
 - Round-trip: `CMD_ECHO -> addr 0x09: status=0 result="hello"` — DATA path OK.
 - Configs SURVIVE the firmware flash (config region = top 64 KB, a separate flash region).
 
-**NEXT**: (a) config-driven BUS SPEED — `node_role_run()` and the master both still
-call `bus_phy_init(BUS_DEFAULT_BAUD)`; add a speed field to `idnt` (or a new cfg file)
-and read it at boot. (b) Pico2/RP2350 build of the same source. (c) more node app
-logic beyond CMD_ECHO. (d) `g_roster`(cap 16) vs `core/bus_roster.c`(cap 32) reconcile.
+**ALSO DONE + HW-VERIFIED 2026-06-22 (commits `9cdda65`, `ae6b660`):**
+- **Bus speed from config** (`9cdda65`): optional `sp` (baud) field in `idnt`; both roles
+  `bus_phy_init(sp ? sp : BUS_DEFAULT_BAUD)`. `identity_t.baud` (0 = absent). `cfg_image.lua
+  --speed`. Master boot banner now shows `baud=<n>`. Backward-compatible (no `sp` → 115200).
+  VERIFIED end-to-end: re-commissioned BOTH idnt at `--speed 230400`, master banner read
+  `baud=230400`, slave `ALIVE misses=0`, round-trip OK at 230400 → then reverted both to
+  default 115200 (bench is back on baseline).
+- **Slave USB reflash without BOOTSEL** (`ae6b660`): `node_task` used `taskYIELD()` (yields
+  only to >= priority), which starved the `pico_async_context` USB worker → a board running
+  the slave role couldn't be force-rebooted by picotool. Fix: `vTaskDelay(1)` so the USB
+  worker runs (RX is IRQ-fed; 1 ms wake << the ~2 ms POLL window). VERIFIED: a slave on the
+  fixed fw was force-rebooted + reflashed over USB, no BOOTSEL button.
+
+**FLASHING GOTCHAS (picotool 2.2.0, two RP devices on the Pi — learned the hard way):**
+- `--ser` does NOT disambiguate two RUNNING devices for `-f`; use `--bus/--address`
+  (map serial→bus/dev from `/sys/bus/usb/devices/*/{serial,busnum,devnum}`; in BOOTSEL,
+  `picotool info -a --bus 1 --address N` shows the `flash id` = board UID).
+- `reboot` rejects `--ser/--bus/--address` → can't target a reboot among two devices.
+- `load -x` on a CONFIG uf2 fails ("no valid executable") — config has no entry point.
+- RELIABLE CONFIG FLASH: force ONE board to BOOTSEL (it becomes the single BOOTSEL device),
+  then operate UNTARGETED: `picotool load -x -f --bus B --address A <cfg>.uf2` (rc 254, -x
+  fails but it's now in BOOTSEL) → `picotool load <cfg>.uf2` (writes config) → `picotool
+  load -x <bus_controller>.uf2` (reboots to run; firmware region is separate from config).
+
+**NEXT**: (a) **Pico2/RP2350 build of the same source** (the "pico AND pico2" half of the
+goal — only rp2040 built/verified so far). (b) more node app logic beyond CMD_ECHO.
+(c) `g_roster`(cap 16) vs `core/bus_roster.c`(cap 32) reconcile. (d) remove the SAMD21 tree
+(→ `~/xiao_blocks`) once it's a few days settled. (e) later: the Pi wireless proxy.
 
 ---
 
