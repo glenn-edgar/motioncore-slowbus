@@ -65,10 +65,44 @@ Size: unified text 167,932 B (+1.3 KB vs the old master), bss 101,672 B (+2.2 KB
   fails but it's now in BOOTSEL) → `picotool load <cfg>.uf2` (writes config) → `picotool
   load -x <bus_controller>.uf2` (reboots to run; firmware region is separate from config).
 
-**NEXT**: (a) **Pico2/RP2350 build of the same source** (the "pico AND pico2" half of the
-goal — only rp2040 built/verified so far). (b) more node app logic beyond CMD_ECHO.
-(c) `g_roster`(cap 16) vs `core/bus_roster.c`(cap 32) reconcile. (d) remove the SAMD21 tree
-(→ `~/xiao_blocks`) once it's a few days settled. (e) later: the Pi wireless proxy.
+**BASELINE 2026-06-22** (git tag `baseline-2026-06-22`): single image + role-from-config +
+speed-from-config + slave USB-reflash — all HW-verified; bench reverted to the 115200 default;
+working tree clean + pushed. The working KBs are **KB0 (monitor)** and **KB1 (HIL/API surface)**.
+
+## NEXT SESSION (2026-06-23) — KB2/KB3 INTERLOCKS — the keystone, "must be done right"
+
+This is the **safety-critical** part (Glenn 2026-06-22: "this is a part that must be done
+right"). **Read `docs/core1-design.md` §Interlocks FIRST — the design is LOCKED.**
+
+CURRENT STATE = **SEAM ONLY**: the 1 kHz ADC-decimation ISR runs; `kb2_on_fast_tick` is an
+EMPTY weak stub; the chain tree (`kb0.json`) has only KB0+KB1; there is no veto / latch /
+re-arm / state machine, no config/arm commands, and the 64-bit status word is hard-zero.
+"Interlocks boot to 0." KB2 and KB3 are IDENTICAL — two instances of one interlock module.
+
+SAFETY INVARIANT (from the SAMD21 era — preserve it): **the veto NEVER depends on the engine
+being healthy.** The **ISR is the sole writer of latch + veto**; the KB is only policy + a
+mirror of the ISR latch. The latch holds through input recovery (no auto-resume).
+
+Build order (core1-design.md items 2–5) — DO IN ORDER, verify between each:
+1. **ADC fast-path callbacks**: per-armed-interlock callback the decimation ISR walks —
+   `watch channel → drive veto pin to SAFE → LATCH` (ISR sole writer).
+2. **KB2/KB3 chains** in the DSL (two identical instances) → regenerate the chain IR.
+3. **Slow-path state machine** `DISARMED→ARMED→TRIPPED→ARMED`; `TRIPPED` mirrors the ISR latch
+   at 10 Hz; a config change is REFUSED while TRIPPED.
+4. **Re-arm**: host command → KB sets `rearm_request` → ISR verifies input safe + dwell next
+   tick → clear, or `rearm_refused` (ack/nack; new API command id).
+5. **Notification**: the interlock's bit in the 64-bit status word (core0 reads the ISR latch
+   on the virtual-slave POLL → `OP_BUS_SLAVE_FLAGGED` at bus-poll cadence) + the 10 Hz
+   `OP_EVENT` detail pushed north.
+6. **KB1 glue**: the config / arm / clear / status commands + pin-ownership (KB1 refuses a HIL
+   write to a pin an armed interlock claimed).
+
+(KB4 — the interlock manager: admission / allocation / supervision — is the layer AFTER the
+two interlocks run.)
+
+**Deferred until after the interlocks:** Pico2/RP2350 build (the "pico AND pico2" half — only
+rp2040 verified so far); more node app logic; `g_roster`(16) vs `core/bus_roster.c`(32)
+reconcile; retire the SAMD21 tree (→ `~/xiao_blocks`); later, the Pi wireless proxy.
 
 ---
 
