@@ -84,6 +84,8 @@ while i <= #arg do
     elseif a == "--speed" or a == "--baud" then opt.baud = tonumber(nextval())  -- optional RS-485 bus speed -> idnt 'sp'
     elseif a == "--slvr"       then opt.slvr = nextval()
     elseif a == "--poll"       then opt.poll = nextval()
+    elseif a == "--io"         then opt.io = nextval()    -- hwio HIL roles: "r0,r1,..,r7" (GP2..GP9; HWIO_ROLE_* 0..6)
+    elseif a == "--adc"        then opt.adc = nextval()   -- hwio ADC annotation: "label:unit:num:den,..." (<=3 chans)
     elseif a == "--flash-size" then opt.flash_size = tonumber(nextval())
     elseif a == "--port"       then opt.port = nextval()
     else error("unknown arg: " .. a) end
@@ -139,6 +141,48 @@ if opt.slvr then
     slvr_desc = (" + slvr{%d slaves, poll %s}"):format(#slaves, opt.poll)
 end
 
+-- hwio (optional, frozen HIL pin-role map + ADC annotation) -----------------
+-- --io  "r0,r1,..,r7"  : up to 8 role ints for GP2..GP9 (HWIO_ROLE_*: 0=unused,
+--                        1=in, 2=in_pullup, 3=in_pulldown, 4=out, 5=servo, 6=pulse).
+-- --adc "L:U:N:D,.."   : up to 3 channels; each "label:unit:num:den" (any field
+--                        may be empty -> omitted; value = raw*num/den).
+local hwio_desc = ""
+if opt.io or opt.adc then
+    local hw = { v = 1 }
+    if opt.io then
+        local roles = {}
+        for _, t in ipairs(split(opt.io, ",")) do
+            local r = tonumber(t); assert(r and r >= 0 and r <= 6, "bad --io role: " .. t .. " (want 0..6)")
+            roles[#roles + 1] = r
+        end
+        assert(#roles <= 8, "--io has " .. #roles .. " roles (max 8, GP2..GP9)")
+        hw.io = roles
+    end
+    if opt.adc then
+        -- Split on ',' PRESERVING empties so channels stay positional (ADC0/1/2).
+        local clist = {}; for x in (opt.adc .. ","):gmatch("([^,]*),") do clist[#clist + 1] = x end
+        local chans = {}
+        for _, e in ipairs(clist) do
+            local f = {}; for x in (e .. ":::"):gmatch("([^:]*):") do f[#f + 1] = x end  -- pad so trailing empties survive
+            local ch = {}
+            if f[1] and f[1] ~= "" then ch.l = f[1] end
+            if f[2] and f[2] ~= "" then ch.u = f[2] end
+            if f[3] and f[3] ~= "" then ch.n = tonumber(f[3]) or error("bad --adc num: " .. f[3]) end
+            if f[4] and f[4] ~= "" then ch.d = tonumber(f[4]) or error("bad --adc den: " .. f[4]) end
+            -- An empty {} would CBOR-encode as an array, not a map (the reader wants a
+            -- map); require at least a label so channels stay positional + well-typed.
+            assert(next(ch), "empty --adc channel #" .. #chans + 1 .. " (give at least a label, e.g. 'vbus')")
+            chans[#chans + 1] = ch
+        end
+        assert(#chans <= 3, "--adc has " .. #chans .. " channels (max 3)")
+        hw.ad = chans
+    end
+    local hwio = cbor.encode(hw)
+    assert(#hwio <= STORE_DATA_MAX, "hwio CBOR too big: " .. #hwio .. " B (>" .. STORE_DATA_MAX .. ")")
+    entries[#entries + 1] = { name = "hwio", data = hwio }
+    hwio_desc = (" + hwio{io=%d,adc=%d}"):format(hw.io and #hw.io or 0, hw.ad and #hw.ad or 0)
+end
+
 -- ---- entries -> rows -> multi-block UF2 ------------------------------------
 local base = 0x10000000 + opt.flash_size - 0x10000   -- top 64 KB of flash
 local blocks = {}
@@ -152,5 +196,5 @@ local f = assert(io.open(opt.out, "wb")); f:write(uf2); f:close()
 io.write(string.format(
     "[cfg_image] %s: idnt{v=1,ch=%d,vr=%d,ad=%d,%sid=%s}%s -> %d entr%s -> UF2 @ 0x%08X (%d B)\n",
     opt.out, opt.chip, opt.variant, opt.addr,
-    opt.baud and string.format("sp=%d,", opt.baud) or "", opt.uid, slvr_desc,
+    opt.baud and string.format("sp=%d,", opt.baud) or "", opt.uid, slvr_desc .. hwio_desc,
     #entries, #entries == 1 and "y" or "ies", base, #uf2))

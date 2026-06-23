@@ -57,6 +57,7 @@
 #include "variants.h"        // shared product/variant enum + role derivation
 #include "node_role.h"       // slave/node role entry (single image, role from config)
 #include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
+#include "boot_hwio.h"       // read the frozen HIL pin-role map ('hwio' config file)
 #include "boot_roster.h"     // read the master's slave roster ('slvr' config file)
 #include "cfg_file.h"        // read-only config store (cfg_load / cfg_layout_ok)
 
@@ -177,6 +178,8 @@ static SemaphoreHandle_t g_lock;
 
 static host_link_t g_hl;
 static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitted on each host (re)attach
+static int g_hwio_rc; // boot_read_hwio() result (HWIO_OK / _MISSING benign; other = present-but-bad)
+static hwio_t g_hwio; // frozen HIL pin-role map + ADC annotation (always usable; defaults all-UNUSED)
 static volatile bool g_identity_refused;   // mismatch (or missing+IDENT_REQUIRE_PRESENT) -> bus arbiter quarantined
 static uint32_t g_bus_baud;   // resolved RS-485 baud (config 'sp', else BUS_DEFAULT_BAUD); shown in the banner
 static uint8_t g_cfg_roster_n;   // slaves loaded from the 'slvr' config file at boot (0 if none)
@@ -189,10 +192,10 @@ static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
 // re-emit is what actually makes `ident` observable over USB. Caller serializes
 // host_link access (boot path is pre-scheduler; uplink holds g_lock).
 static void bc_emit_boot_banner(void) {
-    char b[88];
-    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s slvr=%u baud=%u",
+    char b[96];
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d slvr=%u baud=%u",
                      (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc,
-                     g_identity_refused ? " REFUSED" : "", (unsigned)g_cfg_roster_n,
+                     g_identity_refused ? " REFUSED" : "", g_hwio_rc, (unsigned)g_cfg_roster_n,
                      (unsigned)g_bus_baud);
     (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
 }
@@ -1380,6 +1383,13 @@ int main(void) {
     // Bus speed from config ('sp'); absent/uncommissioned -> BUS_DEFAULT_BAUD.
     // Must match across every node on the wire (set the same 'sp' in each idnt).
     g_bus_baud = (g_id_rc == IDENT_OK && ident.baud) ? ident.baud : BUS_DEFAULT_BAUD;
+
+    // ---- frozen HIL pin-role map from the config FS ('hwio') ----------------
+    // Role-agnostic (read before the role split). HWIO_OK / _MISSING both leave
+    // g_hwio usable (MISSING -> all pins UNUSED / hi-Z). A present-but-malformed
+    // file is logged via the banner; pins stay at the fail-safe defaults. Roles
+    // are APPLIED to hardware later (hwio_apply, per role path).
+    g_hwio_rc = boot_read_hwio(&g_hwio);
 
     // ROLE DISPATCH (one image; role chosen from the config 'vr'): a COMMISSIONED
     // SLAVE runs only the node responder (node_role_run never returns) and skips
