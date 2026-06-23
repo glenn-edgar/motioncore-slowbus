@@ -92,3 +92,36 @@ cfg modes: `in[,up|,down|,debounce_N]`, `adc[,oversample_N|,sh_N|,hyst_N]`,
   ADC-threshold veto path is the ISR, so the tick cadence is the supervisory rate).
 - `ilcf` (DSL text) + the I²C inventory become config-FS files (I²C input source +
   freshness fail-safe are added when the I²C service lands — deferred).
+
+## Port staging in slow_bus (`node/interlock/`)
+Module is built in isolation by the `il_thread2_check` object lib (CMake,
+`-Werror`) so the main image stays green until the wire-in stage.
+
+- **Stage 1 — pin HAL ✅ (2026-06-23).** `il_hal.h` (contract, SAMD21-compatible
+  names) + `il_hal_rp2040.c` (ownership-table port on RP2040 SIO). Compiles clean.
+- **Stage 2 — vendored framework.** Copy `samd21_interlocks.{c,h}` → `interlock.{c,h}`;
+  swap `samd21.h`/CMSIS → `il_platform.h` (reset-cause + `panic()` via
+  `watchdog_reboot`; persist in `.uninitialized_data`); swap `samd21_pin_table.h` →
+  `il_pin_table.h` (DSL pin name → GPIO; ADC channel map); replace the libcomm
+  `OP_EVENT`/`interlock_build_status_v2`/repush wire surface with the **shared-status
+  coupling** (status word out, `rearm` flag in — no queue on the safety path).
+- **Stage 3 — DSL parser.** Vendor `samd21_interlock_dsl.c` → `interlock_dsl.c`
+  against `il_pin_table.h`. Pin-naming for `ilcf`: by GP number + ADC channel.
+- **Stage 4 — config + wire-in.** `ilcf` config-FS reader (DSL text, sibling to
+  `idnt`/`hwio`); the platform seam (`il_plat_pin_reserved/cap/adc_channel/adc_latest`)
+  implemented in main.c against `g_hwio_role` + the shared `g_adc_latest[]`; Thread 2
+  task on Core A calling `interlock_tick_all()`; veto on GP0; link the module into
+  `bus_controller`.
+
+### Key adaptation decisions (locked)
+- **phys_id == GPIO number** (flat); HAL table size 30.
+- **Frozen hardware:** the interlock READS hwio-configured input/ADC pins (no
+  reconfigure on claim); only its OUTPUT (veto GP0) is interlock-owned + driven.
+- **ADC from the shared decimated area** (`il_plat_adc_latest`), never a private SAR.
+- **Persistence:** `interlock_persist_t` in `.uninitialized_data` (slow_bus already
+  uses it for the crash slot) instead of SAMD21 `.noinit`.
+- **Reset/panic:** `watchdog_reboot` + RP2040 reset-cause instead of `NVIC_SystemReset`/
+  `PM->RCAUSE`.
+- **Host coupling = shared status only** (no event queue touches the safety path).
+- **I²C-mirror input + freshness fail-safe** arrive with the deferred I²C service;
+  ADC/GPIO/virtual inputs do not depend on it.
