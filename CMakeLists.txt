@@ -129,7 +129,9 @@ endif()
 # image. Build with: tools/pi-build.sh il_thread2_check
 add_library(il_thread2_check OBJECT
     ${NODE_DIR}/interlock/il_hal_rp2040.c
-    ${NODE_DIR}/interlock/interlock.c)
+    ${NODE_DIR}/interlock/interlock.c
+    ${NODE_DIR}/interlock/interlock_dsl.c
+    ${NODE_DIR}/interlock/il_pin_table.c)
 target_include_directories(il_thread2_check PRIVATE ${NODE_DIR}/interlock)
 target_link_libraries(il_thread2_check PRIVATE pico_stdlib hardware_gpio hardware_watchdog)
 target_compile_options(il_thread2_check PRIVATE -Wall -Wextra -Werror)

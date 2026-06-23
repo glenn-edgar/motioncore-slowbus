@@ -26,9 +26,9 @@
 // failure the caller MUST discard *out (left in undefined state).
 // ============================================================================
 
-#include "samd21_interlocks.h"
-#include "samd21_pin_table.h"
-#include "samd21_hal_pin.h"
+#include "interlock.h"
+#include "il_pin_table.h"
+#include "il_hal.h"
 #include <string.h>
 #include <stdbool.h>
 
