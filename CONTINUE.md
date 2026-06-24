@@ -6,6 +6,42 @@ Last updated **2026-06-24**. Branch: **`samd21-namespace-db`** (clean + pushed).
 
 ---
 
+## UPDATE 2026-06-24 (c) — Thread 3 C2: master engine originates node-to-node echo — DONE & HW-VERIFIED
+
+**Objective (Glenn):** chain-tree engine on BOTH master and slave + node-to-node
+(engine↔engine) messaging. Arc: C2 = master engine originates to the slave (slave answers
+via dispatch); C3 = slave runs the engine too (engine↔engine). Commit `e355cf9`.
+
+C2 = the master's `kbapp` ORIGINATES a bus message to a slave node and the master
+**correlates** the reply (first node-to-node, master-initiated transfer):
+- kbapp gained a 2nd column: **`CMD_APP_ECHO_TO`** (event 24) → `APP_ECHO_TO` one-shot.
+- Thread 1 routes `CMD_APP_ECHO_TO`=0x0301 (args `[addr][payload]`) to kbapp via the same
+  low-prio pointer-event/slot path as C1.
+- `kbapp_on_echo_to` (core1) **can't block** on a bus round-trip → hands `{addr,
+  host_req_id, payload}` to the bus thread via a new **core1→core0 queue `g_orig_q`** and
+  returns (no reply pushed there).
+- `bus_control_task` (core0): when idle it **promotes** one `g_orig_q` request into the
+  in-flight slot (mints a master wire `req_id`, builds `OP_SHELL_EXEC` for
+  `NODE_CMD_ECHO`), runs the existing INJECT/COLLECT, and on the slave's `OP_SHELL_REPLY`
+  **re-tags the wire req_id back to the host's** (correlation), surfacing it from the
+  appcore. Promote holds the lock across check+set (no race vs a host command);
+  `g_cmd_is_orig=false` on the host path. (Seed of the tagged event `{source,reply_addr,
+  req_id}`.)
+- **Slave unchanged** — answers via existing `NODE_CMD_ECHO`/`node_cmd_dispatch`.
+- Host test: `pico_app_echo.lua <port> --to <addr> [msg]`.
+- HW proof (master `E6616408437D6628` → slave @ addr 9): two payloads echoed exact
+  node-to-node (status=0), C1 local echo still OK, **regression 11/11 PASS**. (Slave kept
+  its existing fw — C2 is master-side only.)
+
+### NEXT — C3: chain-tree engine on the SLAVE (the end objective)
+The slave currently runs `node_role_run()` (a responder loop), **not** the engine
+(`app_engine_task` is master-path only in `main()`). C3 = make the slave also run the
+engine so its own `kbapp` handles the app message (engine↔engine), per-node `instance_id`,
+cross-node "right app?" check via `OP_REGISTER`. Then: I²C two-bus; interlock chain-tree
+clear source; core-affinity review.
+
+---
+
 ## UPDATE 2026-06-24 (b) — Thread 3 C1: app echo through the chain-tree engine — DONE & HW-VERIFIED
 
 First Thread-3 milestone (`docs/thread3-plan.md` C1). A non-bench application opcode is
