@@ -238,7 +238,12 @@ to Thread 3*.
    **Bench proof (master, jumper GP2→GP3, `CMD_INTERLOCK_STATUS`):** trip on
    violation → latch → latch HOLDS after the input recovers → global clear releases
    (input safe) → clear-while-violated RE-LATCHES. All transitions correct.
+   **Role-agnostic verified 2026-06-24:** the slave runs the SAME interlock on its
+   own local I/O, driven/observed over the bus (host→master→RS-485→slave). Same
+   trip→latch→hold→clear→re-latch sequence passed on the slave (addr 9, jumper
+   GP2→GP3) as on the master.
    Still TODO (not safety-blocking): the hard ADC-ISR fast-veto path; I²C-mirror input
-   (with the deferred I²C service); role-agnostic placement (slave runs Thread 2);
-   final core affinity; the "status out" wire form for the host (compact, non-empty).
+   (with the deferred I²C service); `adc_service_init` on the slave (GPIO/virtual
+   interlocks only there for now); final core affinity; the "status out" wire form for
+   the host (compact, non-empty); the chain-tree event clear source (with Thread 3).
 5. Thread 3 — the chain-tree application (non-bench events in, RS-485 out).
