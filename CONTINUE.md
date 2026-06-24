@@ -6,6 +6,53 @@ Last updated **2026-06-24**. Branch: **`samd21-namespace-db`** (clean + pushed).
 
 ---
 
+## UPDATE 2026-06-24 (b) — Thread 3 C1: app echo through the chain-tree engine — DONE & HW-VERIFIED
+
+First Thread-3 milestone (`docs/thread3-plan.md` C1). A non-bench application opcode is
+routed from Thread 1 up into the chain-tree engine and answered by the engine itself,
+on the master alone. Commit `f96b21f`.
+
+- **DSL source reconstructed (the big enabler).** The `.lua` that built `kb0.json` was
+  never committed — only the IR + the json→C codegen were. Reconstructed it as
+  **`app/bus_controller/kb0/kb0.lua`** (now the **authoritative source** for `kb0/incr/*`);
+  it reproduces the committed IR (kb0/kb1/blackboard byte-identical) and adds `kbapp`.
+  Regenerate with **`tools/gen_kb.sh`** (DSL → `kb0.json` → `incr/` via luajit;
+  `/usr/bin/luajit` on dev box + Pi). Uses `--no-support`: the authoritative
+  `chaintree_support.h` (carries the blackboard `bb_table` field this vendored codegen
+  copy predates) lives in `engine/include/`, which wins on include order — don't let the
+  pipeline emit a stale `incr/` copy. Whole `incr/` regenerates together (random
+  `unique_id` per run + per-run `node_data_id`/`link_start`). See memory `chaintree-dsl-source`.
+- **kbapp KB** = one column looping `WAIT(CMD_APP_ECHO, event 23) → APP_ECHO one-shot →
+  reset`, mirroring kb0/kb1's command-column shape. Event ids stay 20/21/22/23 (build
+  order kb0→kb1→kbapp).
+- **Event system (Glenn):** the event value is a **variant** (int OR pointer). Two
+  queues, **high + low**; `cfl_pop_event` drains ALL high then low. **High = jump ahead
+  of FIFO ordering** — for state-machine changes + exception handlers (others only if
+  they need that bypass). App traffic → **low**. `malloc_flag`: ChainTree began on Linux
+  where the engine freed malloc'd pointer events at end of the event cycle; **NOT wired
+  in this embedded build** (free only in `ring_clear`) → pass payloads via a **static
+  slot pool, malloc_flag=false** (no heap).
+- **Routing:** `cfl_embed_pre_tick` handles `CMD_APP_ECHO=0x0300` — stashes the payload
+  in a 4-slot static ring and injects a LOW-priority **pointer** event at `g_kbapp_node`.
+  Handler `kbapp_on_echo` (main.c; weak hook in `kb0/user_functions.c`) reads
+  `event_data_ptr->data.ptr` → `OP_SHELL_REPLY [req_id][status][ver][echo]`.
+- **Host test:** `tools/commission/lua/pico_app_echo.lua <bc_port> [msg]`.
+- **HW proof (master Pico W `E6616408437D6628`):** flashed firmware-only (config
+  preserved), two payloads echoed exact (`status=0 ver=1`), **regression 11/11 PASS**
+  (no kb0/kb1 regression). NOTE: master re-enumerated to a different ttyACM after the
+  reboot — discover by serial, don't hardcode the port.
+
+### NEXT (Thread 3, from docs/thread3-plan.md)
+- **C2 — master originates to the slave.** Firmware-originated bus inject + internal
+  reply correlation: host "start app-echo to addr N" → master's app originates the bus
+  message → slave's `kbapp` echoes → master correlates → returns to host. (This is where
+  the **tagged event** `{source, reply_addr, req_id}` earns its keep — B2/B3.)
+- **C3 — both ends in the engine** (slave's `kbapp` handles it, per-node instance_id).
+- Then: I²C two-bus service; interlock chain-tree-event clear source (a KB handler calls
+  `interlock_request_global_clear()`); core-affinity review.
+
+---
+
 ## UPDATE 2026-06-24 — hwio + Thread 2 (interlock) DONE & HW-VERIFIED; Thread 1 B1 done
 
 **Architecture:** `docs/three-thread-design.md` (read first). Build-order status there.
