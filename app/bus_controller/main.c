@@ -1606,7 +1606,7 @@ static void engine_runtime_bringup(void) {
     p.perm = &g_perm; p.perm_buffer = g_perm_buf; p.perm_buffer_size = (uint16_t)sizeof g_perm_buf;
     p.heap_size = 4096; p.max_allocator_count = cfl_calculate_arrena_number(h);  // ~250 B in use; 4 KB = generous margin for KB2/3/4
     p.total_node_count = h->node_count; p.allocator_0_size = 256;
-    p.event_queue_high_priority_size = 8; p.event_queue_low_priority_size = 64; p.delta_time = 0.1;
+    p.event_queue_high_priority_size = 8; p.event_queue_low_priority_size = 64; p.delta_time = 0.01;
 
     g_rt = cfl_runtime_create(&g_perm, &p, h);
     if (!g_rt) chassis_panic(RST_PANIC, 3);
