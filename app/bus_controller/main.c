@@ -49,6 +49,7 @@
 
 #include "host_link.h"
 #include "bus_phy.h"
+#include "bus_node.h"        // bus_node_queue — slave engine reply pump (C3)
 #include "bus_frame.h"
 #include "bus_addr.h"
 #include "board.h"
@@ -228,7 +229,12 @@ static uint16_t g_orig_seq;    // master-owned wire req_id for originated comman
 // core0-published condition core1 gates on (the "USB connected throughout" rule).
 #define APPCORE_ARGS_MAX  64
 #define APPCORE_PAY_MAX   96
-typedef struct { uint16_t req_id, cmd; uint8_t alen; uint8_t args[APPCORE_ARGS_MAX]; } appcore_cmd_t;
+// Tagged event (C3): an engine request carries WHERE its reply goes, so one
+// origin-agnostic handler serves both roles. ROUTE_USB -> master uplink (host);
+// ROUTE_BUS -> slave bus window (bus_src = the node that asked).
+#define ROUTE_USB  0u
+#define ROUTE_BUS  1u
+typedef struct { uint16_t req_id, cmd; uint8_t alen; uint8_t route; uint8_t bus_src; uint8_t args[APPCORE_ARGS_MAX]; } appcore_cmd_t;
 typedef struct { uint8_t dest; uint16_t opcode; uint8_t len; uint8_t payload[APPCORE_PAY_MAX]; } appcore_rep_t;
 static QueueHandle_t   g_down_q;   // core0 -> core1
 static QueueHandle_t   g_up_q;     // core1 -> core0
@@ -317,6 +323,7 @@ static void on_bus_msg(void *u, uint8_t dest, uint16_t opcode, const uint8_t *bo
         c.req_id = (uint16_t)body[0] | ((uint16_t)body[1] << 8);
         c.cmd    = (uint16_t)body[2] | ((uint16_t)body[3] << 8);
         c.alen   = (uint8_t)(len - 4);
+        c.route  = ROUTE_USB; c.bus_src = 0;              // host-sourced -> reply to USB
         if (c.alen > APPCORE_ARGS_MAX) c.alen = APPCORE_ARGS_MAX;
         memcpy(c.args, &body[4], c.alen);
         (void)xQueueSend(g_down_q, &c, 0);                // non-blocking; drop if full
@@ -408,8 +415,8 @@ static void bus_control_task(void *arg) {
             if (!g_cmd_pending && xQueueReceive(g_orig_q, &o, 0) == pdTRUE) {
                 uint16_t sr = (uint16_t)(++g_orig_seq); if (sr == 0) sr = (uint16_t)(++g_orig_seq);
                 uint8_t bn = 0;
-                g_cmd_body[bn++] = (uint8_t)sr;                g_cmd_body[bn++] = (uint8_t)(sr >> 8);
-                g_cmd_body[bn++] = (uint8_t)(CMD_ECHO & 0xFF); g_cmd_body[bn++] = (uint8_t)(CMD_ECHO >> 8); // == NODE_CMD_ECHO on the slave
+                g_cmd_body[bn++] = (uint8_t)sr;                    g_cmd_body[bn++] = (uint8_t)(sr >> 8);
+                g_cmd_body[bn++] = (uint8_t)(CMD_APP_ECHO & 0xFF); g_cmd_body[bn++] = (uint8_t)(CMD_APP_ECHO >> 8); // slave's engine (kbapp) handles it
                 uint8_t m = o.len; if (m > (uint8_t)(BUS_PAYLOAD_MAX - bn)) m = (uint8_t)(BUS_PAYLOAD_MAX - bn);
                 for (uint8_t i = 0; i < m; i++) g_cmd_body[bn++] = o.bytes[i];
                 g_cmd_slave = o.addr; g_cmd_op = OP_SHELL_EXEC; g_cmd_len = bn;
@@ -874,22 +881,29 @@ void kb1_on_adc(void *handle, unsigned node_index) {
 // drains it on single-threaded core1, so a few slots cover several queued commands.
 #define APP_REQ_SLOTS 4
 #define APP_REQ_MAX   APPCORE_ARGS_MAX
-typedef struct { uint16_t req_id; uint8_t addr; uint8_t len; uint8_t bytes[APP_REQ_MAX]; } app_req_t;
+typedef struct { uint16_t req_id; uint8_t addr; uint8_t route; uint8_t bus_src; uint8_t len; uint8_t bytes[APP_REQ_MAX]; } app_req_t;
 static app_req_t g_app_req[APP_REQ_SLOTS];
 static uint8_t   g_app_req_head;
 
-// Reply: OP_SHELL_REPLY [req_id u16][status u8][ver u8][echoed bytes...].
+// Echo reply, routed by the request's tag. The reply always rides g_up_q; the
+// role-specific drain delivers it (master uplink -> USB; slave pump -> bus window).
+//   USB route: OP_SHELL_REPLY [req][status][ver][echo], dest = appcore (C1 format).
+//   BUS route: OP_SHELL_REPLY [req][status][echo],      dest = the asking node
+//              (matches the on-wire echo contract the master correlates in COLLECT).
 void kbapp_on_echo(void *handle, unsigned node_index) {
     (void)node_index;
     cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
     const app_req_t *q = (const app_req_t *)rt->event_data_ptr->data.ptr;
-    appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+    if (!q) return;
+    bool to_bus = (q->route == ROUTE_BUS);
+    appcore_rep_t r;
+    r.dest = to_bus ? q->bus_src : BUS_ADDR_APPCORE;
+    r.opcode = OP_SHELL_REPLY;
     uint8_t *p = r.payload; uint8_t n = 0;
-    uint16_t req_id = q ? q->req_id : 0;
-    p[n++] = (uint8_t)req_id; p[n++] = (uint8_t)(req_id >> 8);
+    p[n++] = (uint8_t)q->req_id; p[n++] = (uint8_t)(q->req_id >> 8);
     p[n++] = SHELL_OK;
-    p[n++] = KBAPP_VER;
-    uint8_t m = q ? q->len : 0;
+    if (!to_bus) p[n++] = KBAPP_VER;          // ver only on the local (USB) echo
+    uint8_t m = q->len;
     if (m > (uint8_t)(APPCORE_PAY_MAX - n)) m = (uint8_t)(APPCORE_PAY_MAX - n);
     for (uint8_t i = 0; i < m; i++) p[n++] = q->bytes[i];
     r.len = n; (void)xQueueSend(g_up_q, &r, 0);
@@ -1316,7 +1330,7 @@ void cfl_embed_pre_tick(void) {
             // we own the storage (this build doesn't free pointer events post-dispatch).
             app_req_t *q = &g_app_req[g_app_req_head];
             g_app_req_head = (uint8_t)((g_app_req_head + 1u) % APP_REQ_SLOTS);
-            q->req_id = c.req_id; q->addr = 0;
+            q->req_id = c.req_id; q->addr = 0; q->route = c.route; q->bus_src = c.bus_src;
             uint8_t m = c.alen; if (m > APP_REQ_MAX) m = APP_REQ_MAX;
             q->len = m;
             for (uint8_t i = 0; i < m; i++) q->bytes[i] = c.args[i];
@@ -1327,7 +1341,7 @@ void cfl_embed_pre_tick(void) {
             // but the kbapp handler hands it to the bus thread instead of replying.
             app_req_t *q = &g_app_req[g_app_req_head];
             g_app_req_head = (uint8_t)((g_app_req_head + 1u) % APP_REQ_SLOTS);
-            q->req_id = c.req_id;
+            q->req_id = c.req_id; q->route = c.route; q->bus_src = c.bus_src;
             q->addr = (c.alen >= 1) ? c.args[0] : 0;
             uint8_t m = (c.alen >= 1) ? (uint8_t)(c.alen - 1) : 0;
             if (m > APP_REQ_MAX) m = APP_REQ_MAX;
@@ -1581,9 +1595,11 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
     }
 }
 
-static void app_engine_task(void *arg) {
-    (void)arg;
-    interlock_boot_decide();   // Thread 2: validate persist + bootloop guard (before peripherals)
+// Role-agnostic engine bring-up: create the runtime, activate every real KB (capture
+// start nodes), bind the ADC blackboard slots. Peripherals (ADC/I2C/hwio/interlock)
+// must already be up — the master does that in app_engine_task; the slave in
+// node_thread2_start. Leaves g_rt ready for cfl_runtime_run().
+static void engine_runtime_bringup(void) {
     const chaintree_handle_t *h = &g_chaintree_handle;
     chaintree_handle_bb_init_hashes();   // blackboard field name-hashes are static-init'd to 0
     cfl_runtime_create_params_t p; memset(&p, 0, sizeof p);
@@ -1591,16 +1607,6 @@ static void app_engine_task(void *arg) {
     p.heap_size = 4096; p.max_allocator_count = cfl_calculate_arrena_number(h);  // ~250 B in use; 4 KB = generous margin for KB2/3/4
     p.total_node_count = h->node_count; p.allocator_0_size = 256;
     p.event_queue_high_priority_size = 8; p.event_queue_low_priority_size = 64; p.delta_time = 0.1;
-
-    // Central ADC service: free-running round-robin + 1 kHz FIFO ISR on core1.
-    // (Started here so ADC_IRQ_FIFO is owned by core1.)
-    adc_service_init();
-    i2c_init_hw();      // GP10/11 I2C manager (master, 100 kHz) — inited here; serviced on core1 task
-    hwio_apply(&g_hwio); // FROZEN HIL pin roles from 'hwio': configure GP2..GP9 + arm the servo bank
-#ifdef I2C_SELFTEST
-    i2c_loopback_init(); // opt-in self-test: i2c0 slave 0x42 on GP20/21
-#endif
-    interlock_thread2_start(); // Thread 2: warm-restore / arm from 'ilcf', start the tick task (core1)
 
     g_rt = cfl_runtime_create(&g_perm, &p, h);
     if (!g_rt) chassis_panic(RST_PANIC, 3);
@@ -1633,10 +1639,90 @@ static void app_engine_task(void *arg) {
         g_bb_max[ch]  = (int32_t *)cfl_bb_field_by_name(g_rt, nm_max[ch]);
         g_bb_rms[ch]  = (int32_t *)cfl_bb_field_by_name(g_rt, nm_rms[ch]);
     }
+}
 
+static void app_engine_task(void *arg) {
+    (void)arg;
+    interlock_boot_decide();   // Thread 2: validate persist + bootloop guard (before peripherals)
+    // Central ADC service: free-running round-robin + 1 kHz FIFO ISR on core1.
+    // (Started here so ADC_IRQ_FIFO is owned by core1.)
+    adc_service_init();
+    i2c_init_hw();      // GP10/11 I2C manager (master, 100 kHz) — inited here; serviced on core1 task
+    hwio_apply(&g_hwio); // FROZEN HIL pin roles from 'hwio': configure GP2..GP9 + arm the servo bank
+#ifdef I2C_SELFTEST
+    i2c_loopback_init(); // opt-in self-test: i2c0 slave 0x42 on GP20/21
+#endif
+    interlock_thread2_start(); // Thread 2: warm-restore / arm from 'ilcf', start the tick task (core1)
+
+    engine_runtime_bringup();
     g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
     cfl_runtime_run(g_rt);                           // forever loop (the thread body)
     for (;;) vTaskDelay(pdMS_TO_TICKS(100));         // not reached
+}
+
+// ---- C3: the chain-tree engine on the SLAVE (engine<->engine node-to-node) ------
+// The slave already brought up Thread 2 peripherals (node_thread2_start: interlock +
+// ADC + hwio). These add the engine + the bus<->engine plumbing so the slave's own
+// kbapp answers app messages. node_engine_start() is called from node_role_run().
+
+// Create the inter-core queues (shared by both roles' engine paths).
+void appcore_queues_init(void) {
+    g_down_q = xQueueCreate(8, sizeof(appcore_cmd_t));
+    g_up_q   = xQueueCreate(16, sizeof(appcore_rep_t));   // headroom for a snapshot burst (7 frames)
+    g_i2c_req_q = xQueueCreate(8, sizeof(i2c_req_t));     // engine -> i2c service
+    g_orig_q = xQueueCreate(4, sizeof(orig_req_t));       // engine -> bus (C2 originate)
+    if (!g_down_q || !g_up_q || !g_i2c_req_q || !g_orig_q) chassis_panic(RST_PANIC, 2);
+}
+
+// Slave: route an inbound bus app command into the engine (async). Returns true if it
+// claimed the command (caller skips its synchronous dispatch). Non-app cmds -> false,
+// so echo/GPIO/interlock keep their existing in-window node_cmd_dispatch path.
+bool node_engine_try_route(uint8_t src, uint16_t req, uint16_t cmd,
+                           const uint8_t *args, uint8_t alen) {
+    if (cmd != CMD_APP_ECHO) return false;     // only engine-app opcodes go to the engine
+    if (!g_down_q) return false;               // engine not up yet -> let caller sync-dispatch
+    appcore_cmd_t c; c.req_id = req; c.cmd = cmd; c.route = ROUTE_BUS; c.bus_src = src;
+    c.alen = (alen > APPCORE_ARGS_MAX) ? APPCORE_ARGS_MAX : alen;
+    memcpy(c.args, args, c.alen);
+    (void)xQueueSend(g_down_q, &c, 0);         // reply ships later via the pump -> bus window
+    return true;
+}
+
+// Slave core0 pump: drain engine replies and stage them in the bus node's TX queue
+// (keeps bus_node_queue single-core). The reply rides the next POLL grant.
+static void node_reply_pump_task(void *arg) {
+    (void)arg;
+    appcore_rep_t up;
+    for (;;) {
+        while (xQueueReceive(g_up_q, &up, 0) == pdTRUE) {
+            uint8_t b[BUS_PAYLOAD_MAX]; uint8_t n = 0;
+            b[n++] = (uint8_t)(up.opcode & 0xFF); b[n++] = (uint8_t)(up.opcode >> 8);
+            uint8_t m = up.len; if (m > (uint8_t)(BUS_PAYLOAD_MAX - n)) m = (uint8_t)(BUS_PAYLOAD_MAX - n);
+            for (uint8_t i = 0; i < m; i++) b[n++] = up.payload[i];
+            (void)bus_node_queue(up.dest, BUS_FT_DATA, b, n);
+        }
+        vTaskDelay(1);
+    }
+}
+
+static void node_engine_task(void *arg) {
+    (void)arg;
+    engine_runtime_bringup();   // peripherals already up via node_thread2_start
+    g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
+    cfl_runtime_run(g_rt);
+    for (;;) vTaskDelay(pdMS_TO_TICKS(100));   // not reached
+}
+
+// Called from node_role_run() (slave) to bring up the engine + bus<->engine plumbing.
+void node_engine_start(void) {
+    appcore_queues_init();
+    TaskHandle_t t_eng, t_pump;
+    // engine on core1 (prio 3, below the interlock tick prio 4 — safety preempts the app)
+    xTaskCreate(node_engine_task, "app", configMINIMAL_STACK_SIZE * 8, NULL, 3, &t_eng);
+    vTaskCoreAffinitySet(t_eng, 1u << 1);
+    // reply pump on core0 (prio 2), alongside the node responder
+    xTaskCreate(node_reply_pump_task, "epump", configMINIMAL_STACK_SIZE * 2, NULL, 2, &t_pump);
+    vTaskCoreAffinitySet(t_pump, 1u << 0);
 }
 
 // ---- watchdog: free-running-clock liveness gate -> pet HW WDT ---------------
@@ -1746,11 +1832,7 @@ int main(void) {
 
     g_lock = xSemaphoreCreateMutex();
     if (!g_lock) chassis_panic(RST_PANIC, 1);
-    g_down_q = xQueueCreate(8, sizeof(appcore_cmd_t));
-    g_up_q   = xQueueCreate(16, sizeof(appcore_rep_t));   // headroom for a snapshot burst (7 frames)
-    g_i2c_req_q = xQueueCreate(8, sizeof(i2c_req_t));     // engine -> i2c service
-    g_orig_q = xQueueCreate(4, sizeof(orig_req_t));       // engine -> bus (C2 originate)
-    if (!g_down_q || !g_up_q || !g_i2c_req_q || !g_orig_q) chassis_panic(RST_PANIC, 2);
+    appcore_queues_init();
 
     uint32_t t0 = time_us_32();
     for (int i = 0; i < HB_COUNT; i++) g_hb_us[i] = t0;

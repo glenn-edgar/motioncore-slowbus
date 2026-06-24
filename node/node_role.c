@@ -38,6 +38,11 @@ void bus_node_on_data(uint8_t src, const uint8_t *payload, uint8_t len) {
     const uint8_t *args = &payload[6];
     uint8_t alen = (uint8_t)(len - 6);
 
+    // C3: app opcodes go to the slave's own chain-tree engine (kbapp), which replies
+    // asynchronously on a later POLL via the reply pump. Everything else is handled
+    // synchronously below by the shared Thread-1 dispatch.
+    if (node_engine_try_route(src, req, cmd, args, alen)) return;
+
     uint8_t r[BUS_PAYLOAD_MAX]; uint8_t n = 0;
     r[n++] = (uint8_t)(OP_SHELL_REPLY & 0xFF); r[n++] = (uint8_t)(OP_SHELL_REPLY >> 8);
     r[n++] = (uint8_t)(req & 0xFF);            r[n++] = (uint8_t)(req >> 8);
@@ -79,6 +84,10 @@ void node_role_run(uint8_t addr, uint32_t baud) {
     // Role-agnostic Thread 2: the slave runs the interlock on its own local I/O
     // (hwio roles + ilc0..ilc9), exposed over the bus via bus_node_on_data above.
     node_thread2_start();
+
+    // C3: the slave runs the chain-tree engine too, so its own kbapp answers app
+    // messages (engine<->engine). Peripherals are already up (node_thread2_start).
+    node_engine_start();
 
     TaskHandle_t t;
     xTaskCreate(node_task, "node", configMINIMAL_STACK_SIZE * 4, NULL, tskIDLE_PRIORITY + 2, &t);
