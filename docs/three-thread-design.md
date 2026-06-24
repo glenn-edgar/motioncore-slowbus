@@ -229,10 +229,16 @@ to Thread 3*.
    master/slave, slave-side hwio_apply) is still to do.
 3. The I²C service (periodic-sample → shared area + intermixed async; inventory config).
    **DEFERRED** by request — build the I²C framework later.
-4. ◐ **Thread 2 — the SAMD21 interlock port.** **Software-complete 2026-06-23**
-   (Stages 1–4 in `interlock-port-map.md`): HAL + framework + DSL + pin table ported
-   and LINKED into the image, arming from `ilcf`, ticking on core1, veto on GP0 —
-   builds clean. **HW-verify pending** (trip→latch→reset on the bench). Still TODO:
-   the hard ADC-ISR fast-veto path; I²C-mirror input (with the deferred I²C service);
-   role-agnostic placement; final core affinity.
+4. ✅ **Thread 2 — the SAMD21 interlock port. HW-VERIFIED 2026-06-24.** HAL +
+   framework + DSL + pin table ported, linked, ticking on core1. Extended to Glenn's
+   model: **10 boolean interlock slots** (mostly empty), output = the **union (OR) of
+   their LATCHED states** on the shared GP0 veto; ADC is a shared read resource;
+   global clear is event-driven (`CMD_INTERLOCK_CLEAR` / chain-tree event) and
+   fail-safe (a live hazard re-latches). Per-slot config `ilc0..ilc9`.
+   **Bench proof (master, jumper GP2→GP3, `CMD_INTERLOCK_STATUS`):** trip on
+   violation → latch → latch HOLDS after the input recovers → global clear releases
+   (input safe) → clear-while-violated RE-LATCHES. All transitions correct.
+   Still TODO (not safety-blocking): the hard ADC-ISR fast-veto path; I²C-mirror input
+   (with the deferred I²C service); role-agnostic placement (slave runs Thread 2);
+   final core affinity; the "status out" wire form for the host (compact, non-empty).
 5. Thread 3 — the chain-tree application (non-bench events in, RS-485 out).

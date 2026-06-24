@@ -94,6 +94,7 @@
 // ---- core1 application engine (KB0 monitor PoC) -----------------------------
 #define BUS_ADDR_APPCORE         0xFBu   // core1 virtual-slave address
 #define CMD_INTERLOCK_CLEAR      0x0210u // Thread 2: request a global clear of all latched trips
+#define CMD_INTERLOCK_STATUS     0x0211u // Thread 2: -> [gveto][n] + per non-empty slot [slot][state][tf][latched]
 #define CMD_MON_PING             0x0200u // KB0: liveness round-trip
 #define CMD_MON_SNAPSHOT         0x0201u // KB0: one-shot system report set
 #define CMD_MON_STREAM           0x0202u // KB0: [enable u8][period_ms u16][mask u16]
@@ -1253,6 +1254,26 @@ void cfl_embed_pre_tick(void) {
             r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
             r.payload[2] = SHELL_OK; r.len = 3;
             (void)xQueueSend(g_up_q, &r, 0);
+        } else if (c.cmd == CMD_INTERLOCK_STATUS) {   // Thread 2: observe slot/veto state
+            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+            uint8_t *p = r.payload, n = 0;
+            p[n++] = (uint8_t)c.req_id; p[n++] = (uint8_t)(c.req_id >> 8); p[n++] = SHELL_OK;
+            uint8_t gveto = 0;                        // global veto = OR of armed+latched slots
+            for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS; s++)
+                if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_ARMED &&
+                    g_interlock_persist.slots[s].latched) gveto = 1;
+            p[n++] = gveto;
+            uint8_t cnt_at = n++, cnt = 0;            // count placeholder, filled below
+            for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS && (uint8_t)(n + 4) <= APPCORE_PAY_MAX; s++) {
+                if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_EMPTY) continue;
+                p[n++] = s;
+                p[n++] = g_interlock_persist.slots[s].state;
+                p[n++] = g_interlock_persist.inst[s].tf_state;   // live boolean
+                p[n++] = g_interlock_persist.slots[s].latched;   // sticky trip
+                cnt++;
+            }
+            p[cnt_at] = cnt;
+            r.len = n; (void)xQueueSend(g_up_q, &r, 0);
         } else if (hil_gpio_dispatch(&c)) {
             // GPIO + pulse-count HIL handled inline (reply sent within)
         } else {   // unknown command -> direct UNKNOWN_CMD reply (no chain handler)
