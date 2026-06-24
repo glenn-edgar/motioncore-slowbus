@@ -1289,12 +1289,12 @@ void cfl_embed_pre_tick(void) {
 // STATUS ONLY (g_il_status_buffer) — no queue touches the safety path. Lives on
 // core1 alongside the ADC ISR + its decimated data.
 //
-// NOTE (deferred to the thread-review / Stage 5): (a) the hard "1-clock" ADC fast
-// veto path (driven from the ADC ISR) is not ported yet — the tick below is the
-// SUPERVISORY rate; (b) ideal core affinity isolates interlock + ADC ISR on their
-// own core (engine moved off); (c) Thread 2 runs on the master path only for now
-// (the slave is still a stub) — it becomes role-agnostic with the Thread-1
-// unification. (d) NOT yet HW-verified — trip/latch/reset proving needs the bench.
+// NOTE: (a) the il task ticks every ~2 ms at priority 4 (above the engine), reading
+// the 1 kHz-fresh g_adc_latest — ~2 ms veto response with the FULL DNF/latch/clear
+// eval. A sub-ms ISR-embedded fast-veto can be added on top later if a specific
+// hard requirement needs it (assert-only in the ISR, tick still owns clear).
+// (b) ideal core affinity isolates interlock + ADC ISR on their own core (engine
+// moved off) — deferred to the thread-review.
 
 // Platform externs the framework's VIRTUAL inputs read. board_millis() is in
 // board.c. These two back _stack_hwm / _t_since_m2s; fed minimally for now (only
@@ -1337,7 +1337,8 @@ static void il_tick_task(void *arg) {
     (void)arg;
     for (;;) {
         interlock_tick_all();
-        vTaskDelay(pdMS_TO_TICKS(20));   // supervisory cadence (see NOTE above)
+        vTaskDelay(pdMS_TO_TICKS(2));    // fast tick: ~2 ms veto response (reads the
+                                         // 1 kHz-fresh g_adc_latest); full DNF/latch/clear eval
     }
 }
 
@@ -1383,8 +1384,10 @@ static void interlock_thread2_start(void) {
     } else {
         g_ilcf_rc = (int)interlock_armed_count();            // warm, same config → preserved
     }
-    xTaskCreate(il_tick_task, "il", configMINIMAL_STACK_SIZE * 4, NULL, 2, &t_il);
-    vTaskCoreAffinitySet(t_il, 1u << 1);                      // core1, with the ADC ISR
+    // Priority 4 — ABOVE the chain-tree engine (prio 3): safety preempts the
+    // application, so engine load can't delay the veto. core1, with the ADC ISR.
+    xTaskCreate(il_tick_task, "il", configMINIMAL_STACK_SIZE * 4, NULL, 4, &t_il);
+    vTaskCoreAffinitySet(t_il, 1u << 1);
 }
 
 // ---- Role-agnostic Thread-2 entry points (used by the SLAVE node responder) ----
