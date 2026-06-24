@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-#define CT_M6S5RJ6O_EVENT_STRING_COUNT 23
+#define CT_KAE52WTN_EVENT_STRING_COUNT 24
 
 typedef enum {
     EVENT_CFL_INIT_EVENT = 0,
@@ -32,9 +32,10 @@ typedef enum {
     EVENT_CMD_MON_PING = 20,
     EVENT_CMD_MON_SNAPSHOT = 21,
     EVENT_CMD_ADC_READ = 22,
-    EVENT_COUNT = 23
+    EVENT_CMD_APP_ECHO = 23,
+    EVENT_COUNT = 24
 } event_index_t;
 
-extern const char *ct_m6s5rj6o_event_strings[23];
+extern const char *ct_kae52wtn_event_strings[24];
 
 #endif /* CHAINTREE_HANDLE_EVENTS_H */

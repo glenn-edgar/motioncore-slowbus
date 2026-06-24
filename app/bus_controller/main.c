@@ -106,6 +106,8 @@
 #define ADC_FIFO_THRESH          4       // FIFO IRQ trigger level
 #define ADC_WIN_SAMPLES          100     // 1 kHz samples per 10 Hz window (100 ms)
 #define CMD_ADC_STATS            0x0105u // KB1/firmware: read the 10 Hz mean/max/rms streams
+#define CMD_APP_ECHO             0x0300u // Thread 3 (kbapp): echo payload via the chain-tree engine
+#define KBAPP_VER                1u
 
 // ---- GPIO + pulse-count HIL (KB1 api; pin map per board.h) ------------------
 #define CMD_GPIO_CONFIG          0x0100u // [port u8][pin u8][mode u8][mode-args...]
@@ -526,6 +528,7 @@ static cfl_perm_t            g_perm;
 static char                  g_perm_buf[16 * 1024] __attribute__((aligned(8)));
 static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
 static uint16_t              g_kb1_node;   // KB1 (api) start node
+static uint16_t              g_kbapp_node; // kbapp (Thread 3 application) start node
 
 // Activated-KB registry (one row per real KB, in activation order = arena id).
 // Drives the OP_MON_KB report generically as KBs are added (kb2/kb3/kb4 later).
@@ -807,6 +810,35 @@ void kb1_on_adc(void *handle, unsigned node_index) {
         uint16_t v = g_adc_latest[ch];             // lock-free single 16-bit read
         p[n++] = (uint8_t)v; p[n++] = (uint8_t)(v >> 8);
     }
+    r.len = n; (void)xQueueSend(g_up_q, &r, 0);
+}
+
+// kbapp (Thread 3 application): CMD_APP_ECHO. The engine event is a variant (int or
+// pointer); an app command's payload rides as a pointer to one of these slots. We own
+// the storage (a small ring, malloc_flag=false) — ChainTree's engine-frees-the-message
+// path is the Linux build's, not wired here. pre_tick fills a slot and injects a
+// LOW-priority pointer event the kbapp WAIT leaf is parked on; the SAME engine cycle
+// drains it on single-threaded core1, so a few slots cover several queued commands.
+#define APP_REQ_SLOTS 4
+#define APP_REQ_MAX   APPCORE_ARGS_MAX
+typedef struct { uint16_t req_id; uint8_t len; uint8_t bytes[APP_REQ_MAX]; } app_req_t;
+static app_req_t g_app_req[APP_REQ_SLOTS];
+static uint8_t   g_app_req_head;
+
+// Reply: OP_SHELL_REPLY [req_id u16][status u8][ver u8][echoed bytes...].
+void kbapp_on_echo(void *handle, unsigned node_index) {
+    (void)node_index;
+    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
+    const app_req_t *q = (const app_req_t *)rt->event_data_ptr->data.ptr;
+    appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+    uint8_t *p = r.payload; uint8_t n = 0;
+    uint16_t req_id = q ? q->req_id : 0;
+    p[n++] = (uint8_t)req_id; p[n++] = (uint8_t)(req_id >> 8);
+    p[n++] = SHELL_OK;
+    p[n++] = KBAPP_VER;
+    uint8_t m = q ? q->len : 0;
+    if (m > (uint8_t)(APPCORE_PAY_MAX - n)) m = (uint8_t)(APPCORE_PAY_MAX - n);
+    for (uint8_t i = 0; i < m; i++) p[n++] = q->bytes[i];
     r.len = n; (void)xQueueSend(g_up_q, &r, 0);
 }
 
@@ -1208,6 +1240,19 @@ void cfl_embed_pre_tick(void) {
         } else if (c.cmd == CMD_ADC_READ) {      // KB1 (api): route to KB1's start node
             cfl_send_integer_event(g_rt->event_queue, CFL_EVENT_PRIORITY_HIGH,
                                    g_kb1_node, EVENT_CMD_ADC_READ, (cfl_int_t)c.req_id);
+        } else if (c.cmd == CMD_APP_ECHO) {      // Thread 3 (kbapp): route to the app KB
+            // The event carries a variant (int OR pointer). Echo needs the payload
+            // bytes, so stash them in a slot and inject a pointer event. App traffic
+            // doesn't need to jump FIFO ordering -> LOW priority. malloc_flag=false:
+            // we own the storage (this build doesn't free pointer events post-dispatch).
+            app_req_t *q = &g_app_req[g_app_req_head];
+            g_app_req_head = (uint8_t)((g_app_req_head + 1u) % APP_REQ_SLOTS);
+            q->req_id = c.req_id;
+            uint8_t m = c.alen; if (m > APP_REQ_MAX) m = APP_REQ_MAX;
+            q->len = m;
+            for (uint8_t i = 0; i < m; i++) q->bytes[i] = c.args[i];
+            cfl_send_data_event(g_rt->event_queue, CFL_EVENT_PRIORITY_LOW,
+                                g_kbapp_node, false, EVENT_CMD_APP_ECHO, q);
         } else if (c.cmd == CMD_ADC_STATS) {     // read the 10 Hz streams from the blackboard
             appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
             uint8_t *p = r.payload; uint8_t n = 0;
@@ -1493,8 +1538,9 @@ static void app_engine_task(void *arg) {
             g_appkb[g_appkb_n].active = 1;
             g_appkb_n++;
         }
-        if (strcmp(nm, "kb0") == 0)      g_kb0_node = node;
-        else if (strcmp(nm, "kb1") == 0) g_kb1_node = node;
+        if (strcmp(nm, "kb0") == 0)         g_kb0_node = node;
+        else if (strcmp(nm, "kb1") == 0)    g_kb1_node = node;
+        else if (strcmp(nm, "kbapp") == 0)  g_kbapp_node = node;
     }
     // Bind the chain_tree blackboard slots for the 10 Hz ADC streams (NULL if absent).
     static const char *const nm_mean[ADC_NCH] = { "adc0_mean", "adc1_mean", "adc2_mean" };

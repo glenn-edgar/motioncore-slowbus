@@ -4,8 +4,8 @@
 
 #include "chaintree_support.h"
 
-extern const json_record_t ct_m6s5rj6o_node_data_records[122];
-extern const char ct_m6s5rj6o_node_data_strings[605];
-extern const record_control_t ct_m6s5rj6o_node_data_controls[6];
+extern const json_record_t ct_kae52wtn_node_data_records[150];
+extern const char ct_kae52wtn_node_data_strings[618];
+extern const record_control_t ct_kae52wtn_node_data_controls[8];
 
 #endif /* CHAINTREE_HANDLE_NODE_DATA_H */
