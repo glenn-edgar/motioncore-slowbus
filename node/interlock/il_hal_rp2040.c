@@ -79,14 +79,13 @@ hal_pin_claim_status_t hal_pin_claim_adc(uint8_t phys_id, uint8_t slot,
     if (ch == 0xFFu) return HAL_PIN_CLAIM_CAP_MISSING;
     if (il_plat_pin_reserved(phys_id)) return HAL_PIN_CLAIM_RESERVED;
 
+    // ADC is a SHARED READ resource — any number of slots (and the bench /
+    // telemetry) may watch the same channel. Reads come from the shared decimated
+    // area, so there is no contention and no single-owner rule: just ADD this slot
+    // to the sharer mask. (ADC pins are never GPIO-claimed — il_plat_pin_cap
+    // rejects GPIO modes on GP26/27/28 — so there is no cross-mode conflict.)
     const il_slotmask_t slot_bit = (il_slotmask_t)(1u << slot);
-    if (g_claims[phys_id].slot_mask != 0 && g_claims[phys_id].slot_mask != slot_bit)
-        return HAL_PIN_CLAIM_TAKEN;
-    if (g_claims[phys_id].slot_mask == slot_bit &&
-        g_claims[phys_id].mode != (uint8_t)HAL_PIN_MODE_ADC_SCAN)
-        return HAL_PIN_CLAIM_TAKEN;
-
-    g_claims[phys_id].slot_mask   = slot_bit;
+    g_claims[phys_id].slot_mask  |= slot_bit;
     g_claims[phys_id].mode        = (uint8_t)HAL_PIN_MODE_ADC_SCAN;
     g_claims[phys_id].ok_value    = 0;
     g_claims[phys_id].err_value   = 0;
@@ -171,9 +170,12 @@ bool hal_pin_check_consistency(void) {
     for (uint8_t id = 0; id < HAL_PIN_TABLE_SIZE; id++) {
         const hal_pin_claim_record_t* c = &g_claims[id];
         if (c->slot_mask == 0u) continue;
-        if (c->mode == (uint8_t)HAL_PIN_MODE_GPIO_OUT) continue;   // sharing allowed
+        // Outputs (OR-of-vetoes) and ADC (shared read) are legitimately multi-slot;
+        // only the single-owner GPIO inputs must have exactly one owner.
+        if (c->mode == (uint8_t)HAL_PIN_MODE_GPIO_OUT ||
+            c->mode == (uint8_t)HAL_PIN_MODE_ADC_SCAN) continue;
         il_slotmask_t m = c->slot_mask; uint8_t bits = 0;
-        while (m) { m &= (uint8_t)(m - 1u); bits++; }             // popcount (no CLZ on M0+)
+        while (m) { m &= (il_slotmask_t)(m - 1u); bits++; }       // popcount (no CLZ on M0+)
         if (bits > 1u) return false;
     }
     return true;
