@@ -1378,6 +1378,43 @@ static void interlock_thread2_start(void) {
     vTaskCoreAffinitySet(t_il, 1u << 1);                      // core1, with the ADC ISR
 }
 
+// ---- Role-agnostic Thread-2 entry points (used by the SLAVE node responder) ----
+// The slave path (node_role_run) is a stub responder today; these let it run the
+// SAME interlock + a minimal HIL surface so the trip/latch/clear behaviour can be
+// exercised on the slave over the bus. Master keeps using app_engine_task's calls.
+
+// Bring up Thread 2 on the slave: validate persist, apply the frozen hwio roles,
+// arm ilc0..ilc9, and start the tick task. (No adc_service_init here yet — GPIO/
+// virtual interlocks only on the slave for now; ADC-on-slave is future work.)
+void node_thread2_start(void) {
+    interlock_boot_decide();
+    hwio_apply(&g_hwio);
+    interlock_thread2_start();
+}
+
+// GPIO write/read with frozen-role validation, reply-mechanism-agnostic so the
+// slave responder can use it (the master uses hil_gpio_dispatch). Returns a SHELL_*
+// status; for READ, *res[0] = level and *reslen = 1.
+uint8_t node_hil_gpio(uint16_t cmd, const uint8_t *args, uint8_t alen,
+                      uint8_t *res, uint8_t *reslen) {
+    *reslen = 0;
+    if (cmd == CMD_GPIO_WRITE) {
+        if (alen < 3) return SHELL_BAD_ARGS;
+        uint8_t port = args[0], pin = args[1], level = args[2];
+        if (port != 0 || level > 1 || hil_role_of(pin) != HWIO_ROLE_OUTPUT) return SHELL_BAD_ARGS;
+        gpio_put(pin, level); return SHELL_OK;
+    }
+    if (cmd == CMD_GPIO_READ) {
+        if (alen < 2) return SHELL_BAD_ARGS;
+        uint8_t port = args[0], pin = args[1], role = hil_role_of(pin);
+        bool readable = (role == HWIO_ROLE_INPUT || role == HWIO_ROLE_INPUT_PULLUP ||
+                         role == HWIO_ROLE_INPUT_PULLDOWN || role == HWIO_ROLE_OUTPUT);
+        if (port != 0 || !readable) return SHELL_BAD_ARGS;
+        res[0] = gpio_get(pin) ? 1u : 0u; *reslen = 1; return SHELL_OK;
+    }
+    return SHELL_UNKNOWN_CMD;
+}
+
 static void app_engine_task(void *arg) {
     (void)arg;
     interlock_boot_decide();   // Thread 2: validate persist + bootloop guard (before peripherals)

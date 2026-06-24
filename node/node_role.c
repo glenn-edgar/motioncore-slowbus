@@ -21,6 +21,7 @@
 #include "bus_node.h"
 #include "bus_addr.h"
 #include "node_role.h"
+#include "interlock/interlock.h"   // run the interlock on the slave too (role-agnostic Thread 2)
 
 // The BC injects a host shell-exec to this node as DATA =
 // [opcode u16][req_id u16][cmd u16][args]; we answer with DATA =
@@ -32,6 +33,13 @@
 #define NODE_CMD_ECHO       0x0001u
 #define NODE_SHELL_OK       0u
 #define NODE_SHELL_UNKNOWN  1u
+// Test/interlock command opcodes — mirror app/bus_controller/main.c so the host can
+// drive the SAME trip/latch/clear sequence on the slave over the bus.
+#define CMD_GPIO_WRITE       0x0101u
+#define CMD_GPIO_READ        0x0102u
+#define CMD_INTERLOCK_CLEAR  0x0210u
+#define CMD_INTERLOCK_STATUS 0x0211u
+#define SHELL_OK             0u
 
 void bus_node_on_data(uint8_t src, const uint8_t *payload, uint8_t len) {
     if (len < 6) return;
@@ -49,6 +57,30 @@ void bus_node_on_data(uint8_t src, const uint8_t *payload, uint8_t len) {
         r[n++] = NODE_SHELL_OK;
         if (alen > (uint8_t)(BUS_PAYLOAD_MAX - n)) alen = (uint8_t)(BUS_PAYLOAD_MAX - n);
         memcpy(&r[n], args, alen); n = (uint8_t)(n + alen);
+    } else if (cmd == CMD_GPIO_WRITE || cmd == CMD_GPIO_READ) {
+        uint8_t res[4], reslen = 0;
+        r[n++] = node_hil_gpio(cmd, args, alen, res, &reslen);   // role-validated
+        for (uint8_t i = 0; i < reslen && n < BUS_PAYLOAD_MAX; i++) r[n++] = res[i];
+    } else if (cmd == CMD_INTERLOCK_CLEAR) {
+        interlock_request_global_clear();
+        r[n++] = SHELL_OK;
+    } else if (cmd == CMD_INTERLOCK_STATUS) {
+        r[n++] = SHELL_OK;
+        uint8_t gveto = 0;                       // global veto = OR of armed+latched slots
+        for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS; s++)
+            if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_ARMED &&
+                g_interlock_persist.slots[s].latched) gveto = 1;
+        r[n++] = gveto;
+        uint8_t cnt_at = n++, cnt = 0;
+        for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS && (uint8_t)(n + 4) <= BUS_PAYLOAD_MAX; s++) {
+            if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_EMPTY) continue;
+            r[n++] = s;
+            r[n++] = g_interlock_persist.slots[s].state;
+            r[n++] = g_interlock_persist.inst[s].tf_state;   // live boolean
+            r[n++] = g_interlock_persist.slots[s].latched;   // sticky trip
+            cnt++;
+        }
+        r[cnt_at] = cnt;
     } else {
         r[n++] = NODE_SHELL_UNKNOWN;
     }
@@ -75,6 +107,10 @@ void node_role_run(uint8_t addr, uint32_t baud) {
     board_init();
     bus_phy_init(baud ? baud : BUS_DEFAULT_BAUD);   // config 'sp', else default
     bus_node_init(addr);
+
+    // Role-agnostic Thread 2: the slave runs the interlock on its own local I/O
+    // (hwio roles + ilc0..ilc9), exposed over the bus via bus_node_on_data above.
+    node_thread2_start();
 
     TaskHandle_t t;
     xTaskCreate(node_task, "node", configMINIMAL_STACK_SIZE * 4, NULL, tskIDLE_PRIORITY + 2, &t);

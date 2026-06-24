@@ -15,3 +15,10 @@
 // BUS_DEFAULT_BAUD). The caller (main) has already done stdio_init_all() and
 // read+validated the identity.
 void node_role_run(uint8_t addr, uint32_t baud);
+
+// Role-agnostic Thread-2 hooks, defined in app/bus_controller/main.c, used by the
+// slave responder so the interlock runs on the slave too and its trip/latch/clear
+// can be driven over the bus (the master uses its own app_engine_task path).
+void    node_thread2_start(void);   // boot_decide + hwio_apply + arm ilcN + tick task
+uint8_t node_hil_gpio(uint16_t cmd, const uint8_t *args, uint8_t alen,
+                      uint8_t *res, uint8_t *reslen);   // GPIO write/read, role-validated
