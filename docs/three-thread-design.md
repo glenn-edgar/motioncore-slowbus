@@ -224,9 +224,12 @@ to Thread 3*.
    boot `hwio=0`; WRITE OUTPUT ok, WRITE INPUT/UNUSED + GPIO_CONFIG rejected; READ
    INPUT ok; idnt + roster preserved through the config reflash.
 2. ◐ Thread 1 — router + bench surface (operate-only HIL, validated against `hwio`).
-   **Partial** — the HIL command surface is now operate-only/role-validated. The full
-   router unification (one tagged event type, per-consumer queues, role-agnostic
-   master/slave, slave-side hwio_apply) is still to do.
+   **Partial.** Operate-only/role-validated HIL ✓. **B1 done 2026-06-24:** unified
+   `node_cmd_dispatch` — one origin-agnostic handler (echo / GPIO / interlock) shared
+   by the master appcore drain and the slave bus responder (deletes the duplicated
+   slave dispatch; echo now uniform on both). **Still to do (fresh context):** the
+   uniform tagged event type `{source, reply_addr, req_id}`, symmetric reply routing,
+   per-consumer queues.
 3. The I²C service (periodic-sample → shared area + intermixed async; inventory config).
    **DEFERRED** by request — build the I²C framework later.
 4. ✅ **Thread 2 — the SAMD21 interlock port. HW-VERIFIED 2026-06-24.** HAL +
