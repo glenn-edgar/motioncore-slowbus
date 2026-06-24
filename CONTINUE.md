@@ -1,7 +1,95 @@
 # CONTINUE — slow_bus pick-up doc
 
-Read first on any session resume. Companion to `README.md` (orientation) and
-`docs/README.md` (full spec). Last updated **2026-06-22**.
+Read first on any session resume. Companion to `README.md` (orientation),
+`docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
+Last updated **2026-06-24**. Branch: **`samd21-namespace-db`** (clean + pushed).
+
+---
+
+## UPDATE 2026-06-24 — hwio + Thread 2 (interlock) DONE & HW-VERIFIED; Thread 1 B1 done
+
+**Architecture:** `docs/three-thread-design.md` (read first). Build-order status there.
+Interlock port detail: `docs/interlock-port-map.md`. Thread 3 plan: `docs/thread3-plan.md`.
+
+### What's DONE this stretch (all committed + HW-verified on the two bench Picos)
+- **PWM + quadrature dropped** to the Pico2 (RP2040 GP14/17/18 freed).
+- **Build-order step 1 — `hwio` frozen pin-role config (HW-VERIFIED).** `node/boot_hwio.{c,h}`
+  (CBOR reader, mirrors `boot_identity.c`), `cfg_image.lua --io/--adc`, `hwio_apply()` at boot.
+  `CMD_GPIO_CONFIG` retired; HIL is **operate-only**, validated per frozen role.
+- **Build-order step 4 — Thread 2 interlock port (HW-VERIFIED, both roles).** Ported the
+  proven SAMD21 framework into `node/interlock/` (`interlock.{c,h}`, `interlock_dsl.c`,
+  `il_hal{.h,_rp2040.c}`, `il_pin_table.{c,h}`). Platform swaps: `.uninitialized_data`
+  persistence, `il_panic`/`watchdog_reboot`, HardFault dropped (chassis owns faults),
+  `emit_op_event`→shared-status. **Extended to Glenn's model:**
+  - **10 boolean interlock slots** (`INTERLOCK_MAX_SLOTS=10`), usually mostly EMPTY;
+    output = the **UNION (OR) of their LATCHED states** on the shared **GP0** veto.
+  - **Latched** trips: a slot stays vetoing after its input recovers, until an
+    **event-driven GLOBAL CLEAR** (`interlock_request_global_clear()` from a USB/bus
+    command `CMD_INTERLOCK_CLEAR=0x0210`; chain-tree-event source lands with Thread 3).
+    Clear is **fail-safe**: a still-violated slot re-latches the same tick.
+  - **ADC = shared read resource** (any slot/bench/telemetry reads `g_adc_latest`).
+  - Per-slot config `ilc0..ilc9` (`cfg_image.lua --il "N:<dsl>"`); absent = empty.
+  - **Config-fingerprint re-arm:** reflashing `ilc` config takes effect WITHOUT a power
+    cycle (persist v10 `cfg_fingerprint`); unchanged config + warm reset preserves latch.
+  - **Role-agnostic:** the SLAVE runs the same interlock (`node_thread2_start`), driven
+    over the bus. **Fast veto:** the `il` task ticks ~2 ms at priority 4 (above the engine).
+  - Status: `CMD_INTERLOCK_STATUS=0x0211` → `[ver][gveto][n]+n*[slot][state][tf][latched]`;
+    picolink `Link:il_status()/il_clear()`.
+  - HW proof: single trip→latch→hold→clear→re-latch AND the multi-slot union, on BOTH nodes.
+- **Build-order step 2 — Thread 1 B1 (done).** Unified `node_cmd_dispatch()` (echo / GPIO /
+  interlock) shared by the master appcore drain and the slave bus responder — deletes the
+  duplicated slave dispatch. **Remaining B (B2/B3 tagged events + symmetric reply) is a no-op
+  until Thread 3 gives it a second consumer — fold it into Thread 3 C1 (see thread3-plan.md).**
+
+### NEXT (recommended order)
+1. **Thread 3 — chain-tree app echo PoC** (`docs/thread3-plan.md`, increments C1→C3). This is
+   the next real milestone; B2/B3 fold into C1. Needs chain-tree IR tooling + an engine
+   "originate RS-485" path — a fresh-context-sized build.
+2. **I²C two-bus service** (deferred by Glenn) — unblocks the interlock's I²C-mirror input +
+   freshness fail-safe (build-order step 3).
+3. Core-affinity thread-review (isolate interlock + ADC ISR on their own core).
+
+### BENCH STATE (the two Picos on the Pi)
+- **Master** = Pico W, UID **`E6616408437D6628`**, bus addr **0** (variant 1). Talk to its
+  appcore at picolink addr **`0xFB`**.
+- **Slave** = plain Pico, UID **`E6605481DB611135`**, bus addr **9** (variant 3). Reach it via
+  the master relay: `lk:exec(9, …)`.
+- Both run the latest `bus_controller.uf2` with a **2-interlock TEST config**: `hwio` GP2=OUT,
+  GP3=IN(pulldown), GP4=OUT, GP5=IN(pulldown); `ilc0`=`watch[gp3:eq:0]`, `ilc1`=`watch[gp5:eq:0]`,
+  both → GP0 veto. **Jumpers on BOTH boards: GP2↔GP3 (pins 4↔5) and GP4↔GP5 (pins 6↔7).**
+  (Reflash clean no-interlock configs if you don't want the test interlocks armed.)
+- Bus healthy (master polls slave, 0 misses); both `idnt`s intact.
+
+### BUILD / FLASH (post-Pi-SD-crash 2026-06-23 — paths moved to /mnt/ssd; see memory pi-ssd-rebuild)
+- Pi `ssh robot` (192.168.1.66). All build software on the **SSD at `/mnt/ssd`**; `~/pico` →
+  `/mnt/ssd/pico` symlinked. **slow_bus is at `/mnt/ssd/slow_bus`** (`~/slow_bus` symlinked).
+- Build: `rsync -az --delete --exclude '.git' --exclude 'build' ./ robot:slow_bus/` then
+  `ssh robot 'cd slow_bus && bash tools/pi-build.sh bus_controller'` (sources `tools/pi-env.sh`,
+  which now adds the SSD arm-gnu-toolchain-14.2 to PATH — the apt arm-gcc is gone). cmake 4.x
+  in `~/.local/bin`. `il_thread2_check` is an isolated `-Werror` compile target for the
+  interlock module.
+- **picotool** (v2.2.0, rebuilt to `~/.local/bin` — NOT on the default non-login ssh PATH, so
+  prefix `. /mnt/ssd/pico/env.sh`). **Flashing syntax (verified 2026-06-24, supersedes the old
+  gotchas below): device-selection flags go BEFORE the `<filename>`, and `reboot` accepts them.**
+  - Reflash firmware only (preserves the config region = `idnt`/`hwio`/`ilc`):
+    `picotool load --ser <UID> -f -x /home/pi/slow_bus/build/bus_controller.uf2` (`-f`→BOOTSEL,
+    `-x`→run; ABSOLUTE path).
+  - Reflash config (entries share one 4 KB sector → ALL in one UF2): `picotool reboot --ser <UID>
+    -f -u` → `picotool load /tmp/cfg.uf2` → `picotool load -u -x <fw>.uf2`.
+  - NOTE: a `load -x`/firmware reboot can clobber the crash slot (`rst=POWER`) but the interlock
+    persist may survive → config changes are picked up via the **cfg_fingerprint**, not a cold boot.
+- Host tooling (pure-Lua, on the Pi): `cd /mnt/ssd/slow_bus/tools/commission/lua && luajit …`.
+  `picolink.lua` (`enumerate`/`open`/`exec`/`il_status`/`il_clear`), `cfg_image.lua` (build
+  config UF2s). Bench test scripts were written to `/tmp/*.lua` (union2/echo/etc. — re-derive).
+
+### KEY GOTCHAS / LEARNINGS
+- **GCC 14** (post-crash toolchain) is stricter: `-Werror=address-of-packed-member` on the wire
+  status buffer — evaluate into a local then copy element-wise (don't pass a `uint16_t*` into a
+  packed struct). The SDK has its own `panic()` → the interlock's is `il_panic`.
+- **Interlock config change needs the cfg_fingerprint** (already wired) — a plain reflash+soft-reboot
+  warm-restores the OLD armed set otherwise.
+- `INTERLOCK_MAX_SLOTS` bumps trip two guards: the slot bitmask `<=16` assert (now `il_slotmask_t`
+  =uint16) and the `il_status_buffer` size (now scales with the slot count).
 
 ---
 
