@@ -20,6 +20,11 @@ void node_role_run(uint8_t addr, uint32_t baud);
 // slave responder so the interlock runs on the slave too and its trip/latch/clear
 // can be driven over the bus (the master uses its own app_engine_task path).
 void    node_thread2_start(void);   // boot_decide + hwio_apply + arm ilcN + tick task
-uint8_t node_hil_gpio(uint16_t cmd, const uint8_t *args, uint8_t alen,
-                      uint8_t *res, uint8_t *reslen);   // GPIO write/read, role-validated
-uint8_t il_status_pack(uint8_t *out, uint8_t cap);      // interlock status wire form (shared)
+
+// Thread-1 unified operate-command dispatch (B1), shared by the master appcore drain
+// and the slave bus responder. Handles echo / GPIO read-write / interlock clear-
+// status into out (<= cap) + *outlen, returns a SHELL_* status, or CMD_NOT_MINE
+// (0xFF) if cmd isn't one of these. The caller owns the reply transport.
+#define CMD_NOT_MINE 0xFFu
+uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
+                          uint8_t *out, uint8_t cap, uint8_t *outlen);

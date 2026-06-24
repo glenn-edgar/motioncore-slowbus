@@ -1081,25 +1081,8 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
         // by hwio_apply(). Runtime reconfiguration is no longer permitted — operate
         // the pins, don't reconfigure them. Always rejected.
         hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true;
-    case CMD_GPIO_WRITE: {
-        if (c->alen < 3) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        uint8_t port = c->args[0], pin = c->args[1], level = c->args[2];
-        // Operate-only: writable iff the frozen role is OUTPUT.
-        if (port != 0 || level > 1 || hil_role_of(pin) != HWIO_ROLE_OUTPUT) {
-            hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true;
-        }
-        gpio_put(pin, level); hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
-    }
-    case CMD_GPIO_READ: {
-        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        uint8_t port = c->args[0], pin = c->args[1], role = hil_role_of(pin);
-        // Readable iff the pin is an input role or an output (read-back is harmless).
-        bool readable = (role == HWIO_ROLE_INPUT || role == HWIO_ROLE_INPUT_PULLUP ||
-                         role == HWIO_ROLE_INPUT_PULLDOWN || role == HWIO_ROLE_OUTPUT);
-        if (port != 0 || !readable) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        uint8_t lvl = gpio_get(pin) ? 1u : 0u;
-        hil_reply(c->req_id, SHELL_OK, &lvl, 1); return true;
-    }
+    // CMD_GPIO_WRITE / CMD_GPIO_READ are handled earlier by the unified
+    // node_cmd_dispatch (shared with the slave) — not here.
     case CMD_PULSE_READ: {
         uint8_t res[HIL_GPIO_COUNT * 4]; uint8_t n = 0;
         irq_set_enabled(ADC_IRQ_FIFO, false);                     // coherent 32-bit snapshot
@@ -1249,25 +1232,22 @@ void cfl_embed_pre_tick(void) {
             r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
             r.payload[2] = SHELL_OK; r.len = 3;
             (void)xQueueSend(g_up_q, &r, 0);
-        } else if (c.cmd == CMD_INTERLOCK_CLEAR) {   // Thread 2: global clear of latched trips
-            interlock_request_global_clear();         // serviced on the interlock's next tick
-            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
-            r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
-            r.payload[2] = SHELL_OK; r.len = 3;
-            (void)xQueueSend(g_up_q, &r, 0);
-        } else if (c.cmd == CMD_INTERLOCK_STATUS) {   // Thread 2: observe slot/veto state
-            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
-            uint8_t *p = r.payload, n = 0;
-            p[n++] = (uint8_t)c.req_id; p[n++] = (uint8_t)(c.req_id >> 8); p[n++] = SHELL_OK;
-            n += il_status_pack(&p[n], (uint8_t)(APPCORE_PAY_MAX - n));
-            r.len = n; (void)xQueueSend(g_up_q, &r, 0);
-        } else if (hil_gpio_dispatch(&c)) {
-            // GPIO + pulse-count HIL handled inline (reply sent within)
-        } else {   // unknown command -> direct UNKNOWN_CMD reply (no chain handler)
-            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
-            r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
-            r.payload[2] = SHELL_UNKNOWN_CMD; r.len = 3;
-            (void)xQueueSend(g_up_q, &r, 0);
+        } else {
+            // Thread-1 unified operate dispatch (echo / GPIO / interlock), shared
+            // with the slave responder. Then the master's own extras (servo / pulse
+            // / I2C via hil_gpio_dispatch), else UNKNOWN.
+            uint8_t out[APPCORE_PAY_MAX], outlen;
+            uint8_t st = node_cmd_dispatch(c.cmd, c.args, c.alen, out, sizeof out, &outlen);
+            if (st != CMD_NOT_MINE) {
+                hil_reply(c.req_id, st, out, outlen);
+            } else if (hil_gpio_dispatch(&c)) {
+                // servo / pulse / I2C / (frozen) config handled inline (reply sent within)
+            } else {   // unknown command -> direct UNKNOWN_CMD reply (no chain handler)
+                appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+                r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
+                r.payload[2] = SHELL_UNKNOWN_CMD; r.len = 3;
+                (void)xQueueSend(g_up_q, &r, 0);
+            }
         }
     }
 
@@ -1407,35 +1387,11 @@ void node_thread2_start(void) {
     interlock_thread2_start();
 }
 
-// GPIO write/read with frozen-role validation, reply-mechanism-agnostic so the
-// slave responder can use it (the master uses hil_gpio_dispatch). Returns a SHELL_*
-// status; for READ, *res[0] = level and *reslen = 1.
-uint8_t node_hil_gpio(uint16_t cmd, const uint8_t *args, uint8_t alen,
-                      uint8_t *res, uint8_t *reslen) {
-    *reslen = 0;
-    if (cmd == CMD_GPIO_WRITE) {
-        if (alen < 3) return SHELL_BAD_ARGS;
-        uint8_t port = args[0], pin = args[1], level = args[2];
-        if (port != 0 || level > 1 || hil_role_of(pin) != HWIO_ROLE_OUTPUT) return SHELL_BAD_ARGS;
-        gpio_put(pin, level); return SHELL_OK;
-    }
-    if (cmd == CMD_GPIO_READ) {
-        if (alen < 2) return SHELL_BAD_ARGS;
-        uint8_t port = args[0], pin = args[1], role = hil_role_of(pin);
-        bool readable = (role == HWIO_ROLE_INPUT || role == HWIO_ROLE_INPUT_PULLUP ||
-                         role == HWIO_ROLE_INPUT_PULLDOWN || role == HWIO_ROLE_OUTPUT);
-        if (port != 0 || !readable) return SHELL_BAD_ARGS;
-        res[0] = gpio_get(pin) ? 1u : 0u; *reslen = 1; return SHELL_OK;
-    }
-    return SHELL_UNKNOWN_CMD;
-}
-
 // Pack interlock status into out (<= cap bytes). Wire format v1:
 //   [ver=1][gveto] [n] then n x [slot][state][tf(live)][latched]
-// Only non-empty slots are reported (mostly-empty model). Shared by the master
-// (appcore) and slave (bus responder) CMD_INTERLOCK_STATUS handlers. Returns bytes.
+// Only non-empty slots are reported (mostly-empty model).
 #define IL_STATUS_WIRE_VER 1u
-uint8_t il_status_pack(uint8_t *out, uint8_t cap) {
+static uint8_t il_status_pack(uint8_t *out, uint8_t cap) {
     if (cap < 3) return 0;
     uint8_t gveto = 0;
     for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS; s++)
@@ -1455,6 +1411,47 @@ uint8_t il_status_pack(uint8_t *out, uint8_t cap) {
     }
     out[cnt_at] = cnt;
     return n;
+}
+
+// ---- Thread 1: unified operate-command dispatch (B1) ------------------------
+// ONE origin-agnostic handler for the synchronous operate commands common to the
+// master and the slave: echo, role-validated GPIO read/write, interlock clear/
+// status. Fills out (<= cap) + *outlen with reply data and returns a SHELL_* status,
+// or CMD_NOT_MINE if cmd isn't one of these — the caller then handles its own extras
+// (engine-routed MON/ADC + async servo/I2C on the master, UNKNOWN on the slave). The
+// caller owns the reply transport (USB up-queue vs bus window), so the same dispatch
+// serves both roles. Replaces the duplicated node_hil_gpio + per-side handlers.
+#define NODE_CMD_ECHO  0x0001u   // host/peer echo (now handled on both roles)
+// (CMD_NOT_MINE sentinel is defined in node_role.h — shared with the slave.)
+uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
+                          uint8_t *out, uint8_t cap, uint8_t *outlen) {
+    *outlen = 0;
+    switch (cmd) {
+    case NODE_CMD_ECHO: {
+        uint8_t k = (alen > cap) ? cap : alen;
+        memcpy(out, args, k); *outlen = k; return SHELL_OK;
+    }
+    case CMD_GPIO_WRITE: {
+        if (alen < 3) return SHELL_BAD_ARGS;
+        uint8_t port = args[0], pin = args[1], level = args[2];
+        if (port != 0 || level > 1 || hil_role_of(pin) != HWIO_ROLE_OUTPUT) return SHELL_BAD_ARGS;
+        gpio_put(pin, level); return SHELL_OK;
+    }
+    case CMD_GPIO_READ: {
+        if (alen < 2 || cap < 1) return SHELL_BAD_ARGS;
+        uint8_t port = args[0], pin = args[1], role = hil_role_of(pin);
+        bool readable = (role == HWIO_ROLE_INPUT || role == HWIO_ROLE_INPUT_PULLUP ||
+                         role == HWIO_ROLE_INPUT_PULLDOWN || role == HWIO_ROLE_OUTPUT);
+        if (port != 0 || !readable) return SHELL_BAD_ARGS;
+        out[0] = gpio_get(pin) ? 1u : 0u; *outlen = 1; return SHELL_OK;
+    }
+    case CMD_INTERLOCK_CLEAR:
+        interlock_request_global_clear(); return SHELL_OK;
+    case CMD_INTERLOCK_STATUS:
+        *outlen = il_status_pack(out, cap); return SHELL_OK;
+    default:
+        return CMD_NOT_MINE;
+    }
 }
 
 static void app_engine_task(void *arg) {
