@@ -28,7 +28,8 @@
 // ---- Constants ------------------------------------------------------------
 
 #define INTERLOCK_MAGIC              0xCD51AC73u
-#define INTERLOCK_MAX_SLOTS          2u
+#define INTERLOCK_MAX_SLOTS          10u   // 10 boolean interlocks; veto = union (OR) of
+                                           // their latched states. Usually mostly EMPTY.
 #define INTERLOCK_MAX_BOOT_ATTEMPTS  3u
 #define INTERLOCK_ID_NONE            0u
 #define INTERLOCK_ID_NOOP            1u
@@ -273,8 +274,12 @@ void il_panic(panic_code_t code, uint32_t arg);
 //
 // Compatibility: bump IL_STATUS_BUFFER_VERSION on any layout change. Host
 // decoder reads version first and refuses unknown.
-#define IL_STATUS_BUFFER_VERSION   2u   // v2: IL_MAX_INPUTS 4->7 grows input_vals[] (buffer stays 64 B)
-#define IL_STATUS_BUFFER_SIZE      64u
+#define IL_STATUS_BUFFER_VERSION   3u   // v3: INTERLOCK_MAX_SLOTS 2->10 grows slots[]+input_vals[]
+// Size scales with the slot count: 8 B header + per-slot (14 B il_status_slot_t +
+// 2*IL_MAX_INPUTS B readings). N=10 -> 8 + 28*10 = 288 B. (No host decoder consumes
+// it yet; it's an internal snapshot. Revisit a compact non-empty-only wire form when
+// a host status command + the Thread-1 unification land.)
+#define IL_STATUS_BUFFER_SIZE      (8u + (14u + 2u * IL_MAX_INPUTS) * INTERLOCK_MAX_SLOTS)
 #define IL_STATUS_SLOT_NAME_MAX    8u    // truncated from IL_NAME_MAX=16
 
 typedef struct __attribute__((packed)) {

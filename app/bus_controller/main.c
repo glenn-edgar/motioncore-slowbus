@@ -177,8 +177,8 @@ static host_link_t g_hl;
 static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitted on each host (re)attach
 static int g_hwio_rc; // boot_read_hwio() result (HWIO_OK / _MISSING benign; other = present-but-bad)
 static hwio_t g_hwio; // frozen HIL pin-role map + ADC annotation (always usable; defaults all-UNUSED)
-static int g_ilcf_rc = -2; // Thread-2 'ilcf' bring-up for the banner: -2 pending, -1 absent,
-                           // 0 armed/warm-restored, >0 = DSL parse-error category
+static int g_ilcf_rc = -2; // Thread-2 interlock bring-up for the banner: -2 pending,
+                           // else the count of slots armed from ilc0..ilc9 (0..10)
 static volatile bool g_identity_refused;   // mismatch (or missing+IDENT_REQUIRE_PRESENT) -> bus arbiter quarantined
 static uint32_t g_bus_baud;   // resolved RS-485 baud (config 'sp', else BUS_DEFAULT_BAUD); shown in the banner
 static uint8_t g_cfg_roster_n;   // slaves loaded from the 'slvr' config file at boot (0 if none)
@@ -1334,21 +1334,24 @@ static void il_tick_task(void *arg) {
 }
 
 // Run from app_engine_task AFTER adc_service_init + hwio_apply (peripherals up).
-// Re-claims warm-restored slots; on a cold boot, arms slot 0 from the 'ilcf' DSL
-// text. Then spawns the periodic tick task on core1.
+// Re-claims warm-restored slots; on a cold boot, arms each slot N from its optional
+// 'ilcN' DSL config (ilc0..ilc9, each absent = empty slot). Then spawns the tick
+// task on core1. g_ilcf_rc reports the count of armed slots for the boot banner.
 static void interlock_thread2_start(void) {
     interlock_warm_restore();
     if (interlock_armed_count() == 0) {                  // cold boot → arm from config
-        uint8_t buf[CFG_FILE_MAX]; uint32_t len;
-        if (cfg_load("ilcf", buf, sizeof buf, &len) == 0 && len > 0) {
+        uint8_t armed = 0;
+        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS && slot < 10; slot++) {
+            const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
+            uint8_t buf[CFG_FILE_MAX]; uint32_t len;
+            if (cfg_load(name, buf, sizeof buf, &len) != 0 || len == 0) continue;  // absent → empty
             uint8_t err[3];
-            uint8_t st = interlock_set_slot_dsl(0, (const char *)buf, (uint16_t)len, err);
-            g_ilcf_rc = (st == SHELL_OK) ? 0 : (int)err[0];   // 0 = ok, else parse category
-        } else {
-            g_ilcf_rc = -1;                                   // no ilcf → no interlock armed
+            if (interlock_set_slot_dsl(slot, (const char *)buf, (uint16_t)len, err) == SHELL_OK)
+                armed++;
         }
+        g_ilcf_rc = armed;                                   // 0..10 slots armed from config
     } else {
-        g_ilcf_rc = 0;                                        // warm-restored
+        g_ilcf_rc = (int)interlock_armed_count();            // warm-restored count
     }
     xTaskCreate(il_tick_task, "il", configMINIMAL_STACK_SIZE * 4, NULL, 2, &t_il);
     vTaskCoreAffinitySet(t_il, 1u << 1);                      // core1, with the ADC ISR

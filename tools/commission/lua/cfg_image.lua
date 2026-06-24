@@ -71,7 +71,7 @@ end
 --                                                   flags default 2=ENABLED)
 -- --poll "period_ms:max_misses:tcp_retries[:window_us]"   (default 200:3:2:0)
 local opt = { out = "cfg.uf2", chip = 0, variant = 1, addr = 0, flash_size = 2 * 1024 * 1024,
-              poll = "200:3:2" }
+              poll = "200:3:2", il = {} }
 local i = 1
 while i <= #arg do
     local a = arg[i]
@@ -86,7 +86,12 @@ while i <= #arg do
     elseif a == "--poll"       then opt.poll = nextval()
     elseif a == "--io"         then opt.io = nextval()    -- hwio HIL roles: "r0,r1,..,r7" (GP2..GP9; HWIO_ROLE_* 0..6)
     elseif a == "--adc"        then opt.adc = nextval()   -- hwio ADC annotation: "label:unit:num:den,..." (<=3 chans)
-    elseif a == "--ilcf"       then opt.ilcf = nextval()  -- Thread-2 interlock DSL text (slot 0), raw, <=128 B
+    elseif a == "--il"         then                       -- repeatable: "N:<dsl>" arms slot N (0..9)
+        local v = nextval()
+        local s, dsl = v:match("^(%d+):(.*)$")            -- split on FIRST colon (DSL contains colons)
+        assert(s and dsl and #dsl > 0, "bad --il (want N:<dsl>): " .. tostring(v))
+        s = tonumber(s); assert(s >= 0 and s <= 9, "--il slot out of range 0..9: " .. s)
+        opt.il[#opt.il + 1] = { slot = s, dsl = dsl }
     elseif a == "--flash-size" then opt.flash_size = tonumber(nextval())
     elseif a == "--port"       then opt.port = nextval()
     else error("unknown arg: " .. a) end
@@ -184,14 +189,19 @@ if opt.io or opt.adc then
     hwio_desc = (" + hwio{io=%d,adc=%d}"):format(hw.io and #hw.io or 0, hw.ad and #hw.ad or 0)
 end
 
--- ilcf (optional, Thread-2 interlock DSL for slot 0) ------------------------
+-- ilcN (optional, Thread-2 interlock DSL per slot; ilc0..ilc9) ---------------
 -- Raw DSL text (NOT CBOR): name;cfg[(pin):mode,..];watch[..];out_ok[..];out_err[..].
--- Pin names: gp0..gp29 (veto = gp0) and adc0..2 (== ain0..2 -> GP26/27/28).
+-- Pin names: gp0..gp29 (shared veto = gp0) and adc0..2 (== ain0..2 -> GP26/27/28).
+-- Each slot independent; absent slots = empty. The veto is the union of all slots.
 local ilcf_desc = ""
-if opt.ilcf then
-    assert(#opt.ilcf <= 128, "--ilcf text is " .. #opt.ilcf .. " B (max 128, IL_DSL_MAX)")
-    entries[#entries + 1] = { name = "ilcf", data = opt.ilcf }
-    ilcf_desc = (" + ilcf{%dB}"):format(#opt.ilcf)
+if #opt.il > 0 then
+    local seen = {}
+    for _, e in ipairs(opt.il) do
+        assert(not seen[e.slot], "duplicate --il slot " .. e.slot); seen[e.slot] = true
+        assert(#e.dsl <= 128, ("--il slot %d text %dB (max 128, IL_DSL_MAX)"):format(e.slot, #e.dsl))
+        entries[#entries + 1] = { name = "ilc" .. e.slot, data = e.dsl }
+    end
+    ilcf_desc = (" + ilc{%d slot%s}"):format(#opt.il, #opt.il == 1 and "" or "s")
 end
 
 -- ---- entries -> rows -> multi-block UF2 ------------------------------------
