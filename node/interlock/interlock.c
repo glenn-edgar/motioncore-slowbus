@@ -669,8 +669,13 @@ void interlock_tick_all(void) {
         interlock_slot_persist_t* sp = &g_interlock_persist.slots[slot];
         if (sp->state != INTERLOCK_SLOT_ARMED) continue;
         if (sp->id == INTERLOCK_ID_DSL) {
-            eval_slot(slot, &g_interlock_persist.inst[slot],
-                      g_il_status_buffer.input_vals[slot]);
+            // Evaluate into a local aligned array, then copy element-wise into the
+            // packed wire-format status buffer (avoids forming a uint16_t* into a
+            // packed member — GCC 14 -Werror=address-of-packed-member).
+            uint16_t vals[IL_MAX_INPUTS] = {0};
+            eval_slot(slot, &g_interlock_persist.inst[slot], vals);
+            for (uint8_t i = 0; i < IL_MAX_INPUTS; i++)
+                g_il_status_buffer.input_vals[slot][i] = vals[i];
         } else if (sp->id != INTERLOCK_ID_NONE
                    && sp->id <= g_interlock_count) {
             g_active_interlock_slot = slot;
@@ -684,17 +689,17 @@ void interlock_tick_all(void) {
     // participate by claiming outputs via hal_pin_claim_output in their
     // init and writing tf in their tick. Empty/POISONED slots have no
     // HAL claims so they don't affect output drive.
-    uint8_t veto_mask = 0;
+    il_slotmask_t veto_mask = 0;
     for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
         const interlock_slot_persist_t* sp = &g_interlock_persist.slots[slot];
         if (sp->state != INTERLOCK_SLOT_ARMED) continue;
         if (g_interlock_persist.inst[slot].tf_state == (uint8_t)IL_TF_FALSE) {
-            veto_mask |= (uint8_t)(1u << slot);
+            veto_mask |= (il_slotmask_t)(1u << slot);
         }
     }
     // Manage only the framework slots (0..INTERLOCK_MAX_SLOTS-1). Pins claimed by
     // the mode interlocks (MIXED/PIO/ADC on dedicated higher slots) drive themselves.
-    hal_pin_drive_outputs(veto_mask, (uint8_t)((1u << INTERLOCK_MAX_SLOTS) - 1u));
+    hal_pin_drive_outputs(veto_mask, (il_slotmask_t)((1u << INTERLOCK_MAX_SLOTS) - 1u));
 
     // Phase 3 — populate status buffer + emit OP_EVENT on slot transitions.
     // Compare new slot snapshots against the previous tick's status buffer

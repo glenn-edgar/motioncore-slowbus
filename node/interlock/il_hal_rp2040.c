@@ -19,7 +19,7 @@
 #include <string.h>
 
 typedef struct {
-    uint8_t slot_mask;        // bit i = slot i shares this pin; 0 = unclaimed
+    il_slotmask_t slot_mask;  // bit i = slot i shares this pin; 0 = unclaimed
     uint8_t mode;             // hal_pin_mode_t (uniform across sharers)
     uint8_t ok_value;         // output mode only
     uint8_t err_value;        // output mode only
@@ -55,7 +55,7 @@ hal_pin_claim_status_t hal_pin_claim(uint8_t phys_id, uint8_t slot, hal_pin_mode
     if (il_plat_pin_reserved(phys_id))     return HAL_PIN_CLAIM_RESERVED;
     if (!il_plat_pin_cap(phys_id, mode))   return HAL_PIN_CLAIM_CAP_MISSING;
 
-    const uint8_t slot_bit = (uint8_t)(1u << slot);
+    const il_slotmask_t slot_bit = (il_slotmask_t)(1u << slot);
     // Inputs are single-owner; allow idempotent re-claim by the same slot.
     if (g_claims[phys_id].slot_mask != 0 && g_claims[phys_id].slot_mask != slot_bit)
         return HAL_PIN_CLAIM_TAKEN;
@@ -79,7 +79,7 @@ hal_pin_claim_status_t hal_pin_claim_adc(uint8_t phys_id, uint8_t slot,
     if (ch == 0xFFu) return HAL_PIN_CLAIM_CAP_MISSING;
     if (il_plat_pin_reserved(phys_id)) return HAL_PIN_CLAIM_RESERVED;
 
-    const uint8_t slot_bit = (uint8_t)(1u << slot);
+    const il_slotmask_t slot_bit = (il_slotmask_t)(1u << slot);
     if (g_claims[phys_id].slot_mask != 0 && g_claims[phys_id].slot_mask != slot_bit)
         return HAL_PIN_CLAIM_TAKEN;
     if (g_claims[phys_id].slot_mask == slot_bit &&
@@ -112,7 +112,7 @@ hal_pin_claim_status_t hal_pin_claim_output(uint8_t phys_id, uint8_t slot,
     if (il_plat_pin_reserved(phys_id)) return HAL_PIN_CLAIM_RESERVED;
     if (!il_plat_pin_cap(phys_id, HAL_PIN_MODE_GPIO_OUT)) return HAL_PIN_CLAIM_CAP_MISSING;
 
-    const uint8_t slot_bit = (uint8_t)(1u << slot);
+    const il_slotmask_t slot_bit = (il_slotmask_t)(1u << slot);
 
     if (g_claims[phys_id].slot_mask != 0) {
         if (g_claims[phys_id].mode != HAL_PIN_MODE_GPIO_OUT) return HAL_PIN_CLAIM_TAKEN;
@@ -135,10 +135,10 @@ hal_pin_claim_status_t hal_pin_claim_output(uint8_t phys_id, uint8_t slot,
 
 void hal_pin_release_slot(uint8_t slot) {
     ensure_initialised();
-    const uint8_t slot_bit = (uint8_t)(1u << slot);
+    const il_slotmask_t slot_bit = (il_slotmask_t)(1u << slot);
     for (uint8_t id = 0; id < HAL_PIN_TABLE_SIZE; id++) {
         if ((g_claims[id].slot_mask & slot_bit) == 0u) continue;
-        g_claims[id].slot_mask &= (uint8_t)~slot_bit;
+        g_claims[id].slot_mask &= (il_slotmask_t)~slot_bit;
         if (g_claims[id].slot_mask == 0u) {
             // Only outputs were reconfigured by the HAL; return them to OK, then
             // hi-Z. Inputs/ADC were never touched (hwio owns them) — leave as-is.
@@ -154,7 +154,7 @@ void hal_pin_release_slot(uint8_t slot) {
     }
 }
 
-uint8_t hal_pin_get_owners(uint8_t phys_id) {
+il_slotmask_t hal_pin_get_owners(uint8_t phys_id) {
     ensure_initialised();
     if (phys_id >= HAL_PIN_TABLE_SIZE) return 0;
     return g_claims[phys_id].slot_mask;
@@ -172,7 +172,7 @@ bool hal_pin_check_consistency(void) {
         const hal_pin_claim_record_t* c = &g_claims[id];
         if (c->slot_mask == 0u) continue;
         if (c->mode == (uint8_t)HAL_PIN_MODE_GPIO_OUT) continue;   // sharing allowed
-        uint8_t m = c->slot_mask, bits = 0;
+        il_slotmask_t m = c->slot_mask; uint8_t bits = 0;
         while (m) { m &= (uint8_t)(m - 1u); bits++; }             // popcount (no CLZ on M0+)
         if (bits > 1u) return false;
     }
@@ -185,7 +185,7 @@ uint8_t hal_pin_read(uint8_t phys_id) {
     return gpio_get(phys_id) ? 1u : 0u;
 }
 
-void hal_pin_drive_outputs(uint8_t veto_mask, uint8_t managed_mask) {
+void hal_pin_drive_outputs(il_slotmask_t veto_mask, il_slotmask_t managed_mask) {
     ensure_initialised();
     for (uint8_t id = 0; id < HAL_PIN_TABLE_SIZE; id++) {
         const hal_pin_claim_record_t* c = &g_claims[id];

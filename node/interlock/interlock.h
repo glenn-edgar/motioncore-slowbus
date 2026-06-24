@@ -137,7 +137,7 @@ typedef struct {
 _Static_assert(sizeof(il_input_t)  == 8,  "il_input_t layout changed -- bump persist version");
 _Static_assert(sizeof(il_watch_t)  == 8,  "il_watch_t layout changed -- bump persist version");
 _Static_assert(sizeof(il_output_t) == 4,  "il_output_t layout changed -- bump persist version");
-_Static_assert(INTERLOCK_MAX_SLOTS <= 8,  "slot bitmasks (hal_pin slot_mask, veto/managed) are uint8_t");
+_Static_assert(INTERLOCK_MAX_SLOTS <= 16, "slot bitmasks (hal_pin slot_mask, veto/managed) are il_slotmask_t (uint16_t)");
 
 // ---- Parser status codes -------------------------------------------------
 

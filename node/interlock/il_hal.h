@@ -21,6 +21,10 @@
 #define HAL_PIN_TABLE_SIZE   30u    // RP2040 GPIO 0..29 (flat phys_id == gpio)
 #define HAL_PIN_UNCLAIMED    0xFFu
 
+// Per-slot bitmask (bit i = slot i). uint16_t supports up to 16 interlock slots
+// (INTERLOCK_MAX_SLOTS); widened from uint8_t to allow 10 slots.
+typedef uint16_t il_slotmask_t;
+
 typedef enum {
     HAL_PIN_MODE_UNCLAIMED  = 0,
     HAL_PIN_MODE_GPIO_IN    = 1,
@@ -54,11 +58,11 @@ hal_pin_claim_status_t hal_pin_claim_output(uint8_t phys_id, uint8_t slot,
                                             uint8_t ok_value, uint8_t err_value);
 
 void           hal_pin_release_slot(uint8_t slot);
-uint8_t        hal_pin_get_owners(uint8_t phys_id);
+il_slotmask_t  hal_pin_get_owners(uint8_t phys_id);
 hal_pin_mode_t hal_pin_get_mode  (uint8_t phys_id);
 bool           hal_pin_check_consistency(void);
 uint8_t        hal_pin_read    (uint8_t phys_id);
-void           hal_pin_drive_outputs(uint8_t veto_mask, uint8_t managed_mask);
+void           hal_pin_drive_outputs(il_slotmask_t veto_mask, il_slotmask_t managed_mask);
 
 // ---- Platform seam (provided by the firmware, e.g. main.c) -----------------
 // Keeps the HAL free of board.h / hwio internals so it stays unit-testable.
