@@ -46,7 +46,9 @@
 // v7: grows il_output_t with `open_drain` (open-collector `oc` / `oc:up` outputs).
 // v8: raises IL_MAX_INPUTS 4 -> 7 (grows il_inst_t.inputs[] + the .noinit persist
 //     inst[]/input_vals[]); old images re-init via persist_is_valid() self_size check.
-#define INTERLOCK_PERSIST_VERSION    8u
+// v9: per-slot `reserved` repurposed as `latched` (sticky-trip-till-global-clear).
+//     Old v8 persist re-inits via the version check (latches start clear).
+#define INTERLOCK_PERSIST_VERSION    9u
 
 // ---- Slice 2: DSL-driven interlock instance ------------------------------
 
@@ -208,7 +210,9 @@ typedef struct {
     uint8_t  state;          // interlock_slot_state_t
     uint8_t  id;             // 1-based index into g_interlocks[]; 0 = none
     uint8_t  boot_counter;   // warm boots observed since this slot was armed
-    uint8_t  reserved;
+    uint8_t  latched;        // 1 once this slot's boolean has tripped (live FALSE);
+                             // stays vetoing until a global clear AND the live
+                             // condition has recovered. Persists across warm reset.
 } interlock_slot_persist_t;
 
 typedef struct {
@@ -387,6 +391,15 @@ uint8_t  interlock_arm_slot_noop(uint8_t slot);
 // call at any point inside a tick callback — no validation overhead beyond
 // the slot-range bound check. Out-of-range slot is silently ignored.
 void     interlock_set_slot_tf(uint8_t slot, il_tf_state_t tf);
+
+// Request a GLOBAL CLEAR of all latched trips. Write-only, async-safe (a single
+// flag set) — call it from ANY event source: a USB/bus command (Thread 1) or a
+// chain-tree event (Thread 3). The interlock services it on its next tick: it
+// drops every slot's latch, then re-evaluates — so any slot whose condition is
+// STILL violated re-latches that same tick (you cannot clear a live hazard). This
+// is the "rearm" half of the shared-status coupling; no queue touches the safety
+// path. Returns immediately; the clear takes effect on the following tick.
+void     interlock_request_global_clear(void);
 
 // Mark slot EMPTY. No-op if already EMPTY. Releases all HAL pin claims
 // belonging to this slot.

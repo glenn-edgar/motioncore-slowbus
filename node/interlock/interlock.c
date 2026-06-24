@@ -59,6 +59,14 @@ interlock_persist_t g_interlock_persist __attribute__((section(".uninitialized_d
 // HardFault occurring outside any interlock tick is recorded that way.
 volatile uint8_t g_active_interlock_slot = INTERLOCK_CRASHED_SLOT_NONE;
 
+// Global-clear request flag (the "rearm" input of the shared-status coupling).
+// Set write-only by any event source via interlock_request_global_clear();
+// read-and-cleared by interlock_tick_all on its own tick. A single-byte flag, so
+// the cross-core set/read is atomic on M0+ — no lock needed on the safety path.
+static volatile uint8_t g_il_clear_request = 0;
+
+void interlock_request_global_clear(void) { g_il_clear_request = 1; }
+
 // ---------------------------------------------------------------------------
 // Status buffer (slice 5). Rebuilt at the end of every interlock_tick_all()
 // run. Lives in .data — does NOT need to survive WDT (host can re-poll the
@@ -206,7 +214,7 @@ static void persist_cold_init(void) {
         g_interlock_persist.slots[i].state        = INTERLOCK_SLOT_EMPTY;
         g_interlock_persist.slots[i].id           = INTERLOCK_ID_NONE;
         g_interlock_persist.slots[i].boot_counter = 0;
-        g_interlock_persist.slots[i].reserved     = 0;
+        g_interlock_persist.slots[i].latched      = 0;
         memset(&g_interlock_persist.inst[i], 0, sizeof(il_inst_t));
         g_interlock_persist.dsl_len[i] = 0;
         memset(g_interlock_persist.dsl_text[i], 0, IL_DSL_MAX);
@@ -332,6 +340,7 @@ uint8_t interlock_arm_slot_compiled(uint8_t slot, uint8_t id) {
     s->state        = INTERLOCK_SLOT_ARMED;
     s->id           = id;
     s->boot_counter = 0;
+    s->latched      = 0;   // fresh arm starts un-latched
     // Fresh-arm: zero inst[slot] so leftover bytes from a prior arm cycle
     // don't masquerade as state. Compiled modes only use tf_state.
     memset(&g_interlock_persist.inst[slot], 0, sizeof(il_inst_t));
@@ -375,6 +384,7 @@ uint8_t interlock_disarm_slot(uint8_t slot) {
     s->state        = INTERLOCK_SLOT_EMPTY;
     s->id           = INTERLOCK_ID_NONE;
     s->boot_counter = 0;
+    s->latched      = 0;
     memset(&g_interlock_persist.inst[slot], 0, sizeof(il_inst_t));
     g_interlock_persist.dsl_len[slot] = 0;
     clear_slot_runtime(slot);
@@ -475,6 +485,7 @@ uint8_t interlock_set_slot_dsl(uint8_t slot,
     sp->state        = INTERLOCK_SLOT_ARMED;
     sp->id           = INTERLOCK_ID_DSL;
     sp->boot_counter = 0;
+    sp->latched      = 0;   // a fresh arm starts un-latched (no stale trip)
     // Slice 6: fresh ARM starts with cleared debounce/hyst state — no false
     // edges from prior arm-cycle samples.
     clear_slot_runtime(slot);
@@ -660,6 +671,16 @@ static void emit_op_event(uint16_t seq, uint8_t slot,
 
 void interlock_tick_all(void) {
     verify_persist_or_panic();
+
+    // Phase 0 — global clear (rearm). Drop every latch on request; Phase 1 below
+    // immediately re-latches any slot still violated, so a live hazard cannot be
+    // cleared. One-shot: read and clear the flag.
+    if (g_il_clear_request) {
+        g_il_clear_request = 0;
+        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++)
+            g_interlock_persist.slots[slot].latched = 0;
+    }
+
     // Phase 1 — evaluate. Dispatch by role mode:
     //   DSL slot  → eval_slot (parser-driven inputs + watches)
     //   Compiled  → g_interlocks[id-1].tick(slot); the mode writes its own
@@ -684,16 +705,26 @@ void interlock_tick_all(void) {
     }
     g_active_interlock_slot = INTERLOCK_CRASHED_SLOT_NONE;
 
-    // Phase 2 — drive outputs. Build the veto mask from any ARMED slot
-    // whose tf is FALSE, regardless of role mode. Compiled modes
-    // participate by claiming outputs via hal_pin_claim_output in their
-    // init and writing tf in their tick. Empty/POISONED slots have no
-    // HAL claims so they don't affect output drive.
+    // Phase 1b — LATCH. A slot whose live boolean is FALSE this tick sets its
+    // sticky latch; the latch only clears via Phase 0 (global clear) when the
+    // condition has actually recovered. So once tripped, a slot keeps vetoing
+    // even after its input recovers, until an explicit clear.
+    for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
+        interlock_slot_persist_t* sp = &g_interlock_persist.slots[slot];
+        if (sp->state != INTERLOCK_SLOT_ARMED) continue;
+        if (g_interlock_persist.inst[slot].tf_state == (uint8_t)IL_TF_FALSE)
+            sp->latched = 1;
+    }
+
+    // Phase 2 — drive outputs. The veto is the union (OR) of every ARMED slot's
+    // LATCHED state (not the live tf), so a tripped slot keeps the output asserted
+    // until a global clear. Empty/POISONED slots have no HAL claims so they don't
+    // affect output drive.
     il_slotmask_t veto_mask = 0;
     for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
         const interlock_slot_persist_t* sp = &g_interlock_persist.slots[slot];
         if (sp->state != INTERLOCK_SLOT_ARMED) continue;
-        if (g_interlock_persist.inst[slot].tf_state == (uint8_t)IL_TF_FALSE) {
+        if (sp->latched) {
             veto_mask |= (il_slotmask_t)(1u << slot);
         }
     }

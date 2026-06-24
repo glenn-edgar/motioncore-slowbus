@@ -93,6 +93,7 @@
 
 // ---- core1 application engine (KB0 monitor PoC) -----------------------------
 #define BUS_ADDR_APPCORE         0xFBu   // core1 virtual-slave address
+#define CMD_INTERLOCK_CLEAR      0x0210u // Thread 2: request a global clear of all latched trips
 #define CMD_MON_PING             0x0200u // KB0: liveness round-trip
 #define CMD_MON_SNAPSHOT         0x0201u // KB0: one-shot system report set
 #define CMD_MON_STREAM           0x0202u // KB0: [enable u8][period_ms u16][mask u16]
@@ -1242,6 +1243,12 @@ void cfl_embed_pre_tick(void) {
                 if (g_stream_period_ms < 50) g_stream_period_ms = 50;
                 g_stream_next_ms = to_ms_since_boot(get_absolute_time()) + g_stream_period_ms;
             }
+            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+            r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
+            r.payload[2] = SHELL_OK; r.len = 3;
+            (void)xQueueSend(g_up_q, &r, 0);
+        } else if (c.cmd == CMD_INTERLOCK_CLEAR) {   // Thread 2: global clear of latched trips
+            interlock_request_global_clear();         // serviced on the interlock's next tick
             appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
             r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
             r.payload[2] = SHELL_OK; r.len = 3;
