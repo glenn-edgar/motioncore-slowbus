@@ -32,7 +32,19 @@ node-to-node app message is handled by the SLAVE's own engine (`kbapp`). Commit 
   echoes exact (status=0), C1 local echo OK, **regression 11/11 PASS**, slave ALIVE misses=0.
 - Test: `pico_app_echo.lua <port> --to 9 <msg>` (now exercises master kbapp → slave kbapp).
 
+### PERF (measured 2026-06-24, 50-iter round-trips, master ↔ slave @ 9)
+Engine messaging was capped by the **engine tick**, not the bus. Bumped `delta_time`
+0.1→**0.01** (10 Hz → **100 Hz**) in `engine_runtime_bringup()` (commit `71715d1`):
+- local engine echo: ~100 ms → **~10 ms (~98 msg/s)**
+- node-to-node engine↔engine: ~100 ms → **~20 ms (~49 msg/s)** — now transport-bound
+- bus-sync (no engine) baseline: **~17 ms** (the RS-485+USB floor, unchanged)
+Decision (Glenn): keep 0.01; **make `delta_time` a per-unit config field later so special
+nodes can tune their tick** (like `baud` in `idnt`). Cost of 100 Hz: more idle core1 CPU
+walking KBs each tick (negligible for echo; revisit under heavy KB load). Interlock
+unaffected (separate ~2 ms `il_tick_task`).
+
 ### NEXT (Thread 3 hardening / follow-ons)
+- **Per-node `delta_time` config field** (tick rate from `idnt`/config, default 0.01).
 - **instance_id / "right app?" check** (design's build-&-identity model) — deferred from C3;
   cross-node validation via `OP_REGISTER` before trusting a peer's app.
 - Bidirectional / slave-originated app messages; richer app KBs beyond echo.
