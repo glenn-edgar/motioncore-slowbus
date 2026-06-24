@@ -218,8 +218,11 @@ to Thread 3*.
 
 ## Suggested build order
 1. ✅ `hwio` config (schema + host builder + boot reader applying pin roles). **DONE
-   2026-06-23** — `node/boot_hwio.{c,h}`, `cfg_image.lua --io/--adc`, `hwio_apply()`
-   at boot. CMD_GPIO_CONFIG retired; HIL is operate-only, validated per frozen role.
+   2026-06-23; HW-VERIFIED 2026-06-24** — `node/boot_hwio.{c,h}`, `cfg_image.lua
+   --io/--adc`, `hwio_apply()` at boot. CMD_GPIO_CONFIG retired; HIL is operate-only,
+   validated per frozen role. Bench proof (master, GP2=OUT/GP3=IN/GP4=UNUSED):
+   boot `hwio=0`; WRITE OUTPUT ok, WRITE INPUT/UNUSED + GPIO_CONFIG rejected; READ
+   INPUT ok; idnt + roster preserved through the config reflash.
 2. ◐ Thread 1 — router + bench surface (operate-only HIL, validated against `hwio`).
    **Partial** — the HIL command surface is now operate-only/role-validated. The full
    router unification (one tagged event type, per-consumer queues, role-agnostic
