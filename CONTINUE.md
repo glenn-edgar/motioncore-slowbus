@@ -6,6 +6,42 @@ Last updated **2026-06-24**. Branch: **`samd21-namespace-db`** (clean + pushed).
 
 ---
 
+## UPDATE 2026-06-24 (d) — Thread 3 C3: chain-tree ENGINE ON THE SLAVE (engine↔engine) — DONE & HW-VERIFIED
+
+**Objective REACHED (Glenn):** the chain-tree engine runs on BOTH master and slave, and a
+node-to-node app message is handled by the SLAVE's own engine (`kbapp`). Commit `22fd910`.
+
+- **Tagged event** (the B2/B3 work, finally earning its keep): `appcore_cmd_t`/`app_req_t`
+  gain `{route, bus_src}`. `kbapp_on_echo` is origin-agnostic — reply rides `g_up_q`, the
+  role-specific drain delivers it: **ROUTE_USB** → master uplink (USB; keeps the C1 ver
+  byte); **ROUTE_BUS** → slave bus window (`[req][status][echo]`, no ver — the on-wire echo
+  contract the master correlates in COLLECT).
+- **Engine factored to be role-agnostic:** `engine_runtime_bringup()` (runtime create +
+  activate KBs + bind ADC blackboard) shared by `app_engine_task` (master) and the new
+  `node_engine_task` (slave); queue creation → `appcore_queues_init()`.
+- **Slave engine path** (`node_role_run` → `node_engine_start`): engine task on **core1**
+  (prio 3, below interlock tick prio 4) + a **core0 reply pump** draining `g_up_q` into
+  `bus_node_queue` (keeps the bus TX queue single-core; engine never touches `g_txq`).
+  Peripherals already up via `node_thread2_start`. `bus_node`'s `node_emit_ack()` fires on
+  the DATA grant independent of the reply, so the async engine reply ships on a later POLL.
+- **Slave responder routing:** `bus_node_on_data` calls `node_engine_try_route()` first —
+  `CMD_APP_ECHO` → engine (async); echo/GPIO/interlock keep their sync `node_cmd_dispatch`.
+- **Master originate** now sends `CMD_APP_ECHO` (was `NODE_CMD_ECHO`) so the SLAVE'S ENGINE
+  answers. `node_cmd_dispatch` does NOT handle 0x0300 → a correct echo proves the engine.
+- **HW proof:** same image on master `E6616408437D6628` + slave @ addr 9; two engine↔engine
+  echoes exact (status=0), C1 local echo OK, **regression 11/11 PASS**, slave ALIVE misses=0.
+- Test: `pico_app_echo.lua <port> --to 9 <msg>` (now exercises master kbapp → slave kbapp).
+
+### NEXT (Thread 3 hardening / follow-ons)
+- **instance_id / "right app?" check** (design's build-&-identity model) — deferred from C3;
+  cross-node validation via `OP_REGISTER` before trusting a peer's app.
+- Bidirectional / slave-originated app messages; richer app KBs beyond echo.
+- Then the deferred infra: I²C two-bus service; interlock chain-tree-event clear source
+  (a KB handler calls `interlock_request_global_clear()`); core-affinity review;
+  `g_roster`(16) vs `core/bus_roster.c`(32) reconcile; retire the SAMD21 tree.
+
+---
+
 ## UPDATE 2026-06-24 (c) — Thread 3 C2: master engine originates node-to-node echo — DONE & HW-VERIFIED
 
 **Objective (Glenn):** chain-tree engine on BOTH master and slave + node-to-node
