@@ -4,41 +4,41 @@
 #include "chaintree_handle_blackboard.h"
 
 const chaintree_handle_t g_chaintree_handle = {
-    .unique_id = "ct_kae52wtn",
+    .unique_id = "ct_vy7ej4ja",
 
-    .nodes = ct_kae52wtn_nodes,
-    .node_count = 23,
+    .nodes = ct_vy7ej4ja_nodes,
+    .node_count = 27,
 
-    .main_functions = ct_kae52wtn_main_functions,
+    .main_functions = ct_vy7ej4ja_main_functions,
     .main_function_count = 6,
-    .one_shot_functions = ct_kae52wtn_one_shot_functions,
-    .one_shot_function_count = 12,
-    .boolean_functions = ct_kae52wtn_boolean_functions,
+    .one_shot_functions = ct_vy7ej4ja_one_shot_functions,
+    .one_shot_function_count = 13,
+    .boolean_functions = ct_vy7ej4ja_boolean_functions,
     .boolean_function_count = 4,
 
-    .main_function_names = ct_kae52wtn_main_function_names,
-    .one_shot_function_names = ct_kae52wtn_one_shot_function_names,
-    .boolean_function_names = ct_kae52wtn_boolean_function_names,
+    .main_function_names = ct_vy7ej4ja_main_function_names,
+    .one_shot_function_names = ct_vy7ej4ja_one_shot_function_names,
+    .boolean_function_names = ct_vy7ej4ja_boolean_function_names,
 
-    .main_function_usage_count = ct_kae52wtn_main_function_usage_count,
+    .main_function_usage_count = ct_vy7ej4ja_main_function_usage_count,
 
-    .link_table = ct_kae52wtn_link_table,
-    .link_table_size = 16,
+    .link_table = ct_vy7ej4ja_link_table,
+    .link_table_size = 20,
 
-    .event_strings = (const char **)ct_kae52wtn_event_strings,
-    .event_count = 24,
+    .event_strings = (const char **)ct_vy7ej4ja_event_strings,
+    .event_count = 25,
 
-    .bitmask_names = (const char **)ct_kae52wtn_bitmask_names,
+    .bitmask_names = (const char **)ct_vy7ej4ja_bitmask_names,
     .bitmask_count = 0,
 
-    .kb_table = ct_kae52wtn_kb_table,
+    .kb_table = ct_vy7ej4ja_kb_table,
     .kb_count = 6,
 
-    .node_data_records = ct_kae52wtn_node_data_records,
-    .node_data_records_count = 150,
-    .node_data_strings = ct_kae52wtn_node_data_strings,
-    .node_data_strings_size = 618,
-    .node_data_controls = ct_kae52wtn_node_data_controls,
-    .node_data_controls_count = 8,
-    .bb_table = &ct_kae52wtn_bb_table
+    .node_data_records = ct_vy7ej4ja_node_data_records,
+    .node_data_records_count = 173,
+    .node_data_strings = ct_vy7ej4ja_node_data_strings,
+    .node_data_strings_size = 634,
+    .node_data_controls = ct_vy7ej4ja_node_data_controls,
+    .node_data_controls_count = 9,
+    .bb_table = &ct_vy7ej4ja_bb_table
 };

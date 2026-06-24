@@ -107,6 +107,8 @@
 #define ADC_WIN_SAMPLES          100     // 1 kHz samples per 10 Hz window (100 ms)
 #define CMD_ADC_STATS            0x0105u // KB1/firmware: read the 10 Hz mean/max/rms streams
 #define CMD_APP_ECHO             0x0300u // Thread 3 (kbapp): echo payload via the chain-tree engine
+#define CMD_APP_ECHO_TO          0x0301u // Thread 3 (kbapp): [addr u8][payload] — engine originates a
+                                         // bus echo to node <addr>, master correlates the reply
 #define KBAPP_VER                1u
 
 // ---- GPIO + pulse-count HIL (KB1 api; pin map per board.h) ------------------
@@ -215,6 +217,10 @@ static uint8_t  g_roster_n, g_cursor;
 static bool     g_cmd_pending;
 static uint8_t  g_cmd_slave; static uint16_t g_cmd_op, g_cmd_req_id;
 static uint8_t  g_cmd_body[BUS_PAYLOAD_MAX]; static uint8_t g_cmd_len;
+// C2 correlation: when the in-flight command was ENGINE-originated (not host-relayed),
+// the slave's reply is re-tagged from the master's wire req_id back to the host's.
+static bool     g_cmd_is_orig; static uint16_t g_cmd_host_req;
+static uint16_t g_orig_seq;    // master-owned wire req_id for originated commands
 
 // ---- inter-core seam (core0 <-> core1 app engine), FreeRTOS queues ----------
 // down: a host shell-exec addressed to 0xFB; up: a frame for the host. Cross-core
@@ -227,6 +233,13 @@ typedef struct { uint8_t dest; uint16_t opcode; uint8_t len; uint8_t payload[APP
 static QueueHandle_t   g_down_q;   // core0 -> core1
 static QueueHandle_t   g_up_q;     // core1 -> core0
 static volatile bool   g_host_connected;
+
+// Thread-3 C2: a bus message the master's ENGINE originates to a slave node. The
+// engine (core1) can't block on a bus round-trip, so kbapp enqueues this and the
+// bus thread (core0) does the transaction + correlates the reply back to the host.
+#define ORIG_PAY_MAX 64
+typedef struct { uint8_t addr; uint16_t host_req_id; uint8_t len; uint8_t bytes[ORIG_PAY_MAX]; } orig_req_t;
+static QueueHandle_t   g_orig_q;   // core1 (engine) -> core0 (bus thread)
 
 // ---- PHY-owned-by-bus-thread helpers (NO lock; PHY has a single owner) ------
 static bus_asm_t g_bc; static uint8_t g_bus_seq;
@@ -316,6 +329,7 @@ static void on_bus_msg(void *u, uint8_t dest, uint16_t opcode, const uint8_t *bo
     g_cmd_req_id = (opcode == OP_BUS_EXEC && len >= 4)
                  ? (uint16_t)body[2] | ((uint16_t)body[3] << 8)
                  : (len >= 2 ? (uint16_t)body[0] | ((uint16_t)body[1] << 8) : 0);
+    g_cmd_is_orig = false;   // host-relayed (not engine-originated)
     g_cmd_pending = true;
 }
 static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t *args, uint8_t alen) {
@@ -371,6 +385,7 @@ enum { BS_SWEEP = 0, BS_CMD_INJECT, BS_CMD_COLLECT };
 static void bus_control_task(void *arg) {
     (void)arg;
     uint8_t  state = BS_SWEEP, collect_slave = 0, collect_tries = 0;
+    bool     collect_is_orig = false; uint16_t collect_host = 0;
     uint32_t sweep_next_ms = 0;
     for (;;) {
         g_hb[HB_BUS]++; g_hb_us[HB_BUS] = time_us_32();
@@ -381,13 +396,38 @@ static void bus_control_task(void *arg) {
         uint32_t now = to_ms_since_boot(get_absolute_time());
         bus_frame_t rf;
 
+        // C2: when idle, promote one engine-originated request into the in-flight slot.
+        // The engine (core1) handed us {addr, host_req_id, payload}; we mint a master
+        // wire req_id and build an OP_SHELL_EXEC for NODE_CMD_ECHO, then let the normal
+        // INJECT/COLLECT path run — COLLECT re-tags the reply back to host_req_id.
+        if (state == BS_SWEEP) {
+            orig_req_t o;
+            LOCK();
+            // Hold the lock across check+set so a host command (on_bus_msg, same lock)
+            // can't claim the in-flight slot between our test and our write.
+            if (!g_cmd_pending && xQueueReceive(g_orig_q, &o, 0) == pdTRUE) {
+                uint16_t sr = (uint16_t)(++g_orig_seq); if (sr == 0) sr = (uint16_t)(++g_orig_seq);
+                uint8_t bn = 0;
+                g_cmd_body[bn++] = (uint8_t)sr;                g_cmd_body[bn++] = (uint8_t)(sr >> 8);
+                g_cmd_body[bn++] = (uint8_t)(CMD_ECHO & 0xFF); g_cmd_body[bn++] = (uint8_t)(CMD_ECHO >> 8); // == NODE_CMD_ECHO on the slave
+                uint8_t m = o.len; if (m > (uint8_t)(BUS_PAYLOAD_MAX - bn)) m = (uint8_t)(BUS_PAYLOAD_MAX - bn);
+                for (uint8_t i = 0; i < m; i++) g_cmd_body[bn++] = o.bytes[i];
+                g_cmd_slave = o.addr; g_cmd_op = OP_SHELL_EXEC; g_cmd_len = bn;
+                g_cmd_req_id = sr; g_cmd_is_orig = true; g_cmd_host_req = o.host_req_id;
+                g_cmd_pending = true;
+            }
+            UNLOCK();
+        }
+
         // A queued command pre-empts the routine sweep.
         bool start_cmd = false; uint8_t cslave = 0, clen = 0; uint16_t cop = 0;
+        bool c_is_orig = false; uint16_t c_host = 0;
         uint8_t cbuf[BUS_PAYLOAD_MAX];
         LOCK();
         if (state == BS_SWEEP && g_cmd_pending) {
             start_cmd = true; cslave = g_cmd_slave; cop = g_cmd_op; clen = g_cmd_len;
             memcpy(cbuf, g_cmd_body, clen);
+            c_is_orig = g_cmd_is_orig; c_host = g_cmd_host_req;
         }
         UNLOCK();
         if (start_cmd) state = BS_CMD_INJECT;
@@ -403,7 +443,9 @@ static void bus_control_task(void *arg) {
             if (got && rf.src == cslave) {
                 mark_alive(cslave, now);
                 uint8_t cls = (uint8_t)(rf.type & BUS_FT_MASK);
-                if (cls == BUS_FT_ACK || cls == BUS_FT_NAK) {
+                if (!c_is_orig && (cls == BUS_FT_ACK || cls == BUS_FT_NAK)) {
+                    // host-relay only: the host tracks the two-phase ACK/NAK. An
+                    // engine-originated command has no host ACK waiter — skip it.
                     uint8_t b[3] = { cslave, (uint8_t)g_cmd_req_id, (uint8_t)(g_cmd_req_id >> 8) };
                     (void)host_link_s2m(&g_hl, cslave, cls == BUS_FT_NAK ? OP_BUS_CMD_NAK : OP_BUS_CMD_ACK, b, 3);
                 }
@@ -411,6 +453,7 @@ static void bus_control_task(void *arg) {
             g_cmd_pending = false;            // bus freed; reply rides a later poll
             UNLOCK();
             collect_slave = cslave; collect_tries = CMD_COLLECT_TRIES; state = BS_CMD_COLLECT;
+            collect_is_orig = c_is_orig; collect_host = c_host;
         } else if (state == BS_CMD_COLLECT) {
             bus_send(collect_slave, BUS_FT_POLL, NULL, 0);
             int got = bus_recv(&rf, CMD_COLLECT_TIMEOUT_MS);
@@ -420,7 +463,17 @@ static void bus_control_task(void *arg) {
                 if (cls == BUS_FT_DATA && rf.len >= 2 &&
                     rf.payload[0] == (uint8_t)(OP_SHELL_REPLY & 0xFF) &&
                     rf.payload[1] == (uint8_t)(OP_SHELL_REPLY >> 8)) {
-                    (void)host_link_s2m(&g_hl, collect_slave, OP_SHELL_REPLY, &rf.payload[2], (uint8_t)(rf.len - 2));
+                    if (collect_is_orig) {
+                        // C2 correlation: the slave's reply [wire_req][status][echo] is
+                        // re-tagged to the host's req_id and surfaced as from the appcore.
+                        uint8_t rb[BUS_PAYLOAD_MAX]; uint8_t rn = (uint8_t)(rf.len - 2);
+                        memcpy(rb, &rf.payload[2], rn);
+                        if (rn >= 2) { rb[0] = (uint8_t)collect_host; rb[1] = (uint8_t)(collect_host >> 8); }
+                        (void)host_link_s2m(&g_hl, BUS_ADDR_APPCORE, OP_SHELL_REPLY, rb, rn);
+                    } else {
+                        (void)host_link_s2m(&g_hl, collect_slave, OP_SHELL_REPLY, &rf.payload[2], (uint8_t)(rf.len - 2));
+                    }
+                    collect_is_orig = false;
                     UNLOCK(); state = BS_SWEEP;
                 } else if (cls == BUS_FT_NO_MESSAGE) {
                     slave_t *s = roster_find(collect_slave);
@@ -821,7 +874,7 @@ void kb1_on_adc(void *handle, unsigned node_index) {
 // drains it on single-threaded core1, so a few slots cover several queued commands.
 #define APP_REQ_SLOTS 4
 #define APP_REQ_MAX   APPCORE_ARGS_MAX
-typedef struct { uint16_t req_id; uint8_t len; uint8_t bytes[APP_REQ_MAX]; } app_req_t;
+typedef struct { uint16_t req_id; uint8_t addr; uint8_t len; uint8_t bytes[APP_REQ_MAX]; } app_req_t;
 static app_req_t g_app_req[APP_REQ_SLOTS];
 static uint8_t   g_app_req_head;
 
@@ -840,6 +893,22 @@ void kbapp_on_echo(void *handle, unsigned node_index) {
     if (m > (uint8_t)(APPCORE_PAY_MAX - n)) m = (uint8_t)(APPCORE_PAY_MAX - n);
     for (uint8_t i = 0; i < m; i++) p[n++] = q->bytes[i];
     r.len = n; (void)xQueueSend(g_up_q, &r, 0);
+}
+
+// kbapp (C2): CMD_APP_ECHO_TO — the engine ORIGINATES a bus echo to a slave node.
+// The bus round-trip can't block the engine tick, so just hand the request to the
+// bus thread (core0) and return; that thread does the transaction and correlates the
+// reply back to this host req_id. No reply is pushed here — it rides the round-trip.
+void kbapp_on_echo_to(void *handle, unsigned node_index) {
+    (void)node_index;
+    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
+    const app_req_t *q = (const app_req_t *)rt->event_data_ptr->data.ptr;
+    if (!q) return;
+    orig_req_t o; o.addr = q->addr; o.host_req_id = q->req_id;
+    uint8_t m = q->len; if (m > ORIG_PAY_MAX) m = ORIG_PAY_MAX;
+    o.len = m;
+    for (uint8_t i = 0; i < m; i++) o.bytes[i] = q->bytes[i];
+    (void)xQueueSend(g_orig_q, &o, 0);   // non-blocking; drop if the bus is backed up
 }
 
 // per-tick hook (weak default in cfl_timer_rp2040.c): bump the core1 heartbeat and
@@ -1247,12 +1316,25 @@ void cfl_embed_pre_tick(void) {
             // we own the storage (this build doesn't free pointer events post-dispatch).
             app_req_t *q = &g_app_req[g_app_req_head];
             g_app_req_head = (uint8_t)((g_app_req_head + 1u) % APP_REQ_SLOTS);
-            q->req_id = c.req_id;
+            q->req_id = c.req_id; q->addr = 0;
             uint8_t m = c.alen; if (m > APP_REQ_MAX) m = APP_REQ_MAX;
             q->len = m;
             for (uint8_t i = 0; i < m; i++) q->bytes[i] = c.args[i];
             cfl_send_data_event(g_rt->event_queue, CFL_EVENT_PRIORITY_LOW,
                                 g_kbapp_node, false, EVENT_CMD_APP_ECHO, q);
+        } else if (c.cmd == CMD_APP_ECHO_TO) {   // C2: engine originates a bus echo to [addr]
+            // args = [addr u8][payload...]; same slot+pointer-event mechanism as echo,
+            // but the kbapp handler hands it to the bus thread instead of replying.
+            app_req_t *q = &g_app_req[g_app_req_head];
+            g_app_req_head = (uint8_t)((g_app_req_head + 1u) % APP_REQ_SLOTS);
+            q->req_id = c.req_id;
+            q->addr = (c.alen >= 1) ? c.args[0] : 0;
+            uint8_t m = (c.alen >= 1) ? (uint8_t)(c.alen - 1) : 0;
+            if (m > APP_REQ_MAX) m = APP_REQ_MAX;
+            q->len = m;
+            for (uint8_t i = 0; i < m; i++) q->bytes[i] = c.args[i + 1];
+            cfl_send_data_event(g_rt->event_queue, CFL_EVENT_PRIORITY_LOW,
+                                g_kbapp_node, false, EVENT_CMD_APP_ECHO_TO, q);
         } else if (c.cmd == CMD_ADC_STATS) {     // read the 10 Hz streams from the blackboard
             appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
             uint8_t *p = r.payload; uint8_t n = 0;
@@ -1667,7 +1749,8 @@ int main(void) {
     g_down_q = xQueueCreate(8, sizeof(appcore_cmd_t));
     g_up_q   = xQueueCreate(16, sizeof(appcore_rep_t));   // headroom for a snapshot burst (7 frames)
     g_i2c_req_q = xQueueCreate(8, sizeof(i2c_req_t));     // engine -> i2c service
-    if (!g_down_q || !g_up_q || !g_i2c_req_q) chassis_panic(RST_PANIC, 2);
+    g_orig_q = xQueueCreate(4, sizeof(orig_req_t));       // engine -> bus (C2 originate)
+    if (!g_down_q || !g_up_q || !g_i2c_req_q || !g_orig_q) chassis_panic(RST_PANIC, 2);
 
     uint32_t t0 = time_us_32();
     for (int i = 0; i < HB_COUNT; i++) g_hb_us[i] = t0;

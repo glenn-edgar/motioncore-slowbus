@@ -4,9 +4,9 @@
 
 #include "chaintree_support.h"
 
-#define CT_KAE52WTN_KB_COUNT 6
+#define CT_VY7EJ4JA_KB_COUNT 6
 
 
-extern const chaintree_kb_info_t ct_kae52wtn_kb_table[6];
+extern const chaintree_kb_info_t ct_vy7ej4ja_kb_table[6];
 
 #endif /* CHAINTREE_HANDLE_KB_INFO_H */
