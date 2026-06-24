@@ -48,8 +48,9 @@
 // v8: raises IL_MAX_INPUTS 4 -> 7 (grows il_inst_t.inputs[] + the .noinit persist
 //     inst[]/input_vals[]); old images re-init via persist_is_valid() self_size check.
 // v9: per-slot `reserved` repurposed as `latched` (sticky-trip-till-global-clear).
-//     Old v8 persist re-inits via the version check (latches start clear).
-#define INTERLOCK_PERSIST_VERSION    9u
+// v10: adds cfg_fingerprint (re-arm when the flashed ilc config changes).
+//     Old persist re-inits via the version/self_size check.
+#define INTERLOCK_PERSIST_VERSION    10u
 
 // ---- Slice 2: DSL-driven interlock instance ------------------------------
 
@@ -239,6 +240,11 @@ typedef struct {
     il_inst_t                inst[INTERLOCK_MAX_SLOTS];
     uint16_t                 dsl_len[INTERLOCK_MAX_SLOTS];
     char                     dsl_text[INTERLOCK_MAX_SLOTS][IL_DSL_MAX];
+    // v10: fingerprint of the flashed ilc0..ilc9 config the armed set was built
+    // from. The bring-up re-arms from config when this no longer matches the flashed
+    // config (so reflashing interlock config takes effect without a power cycle);
+    // an unchanged config + warm reset preserves the armed/latched safety state.
+    uint32_t                 cfg_fingerprint;
 } interlock_persist_t;
 
 // ---- Panic codes (slice 5, Amendment C) ----------------------------------

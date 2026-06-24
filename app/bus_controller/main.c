@@ -180,6 +180,7 @@ static int g_hwio_rc; // boot_read_hwio() result (HWIO_OK / _MISSING benign; oth
 static hwio_t g_hwio; // frozen HIL pin-role map + ADC annotation (always usable; defaults all-UNUSED)
 static int g_ilcf_rc = -2; // Thread-2 interlock bring-up for the banner: -2 pending,
                            // else the count of slots armed from ilc0..ilc9 (0..10)
+static uint32_t g_il_armfail = 0; // DIAG: first arm failure [slot:8][status:8][err0:8][err1:8]
 static volatile bool g_identity_refused;   // mismatch (or missing+IDENT_REQUIRE_PRESENT) -> bus arbiter quarantined
 static uint32_t g_bus_baud;   // resolved RS-485 baud (config 'sp', else BUS_DEFAULT_BAUD); shown in the banner
 static uint8_t g_cfg_roster_n;   // slaves loaded from the 'slvr' config file at boot (0 if none)
@@ -192,11 +193,11 @@ static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
 // re-emit is what actually makes `ident` observable over USB. Caller serializes
 // host_link access (boot path is pre-scheduler; uplink holds g_lock).
 static void bc_emit_boot_banner(void) {
-    char b[112];
-    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d il=%d slvr=%u baud=%u",
+    char b[128];
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d il=%d ilfail=0x%08X slvr=%u baud=%u",
                      (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc,
-                     g_identity_refused ? " REFUSED" : "", g_hwio_rc, g_ilcf_rc, (unsigned)g_cfg_roster_n,
-                     (unsigned)g_bus_baud);
+                     g_identity_refused ? " REFUSED" : "", g_hwio_rc, g_ilcf_rc, (unsigned)g_il_armfail,
+                     (unsigned)g_cfg_roster_n, (unsigned)g_bus_baud);
     (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
 }
 
@@ -1354,25 +1355,47 @@ static void il_tick_task(void *arg) {
     }
 }
 
-// Run from app_engine_task AFTER adc_service_init + hwio_apply (peripherals up).
-// Re-claims warm-restored slots; on a cold boot, arms each slot N from its optional
-// 'ilcN' DSL config (ilc0..ilc9, each absent = empty slot). Then spawns the tick
-// task on core1. g_ilcf_rc reports the count of armed slots for the boot banner.
+// FNV-1a over the flashed ilc0..ilc9 config (each present file, position-tagged) —
+// the fingerprint used to detect a config change across a warm reset.
+static uint32_t interlock_cfg_fingerprint(void) {
+    uint32_t fp = 2166136261u;
+    for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
+        const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
+        uint8_t buf[CFG_FILE_MAX]; uint32_t len;
+        if (cfg_load(name, buf, sizeof buf, &len) != 0 || len == 0) continue;
+        fp = (fp ^ (uint32_t)(slot + 1)) * 16777619u;                 // position tag
+        for (uint32_t i = 0; i < len; i++) fp = (fp ^ buf[i]) * 16777619u;
+    }
+    return fp;
+}
+
+// Run from app_engine_task / node_role_run AFTER hwio_apply (peripherals up).
+// Warm-restores the persisted armed set, then RE-ARMS from the flashed ilc0..ilc9
+// config when that config changed (fingerprint mismatch) or on a cold boot — so a
+// reflashed interlock config takes effect WITHOUT a power cycle, while an unchanged
+// config + warm reset preserves the armed/latched safety state. Spawns the tick task.
 static void interlock_thread2_start(void) {
     interlock_warm_restore();
-    if (interlock_armed_count() == 0) {                  // cold boot → arm from config
+    uint32_t fp = interlock_cfg_fingerprint();
+    if (fp != g_interlock_persist.cfg_fingerprint || interlock_armed_count() == 0) {
+        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++)
+            interlock_disarm_slot(slot);                     // drop any stale armed set
         uint8_t armed = 0;
-        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS && slot < 10; slot++) {
+        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
             const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
             uint8_t buf[CFG_FILE_MAX]; uint32_t len;
             if (cfg_load(name, buf, sizeof buf, &len) != 0 || len == 0) continue;  // absent → empty
             uint8_t err[3];
-            if (interlock_set_slot_dsl(slot, (const char *)buf, (uint16_t)len, err) == SHELL_OK)
-                armed++;
+            uint8_t st = interlock_set_slot_dsl(slot, (const char *)buf, (uint16_t)len, err);
+            if (st == SHELL_OK) armed++;
+            else if (!g_il_armfail)                          // DIAG: capture first arm failure
+                g_il_armfail = ((uint32_t)slot << 24) | ((uint32_t)st << 16) |
+                               ((uint32_t)err[0] << 8) | err[1];
         }
+        g_interlock_persist.cfg_fingerprint = fp;
         g_ilcf_rc = armed;                                   // 0..10 slots armed from config
     } else {
-        g_ilcf_rc = (int)interlock_armed_count();            // warm-restored count
+        g_ilcf_rc = (int)interlock_armed_count();            // warm, same config → preserved
     }
     xTaskCreate(il_tick_task, "il", configMINIMAL_STACK_SIZE * 4, NULL, 2, &t_il);
     vTaskCoreAffinitySet(t_il, 1u << 1);                      // core1, with the ADC ISR

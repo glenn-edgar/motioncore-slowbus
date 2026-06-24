@@ -226,6 +226,7 @@ static void persist_cold_init(void) {
     g_interlock_persist.crash.panic_code         = PANIC_NONE;
     g_interlock_persist.crash.reserved[0]        = 0;
     g_interlock_persist.crash.reserved[1]        = 0;
+    g_interlock_persist.cfg_fingerprint          = 0;
     g_interlock_persist.crash.panic_arg          = 0;
     g_interlock_persist.crash.panic_sp           = 0;
 }
