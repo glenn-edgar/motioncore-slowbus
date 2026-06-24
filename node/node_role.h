@@ -22,3 +22,4 @@ void node_role_run(uint8_t addr, uint32_t baud);
 void    node_thread2_start(void);   // boot_decide + hwio_apply + arm ilcN + tick task
 uint8_t node_hil_gpio(uint16_t cmd, const uint8_t *args, uint8_t alen,
                       uint8_t *res, uint8_t *reslen);   // GPIO write/read, role-validated
+uint8_t il_status_pack(uint8_t *out, uint8_t cap);      // interlock status wire form (shared)

@@ -1259,21 +1259,7 @@ void cfl_embed_pre_tick(void) {
             appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
             uint8_t *p = r.payload, n = 0;
             p[n++] = (uint8_t)c.req_id; p[n++] = (uint8_t)(c.req_id >> 8); p[n++] = SHELL_OK;
-            uint8_t gveto = 0;                        // global veto = OR of armed+latched slots
-            for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS; s++)
-                if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_ARMED &&
-                    g_interlock_persist.slots[s].latched) gveto = 1;
-            p[n++] = gveto;
-            uint8_t cnt_at = n++, cnt = 0;            // count placeholder, filled below
-            for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS && (uint8_t)(n + 4) <= APPCORE_PAY_MAX; s++) {
-                if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_EMPTY) continue;
-                p[n++] = s;
-                p[n++] = g_interlock_persist.slots[s].state;
-                p[n++] = g_interlock_persist.inst[s].tf_state;   // live boolean
-                p[n++] = g_interlock_persist.slots[s].latched;   // sticky trip
-                cnt++;
-            }
-            p[cnt_at] = cnt;
+            n += il_status_pack(&p[n], (uint8_t)(APPCORE_PAY_MAX - n));
             r.len = n; (void)xQueueSend(g_up_q, &r, 0);
         } else if (hil_gpio_dispatch(&c)) {
             // GPIO + pulse-count HIL handled inline (reply sent within)
@@ -1406,11 +1392,14 @@ static void interlock_thread2_start(void) {
 // SAME interlock + a minimal HIL surface so the trip/latch/clear behaviour can be
 // exercised on the slave over the bus. Master keeps using app_engine_task's calls.
 
-// Bring up Thread 2 on the slave: validate persist, apply the frozen hwio roles,
-// arm ilc0..ilc9, and start the tick task. (No adc_service_init here yet — GPIO/
-// virtual interlocks only on the slave for now; ADC-on-slave is future work.)
+// Bring up Thread 2 on the slave: validate persist, start the ADC service, apply
+// the frozen hwio roles, arm ilc0..ilc9, and start the tick task. Runs pre-scheduler
+// from node_role_run (core0), so the ADC FIFO ISR lives on core0 here (vs core1 on
+// the master); the interlock reads g_adc_latest lock-free cross-core, so ADC-watching
+// interlocks now work on the slave too.
 void node_thread2_start(void) {
     interlock_boot_decide();
+    adc_service_init();
     hwio_apply(&g_hwio);
     interlock_thread2_start();
 }
@@ -1436,6 +1425,33 @@ uint8_t node_hil_gpio(uint16_t cmd, const uint8_t *args, uint8_t alen,
         res[0] = gpio_get(pin) ? 1u : 0u; *reslen = 1; return SHELL_OK;
     }
     return SHELL_UNKNOWN_CMD;
+}
+
+// Pack interlock status into out (<= cap bytes). Wire format v1:
+//   [ver=1][gveto] [n] then n x [slot][state][tf(live)][latched]
+// Only non-empty slots are reported (mostly-empty model). Shared by the master
+// (appcore) and slave (bus responder) CMD_INTERLOCK_STATUS handlers. Returns bytes.
+#define IL_STATUS_WIRE_VER 1u
+uint8_t il_status_pack(uint8_t *out, uint8_t cap) {
+    if (cap < 3) return 0;
+    uint8_t gveto = 0;
+    for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS; s++)
+        if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_ARMED &&
+            g_interlock_persist.slots[s].latched) gveto = 1;
+    uint8_t n = 0;
+    out[n++] = IL_STATUS_WIRE_VER;
+    out[n++] = gveto;
+    uint8_t cnt_at = n++, cnt = 0;
+    for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS && (uint8_t)(n + 4) <= cap; s++) {
+        if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_EMPTY) continue;
+        out[n++] = s;
+        out[n++] = g_interlock_persist.slots[s].state;
+        out[n++] = g_interlock_persist.inst[s].tf_state;   // live boolean
+        out[n++] = g_interlock_persist.slots[s].latched;   // sticky trip
+        cnt++;
+    }
+    out[cnt_at] = cnt;
+    return n;
 }
 
 static void app_engine_task(void *arg) {

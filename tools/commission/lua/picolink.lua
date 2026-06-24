@@ -53,6 +53,10 @@ M.SHELL_STATUS_OK = 0
 M.ADDR_LOCAL_SHELL = 0x00   -- BC's own shell (on_local_shell)
 M.ADDR_APPCORE     = 0xFB   -- core1 virtual slave (KB0 monitor / API)
 M.CMD_MON_PING     = 0x0200 -- KB0 liveness round-trip
+M.CMD_GPIO_WRITE   = 0x0101 -- [port][pin][level]
+M.CMD_GPIO_READ    = 0x0102 -- [port][pin] -> [level]
+M.CMD_INTERLOCK_CLEAR  = 0x0210 -- Thread 2: global clear of latched trips
+M.CMD_INTERLOCK_STATUS = 0x0211 -- Thread 2: [ver][gveto][n] + n*[slot][state][tf][latched]
 
 M.OP_NAME = {
     [0x0001]="REGISTER", [0x0002]="HEARTBEAT", [0x0005]="PONG",
@@ -271,6 +275,27 @@ function Link:ping(timeout)
         boot      = b[5] + b[6]*256,
         kb0_ver   = b[7],
     }
+end
+
+-- Thread-2 interlock status at `addr` (ADDR_APPCORE for the local node, or a slave
+-- bus address via the master relay). Returns { ver, gveto, slots = { [slot] =
+-- {state, tf, latched} } } or nil. Wire form v1: [ver][gveto][n] + n*[s][st][tf][la].
+function Link:il_status(addr, timeout)
+    local st, r = self:exec(addr, M.CMD_INTERLOCK_STATUS, "", timeout)
+    if st ~= M.SHELL_STATUS_OK or not r or #r < 3 then return nil end
+    local out = { ver = r:byte(1), gveto = r:byte(2), slots = {} }
+    local n, p = r:byte(3), 4
+    for _ = 1, n do
+        if p + 3 > #r then break end
+        out.slots[r:byte(p)] = { state = r:byte(p+1), tf = r:byte(p+2), latched = r:byte(p+3) }
+        p = p + 4
+    end
+    return out
+end
+
+-- Request a global clear of all latched trips at `addr`. Returns the shell status.
+function Link:il_clear(addr, timeout)
+    return (self:exec(addr, M.CMD_INTERLOCK_CLEAR, "", timeout))
 end
 
 return M

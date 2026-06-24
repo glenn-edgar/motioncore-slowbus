@@ -66,21 +66,7 @@ void bus_node_on_data(uint8_t src, const uint8_t *payload, uint8_t len) {
         r[n++] = SHELL_OK;
     } else if (cmd == CMD_INTERLOCK_STATUS) {
         r[n++] = SHELL_OK;
-        uint8_t gveto = 0;                       // global veto = OR of armed+latched slots
-        for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS; s++)
-            if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_ARMED &&
-                g_interlock_persist.slots[s].latched) gveto = 1;
-        r[n++] = gveto;
-        uint8_t cnt_at = n++, cnt = 0;
-        for (uint8_t s = 0; s < INTERLOCK_MAX_SLOTS && (uint8_t)(n + 4) <= BUS_PAYLOAD_MAX; s++) {
-            if (g_interlock_persist.slots[s].state == INTERLOCK_SLOT_EMPTY) continue;
-            r[n++] = s;
-            r[n++] = g_interlock_persist.slots[s].state;
-            r[n++] = g_interlock_persist.inst[s].tf_state;   // live boolean
-            r[n++] = g_interlock_persist.slots[s].latched;   // sticky trip
-            cnt++;
-        }
-        r[cnt_at] = cnt;
+        n = (uint8_t)(n + il_status_pack(&r[n], (uint8_t)(BUS_PAYLOAD_MAX - n)));
     } else {
         r[n++] = NODE_SHELL_UNKNOWN;
     }
