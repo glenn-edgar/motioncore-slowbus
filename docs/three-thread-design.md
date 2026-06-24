@@ -242,6 +242,12 @@ to Thread 3*.
    own local I/O, driven/observed over the bus (host→master→RS-485→slave). Same
    trip→latch→hold→clear→re-latch sequence passed on the slave (addr 9, jumper
    GP2→GP3) as on the master.
+   **Multi-slot UNION verified 2026-06-24** on both nodes (2 interlocks, jumpers
+   GP2→GP3 + GP4→GP5): each slot independently drives the shared GP0 veto, GVETO =
+   OR(latched), and a partial clear releases only the recovered slot while a still-
+   live slot re-latches and holds. **Config-change re-arm:** a `cfg_fingerprint` in
+   the persist makes a reflashed `ilc` config take effect without a power cycle, while
+   an unchanged config + warm reset preserves the armed/latched state.
    Still TODO (not safety-blocking): the hard ADC-ISR fast-veto path; I²C-mirror input
    (with the deferred I²C service); `adc_service_init` on the slave (GPIO/virtual
    interlocks only there for now); final core affinity; the "status out" wire form for
