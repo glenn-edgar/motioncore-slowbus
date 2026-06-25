@@ -17,11 +17,12 @@
 
       kb0   — monitor: CMD_MON_PING (event 20), CMD_MON_SNAPSHOT (event 21)
       kb1   — api:     CMD_ADC_READ  (event 22)
-      kbapp — Thread-3 application: CMD_APP_ECHO (23), CMD_APP_ECHO_TO (24)
+      kbapp — Thread-3 application: CMD_APP_ECHO (23), CMD_APP_ECHO_TO (24),
+              CMD_APP_IL_CLEAR (25)
 
     Event ids are assigned in registration order after the 20 core CFL_* events
     (0..19), so the build order kb0 -> kb1 -> kbapp (ping, snapshot, adc, echo,
-    echo_to) keeps the ids stable (20/21/22/23/24) — mirrored by EVENT_CMD_* in main.c.
+    echo_to, il_clear) keeps the ids stable (20..25) — mirrored by EVENT_CMD_* in main.c.
 ]]
 
 local ChainTreeMaster = require("chain_tree_master")
@@ -59,10 +60,13 @@ end
 --   C1: CMD_APP_ECHO (event 23) — local echo, proving Thread 1 -> engine -> reply.
 --   C2: CMD_APP_ECHO_TO (event 24) — the engine ORIGINATES a bus message to a slave
 --       node and the master correlates the reply (node-to-node, master-initiated).
+--   IL: CMD_APP_IL_CLEAR (event 25) — the engine (Thread 3) clears Thread 2's latched
+--       interlock trips (interlock_request_global_clear); fail-safe re-latch if still violated.
 local function build_kbapp(ct)
     ct:start_test("kbapp")
-    command_column(ct, "app_", "CMD_APP_ECHO",    "APP_ECHO")
-    command_column(ct, "app_", "CMD_APP_ECHO_TO", "APP_ECHO_TO")
+    command_column(ct, "app_", "CMD_APP_ECHO",     "APP_ECHO")
+    command_column(ct, "app_", "CMD_APP_ECHO_TO",  "APP_ECHO_TO")
+    command_column(ct, "app_", "CMD_APP_IL_CLEAR", "APP_IL_CLEAR")
     ct:end_test()
 end
 

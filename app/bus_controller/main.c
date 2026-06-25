@@ -110,6 +110,7 @@
 #define CMD_APP_ECHO             0x0300u // Thread 3 (kbapp): echo payload via the chain-tree engine
 #define CMD_APP_ECHO_TO          0x0301u // Thread 3 (kbapp): [addr u8][payload] — engine originates a
                                          // bus echo to node <addr>, master correlates the reply
+#define CMD_APP_IL_CLEAR         0x0302u // Thread 3 (kbapp): engine-driven interlock global clear (Thread 2)
 #define KBAPP_VER                1u
 
 // ---- GPIO + pulse-count HIL (KB1 api; pin map per board.h) ------------------
@@ -885,28 +886,51 @@ typedef struct { uint16_t req_id; uint8_t addr; uint8_t route; uint8_t bus_src; 
 static app_req_t g_app_req[APP_REQ_SLOTS];
 static uint8_t   g_app_req_head;
 
-// Echo reply, routed by the request's tag. The reply always rides g_up_q; the
+// Route a kbapp reply by the request's tag: the reply always rides g_up_q, and the
 // role-specific drain delivers it (master uplink -> USB; slave pump -> bus window).
-//   USB route: OP_SHELL_REPLY [req][status][ver][echo], dest = appcore (C1 format).
-//   BUS route: OP_SHELL_REPLY [req][status][echo],      dest = the asking node
-//              (matches the on-wire echo contract the master correlates in COLLECT).
+// `body` is the OP_SHELL_REPLY payload (typically [req][status]...). dest = appcore on
+// the USB route, or the asking node on the bus route.
+static void kbapp_reply(const app_req_t *q, const uint8_t *body, uint8_t blen) {
+    appcore_rep_t r;
+    r.dest = (q->route == ROUTE_BUS) ? q->bus_src : BUS_ADDR_APPCORE;
+    r.opcode = OP_SHELL_REPLY;
+    if (blen > APPCORE_PAY_MAX) blen = APPCORE_PAY_MAX;
+    memcpy(r.payload, body, blen); r.len = blen;
+    (void)xQueueSend(g_up_q, &r, 0);
+}
+
+// Echo, routed by the request's tag.
+//   USB route: OP_SHELL_REPLY [req][status][ver][echo] (C1 format).
+//   BUS route: OP_SHELL_REPLY [req][status][echo] (the on-wire echo contract the
+//              master correlates in COLLECT — no ver byte).
 void kbapp_on_echo(void *handle, unsigned node_index) {
     (void)node_index;
     cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
     const app_req_t *q = (const app_req_t *)rt->event_data_ptr->data.ptr;
     if (!q) return;
     bool to_bus = (q->route == ROUTE_BUS);
-    appcore_rep_t r;
-    r.dest = to_bus ? q->bus_src : BUS_ADDR_APPCORE;
-    r.opcode = OP_SHELL_REPLY;
-    uint8_t *p = r.payload; uint8_t n = 0;
+    uint8_t p[APPCORE_PAY_MAX]; uint8_t n = 0;
     p[n++] = (uint8_t)q->req_id; p[n++] = (uint8_t)(q->req_id >> 8);
     p[n++] = SHELL_OK;
     if (!to_bus) p[n++] = KBAPP_VER;          // ver only on the local (USB) echo
     uint8_t m = q->len;
     if (m > (uint8_t)(APPCORE_PAY_MAX - n)) m = (uint8_t)(APPCORE_PAY_MAX - n);
     for (uint8_t i = 0; i < m; i++) p[n++] = q->bytes[i];
-    r.len = n; (void)xQueueSend(g_up_q, &r, 0);
+    kbapp_reply(q, p, n);
+}
+
+// Thread 3 -> Thread 2: the engine clears the interlock's latched trips. Fail-safe —
+// a still-violated slot re-latches on the next il tick. Reply: [req][status][1=cleared].
+void kbapp_on_il_clear(void *handle, unsigned node_index) {
+    (void)node_index;
+    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
+    const app_req_t *q = (const app_req_t *)rt->event_data_ptr->data.ptr;
+    if (!q) return;
+    interlock_request_global_clear();
+    uint8_t p[4]; uint8_t n = 0;
+    p[n++] = (uint8_t)q->req_id; p[n++] = (uint8_t)(q->req_id >> 8);
+    p[n++] = SHELL_OK; p[n++] = 1u;           // 1 = global clear requested
+    kbapp_reply(q, p, n);
 }
 
 // kbapp (C2): CMD_APP_ECHO_TO — the engine ORIGINATES a bus echo to a slave node.
@@ -1349,6 +1373,12 @@ void cfl_embed_pre_tick(void) {
             for (uint8_t i = 0; i < m; i++) q->bytes[i] = c.args[i + 1];
             cfl_send_data_event(g_rt->event_queue, CFL_EVENT_PRIORITY_LOW,
                                 g_kbapp_node, false, EVENT_CMD_APP_ECHO_TO, q);
+        } else if (c.cmd == CMD_APP_IL_CLEAR) {  // Thread 3 -> Thread 2: engine-driven interlock clear
+            app_req_t *q = &g_app_req[g_app_req_head];
+            g_app_req_head = (uint8_t)((g_app_req_head + 1u) % APP_REQ_SLOTS);
+            q->req_id = c.req_id; q->route = c.route; q->bus_src = c.bus_src; q->addr = 0; q->len = 0;
+            cfl_send_data_event(g_rt->event_queue, CFL_EVENT_PRIORITY_LOW,
+                                g_kbapp_node, false, EVENT_CMD_APP_IL_CLEAR, q);
         } else if (c.cmd == CMD_ADC_STATS) {     // read the 10 Hz streams from the blackboard
             appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
             uint8_t *p = r.payload; uint8_t n = 0;
@@ -1679,7 +1709,7 @@ void appcore_queues_init(void) {
 // so echo/GPIO/interlock keep their existing in-window node_cmd_dispatch path.
 bool node_engine_try_route(uint8_t src, uint16_t req, uint16_t cmd,
                            const uint8_t *args, uint8_t alen) {
-    if (cmd != CMD_APP_ECHO) return false;     // only engine-app opcodes go to the engine
+    if (cmd != CMD_APP_ECHO && cmd != CMD_APP_IL_CLEAR) return false;  // only engine-app opcodes
     if (!g_down_q) return false;               // engine not up yet -> let caller sync-dispatch
     appcore_cmd_t c; c.req_id = req; c.cmd = cmd; c.route = ROUTE_BUS; c.bus_src = src;
     c.alen = (alen > APPCORE_ARGS_MAX) ? APPCORE_ARGS_MAX : alen;

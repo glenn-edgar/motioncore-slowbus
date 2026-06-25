@@ -6,8 +6,8 @@
 #include <stdbool.h>
 #include <string.h>
 
-#define CT_VY7EJ4JA_BITMASK_COUNT 0
+#define CT_8FWLHYXG_BITMASK_COUNT 0
 
-extern const char *ct_vy7ej4ja_bitmask_names[1];
+extern const char *ct_8fwlhyxg_bitmask_names[1];
 
 #endif /* CHAINTREE_HANDLE_BITMASKS_H */
