@@ -94,6 +94,10 @@ while i <= #arg do
         opt.il[#opt.il + 1] = { slot = s, dsl = dsl }
     elseif a == "--flash-size" then opt.flash_size = tonumber(nextval())
     elseif a == "--port"       then opt.port = nextval()
+    elseif a == "--ssid"       then opt.ssid = nextval()        -- neti: WiFi AP SSID (-> 'neti' file)
+    elseif a == "--pass"       then opt.pass = nextval()        -- neti: WiFi AP passphrase ("" = open)
+    elseif a == "--agent-ip"   then opt.agent_ip = nextval()    -- neti: zenoh-agent IPv4 "a.b.c.d"
+    elseif a == "--agent-port" then opt.agent_port = tonumber(nextval())  -- neti: zenoh-agent TCP port
     else error("unknown arg: " .. a) end
     i = i + 1
 end
@@ -204,6 +208,31 @@ if #opt.il > 0 then
     ilcf_desc = (" + ilc{%d slot%s}"):format(#opt.il, #opt.il == 1 and "" or "s")
 end
 
+-- neti (optional, WiFi creds + zenoh-agent endpoint for UPLINK=wifi) ----------
+-- { v=1, ss=<ssid>, pw=<pass>, ip=h'..4..', pt=<port> }. Creds live ONLY in this
+-- flashed UF2, never in source/git.
+local neti_desc = ""
+if opt.ssid then
+    local nm = { v = 1, ss = opt.ssid, pw = opt.pass or "" }
+    if opt.agent_ip then
+        local o = {}
+        for b in opt.agent_ip:gmatch("(%d+)") do o[#o + 1] = tonumber(b) end
+        assert(#o == 4, "--agent-ip wants a.b.c.d: " .. opt.agent_ip)
+        for _, b in ipairs(o) do assert(b >= 0 and b <= 255, "--agent-ip octet out of range: " .. b) end
+        nm.ip = cbor.bytes(string.char(o[1], o[2], o[3], o[4]))
+    end
+    if opt.agent_port then
+        assert(opt.agent_port >= 1 and opt.agent_port <= 65535, "--agent-port out of range")
+        nm.pt = opt.agent_port
+    end
+    local neti = cbor.encode(nm)
+    assert(#neti <= STORE_DATA_MAX, "neti CBOR too big: " .. #neti .. " B (>" .. STORE_DATA_MAX .. ")")
+    entries[#entries + 1] = { name = "neti", data = neti }
+    neti_desc = (" + neti{ssid=%q%s%s}"):format(opt.ssid,
+        opt.agent_ip and (",ip=" .. opt.agent_ip) or "",
+        opt.agent_port and (":" .. opt.agent_port) or "")
+end
+
 -- ---- entries -> rows -> multi-block UF2 ------------------------------------
 local base = 0x10000000 + opt.flash_size - 0x10000   -- top 64 KB of flash
 local blocks = {}
@@ -217,5 +246,5 @@ local f = assert(io.open(opt.out, "wb")); f:write(uf2); f:close()
 io.write(string.format(
     "[cfg_image] %s: idnt{v=1,ch=%d,vr=%d,ad=%d,%sid=%s}%s -> %d entr%s -> UF2 @ 0x%08X (%d B)\n",
     opt.out, opt.chip, opt.variant, opt.addr,
-    opt.baud and string.format("sp=%d,", opt.baud) or "", opt.uid, slvr_desc .. hwio_desc .. ilcf_desc,
+    opt.baud and string.format("sp=%d,", opt.baud) or "", opt.uid, slvr_desc .. hwio_desc .. ilcf_desc .. neti_desc,
     #entries, #entries == 1 and "y" or "ies", base, #uf2))

@@ -59,6 +59,7 @@
 #include "node_role.h"       // slave/node role entry (single image, role from config)
 #include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
 #include "boot_hwio.h"       // read the frozen HIL pin-role map ('hwio' config file)
+#include "boot_netcfg.h"     // read WiFi creds + zenoh-agent endpoint ('neti' config file)
 #include "boot_roster.h"     // read the master's slave roster ('slvr' config file)
 #include "interlock/interlock.h"  // Thread 2: ported SAMD21 interlock framework
 #include "interlock/il_hal.h"     //          + its pin HAL (platform seam below)
@@ -184,6 +185,8 @@ static host_link_t g_hl;
 static int g_id_rc;   // boot_read_identity() result; logged at boot + re-emitted on each host (re)attach
 static int g_hwio_rc; // boot_read_hwio() result (HWIO_OK / _MISSING benign; other = present-but-bad)
 static hwio_t g_hwio; // frozen HIL pin-role map + ADC annotation (always usable; defaults all-UNUSED)
+static int g_neti_rc; // boot_read_netcfg() result (NETI_OK / _MISSING benign; other = present-but-bad)
+static netcfg_t g_netcfg; // WiFi creds + zenoh-agent endpoint (present=0 unless a valid 'neti' loaded)
 static int g_ilcf_rc = -2; // Thread-2 interlock bring-up for the banner: -2 pending,
                            // else the count of slots armed from ilc0..ilc9 (0..10)
 static uint32_t g_il_armfail = 0; // DIAG: first arm failure [slot:8][status:8][err0:8][err1:8]
@@ -199,11 +202,17 @@ static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
 // re-emit is what actually makes `ident` observable over USB. Caller serializes
 // host_link access (boot path is pre-scheduler; uplink holds g_lock).
 static void bc_emit_boot_banner(void) {
-    char b[128];
-    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d il=%d ilfail=0x%08X slvr=%u baud=%u",
+    char b[200];
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d il=%d ilfail=0x%08X slvr=%u baud=%u neti=%d",
                      (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc,
                      g_identity_refused ? " REFUSED" : "", g_hwio_rc, g_ilcf_rc, (unsigned)g_il_armfail,
-                     (unsigned)g_cfg_roster_n, (unsigned)g_bus_baud);
+                     (unsigned)g_cfg_roster_n, (unsigned)g_bus_baud, g_neti_rc);
+    // WiFi config: log the SSID + agent endpoint; the passphrase is redacted to its length.
+    if (g_neti_rc == NETI_OK && n > 0 && n < (int)sizeof b)
+        n += snprintf(b + n, (size_t)((int)sizeof b - n), " ssid=%s %u.%u.%u.%u:%u pwlen=%u",
+                      g_netcfg.ssid, g_netcfg.ip[0], g_netcfg.ip[1], g_netcfg.ip[2], g_netcfg.ip[3],
+                      (unsigned)g_netcfg.port, (unsigned)strlen(g_netcfg.pass));
+    if (n > (int)sizeof b) n = (int)sizeof b;
     (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
 }
 
@@ -1826,6 +1835,7 @@ int main(void) {
     // file is logged via the banner; pins stay at the fail-safe defaults. Roles
     // are APPLIED to hardware later (hwio_apply, per role path).
     g_hwio_rc = boot_read_hwio(&g_hwio);
+    g_neti_rc = boot_read_netcfg(&g_netcfg);   // WiFi creds + agent endpoint ('neti'); MISSING is benign
 
     // ROLE DISPATCH (one image; role chosen from the config 'vr'): a COMMISSIONED
     // SLAVE runs only the node responder (node_role_run never returns) and skips

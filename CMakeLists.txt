@@ -80,6 +80,7 @@ add_executable(bus_controller
     ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/main.c
     ${NODE_DIR}/boot_identity.c
     ${NODE_DIR}/boot_hwio.c          # frozen HIL pin-role map ('hwio' config file)
+    ${NODE_DIR}/boot_netcfg.c        # WiFi creds + zenoh-agent endpoint ('neti' config file)
     ${NODE_DIR}/boot_roster.c
     ${NODE_DIR}/cfg_file.c
     ${NODE_DIR}/interlock/interlock.c       # Thread 2: ported SAMD21 interlock framework
