@@ -43,14 +43,26 @@ nodes can tune their tick** (like `baud` in `idnt`). Cost of 100 Hz: more idle c
 walking KBs each tick (negligible for echo; revisit under heavy KB load). Interlock
 unaffected (separate ~2 ms `il_tick_task`).
 
+### DONE 2026-06-24 (e) — interlock clear from a KB (Thread 3 → Thread 2) — HW-VERIFIED (`03bbb4f`)
+A chain-tree app event now clears the interlock's latched trips — the engine↔safety wiring
+the interlock design wanted. `kbapp` 3rd column **`CMD_APP_IL_CLEAR`** (0x0302, event 25) →
+`kbapp_on_il_clear` calls `interlock_request_global_clear()`. Route-aware via a new shared
+`kbapp_reply()` (refactored out of echo) so it works engine-local (USB) and over the bus
+(slave) identically; `node_engine_try_route()` also accepts it. Fail-safe preserved (clear
+is a request applied next il tick; still-violated slot re-latches). HW: induce→latch held→
+engine clear `gveto 1→0`; clear-while-violated re-latches; resolve+clear clears. 6/6 in
+`pico_app_il_clear.lua`; echo unchanged; regression 11/11.
+**IL polarity gotcha:** `watch[gpN:eq:0]` is SATISFIED at input=0 (drive the paired OUTPUT
+LOW), VIOLATED at 1. `tf_state`: `IL_TF_TRUE=1`=OK, `IL_TF_FALSE=2`=violated (interlock.h).
+
 ### NEXT (Thread 3 hardening / follow-ons)
 - **Per-node `delta_time` config field** (tick rate from `idnt`/config, default 0.01).
 - **instance_id / "right app?" check** (design's build-&-identity model) — deferred from C3;
   cross-node validation via `OP_REGISTER` before trusting a peer's app.
 - Bidirectional / slave-originated app messages; richer app KBs beyond echo.
-- Then the deferred infra: I²C two-bus service; interlock chain-tree-event clear source
-  (a KB handler calls `interlock_request_global_clear()`); core-affinity review;
+- Then the deferred infra: I²C two-bus service; core-affinity review;
   `g_roster`(16) vs `core/bus_roster.c`(32) reconcile; retire the SAMD21 tree.
+  (interlock chain-tree-event clear source — DONE, see update (e) above.)
 
 ---
 
