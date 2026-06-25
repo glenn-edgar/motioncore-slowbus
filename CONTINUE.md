@@ -3,6 +3,72 @@
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
 Last updated **2026-06-24**. Branch: **`samd21-namespace-db`** (clean + pushed).
+**★RESUME HERE tomorrow:** WiFi→zenoh uplink, step **W2** — see the next section.★
+
+---
+
+## ★ ACTIVE DIRECTION 2026-06-24 (f) — WiFi → zenoh container; W1 DONE, W2 NEXT ★
+
+**Goal (Glenn):** the bus controller (Pico W) talks **WiFi to a zenoh container**. Chain-tree
+(Thread 3) reached a good stopping point today (updates b–e below); switched to this.
+
+**Architecture (CONFIRMED + matches `docs/README.md` §Uplink):** proxy model — the chip
+streams the **SAME libcomm frame stream** it speaks over USB, but over a **TCP socket** to a
+**Linux zenoh-agent** that bridges to zenoh. **zenoh-pico is NEVER on the MCU.** The big
+enabler: the firmware↔agent wire IS libcomm (SLIP+CRC8, `OP_SHELL_EXEC`/`OP_SHELL_REPLY`),
+so this is "the same frames over WiFi."
+
+**Reuse blueprint = `~/xiao_blocks`** (proven Wio SAMD51→WiFi→zenoh, HW-verified there):
+- `host/zenoh_agent/agent.lua` — the proxy. **TCP mode** (`DEVICE=tcp:<port>`): listens on a
+  TCP port; the **chip dials in** and streams libcomm; agent is a zenoh RPC server
+  (token = FNV1a hash of a key-expr) bridging to a key. Containerized (`Dockerfile`,
+  debian+luajit+tini). `vendor/zenoh/*.lua` = LuaJIT zenoh client over a prebuilt `.so`.
+- `eclipse/zenoh` **router** on `:46169`; agent is a client to it.
+- Wio used RTL8720 eRPC; **Pico W is simpler** — CYW43 + lwIP native sockets.
+
+**Glenn's answers (2026-06-24):** (1) proxy model — yes. (2) agent on the **Pi** (`robot`,
+`/mnt/ssd`, container) — location flexible, Pi preferred. (3) agent not written — port from
+xiao_blocks. (4) WiFi creds via the secondary-flash config file; SSID **`WIFI_SSID_REDACTED`** /
+pass **`WIFI_PASS_REDACTED`** — **NEVER commit these** (cfg_image.lua CLI args only). Agent/zenoh TCP
+port = a random configurable number unused by existing containers.
+
+### W1 — 'neti' config file (secondary flash) — DONE + committed `785866a`
+WiFi creds + agent endpoint in a new read-only config-FS file, flashed separately.
+- `node/boot_netcfg.{c,h}` — reader (mirrors `boot_hwio`; cbor_min). `neti` CBOR:
+  `{ v:1, ss:<ssid>, pw:<pass>, ip:h'..4..', pt:<port> }`. `netcfg_t {ssid,pass,ip[4],port,present}`.
+  MISSING benign; validates schema + required ssid.
+- `cfg_image.lua --ssid/--pass/--agent-ip/--agent-port` builds the `neti` entry.
+- `main.c`: `boot_read_netcfg()` at boot; boot banner adds `neti=<rc>` + ssid + agent
+  ip:port, **passphrase redacted to length** (`pwlen=N`). Source `node/boot_netcfg.c` added
+  to CMake BC target.
+- Verified locally (CBOR hand-decodes correct: `a5` map v/ss/pw/ip-bytes/pt; firmware builds
+  + links). On-HW boot-banner check folds into W2 (needs a config reflash anyway).
+
+### W2 — NEXT: firmware WiFi+TCP uplink (`bus_controller_wifi`, the big piece)
+Bring up CYW43 + lwIP: join the `neti` AP, dial the agent at `neti` ip:port, stream the same
+libcomm frames `uplink_task` emits. Scaffolding exists: `port/rp2040/uplink_wifi_proxy.c`
+(SKELETON, all TODOs — `bus_uplink.h` seam) + CMake `WIFI=1` → `pico_cyw43_arch_lwip_sys_freertos`,
+`PICO_BOARD=pico_w`.
+- **GOTCHA (two codebases):** the `bus_uplink.h` seam is wired into the OLD `core/bus_sched.c`
+  skeleton, **NOT** the current `app/bus_controller/main.c` (which uses `host_link`/libcomm over
+  USB-CDC directly in `uplink_task`). So W2 = add CYW43/lwIP/TCP into main.c's `uplink_task`
+  (or integrate the seam). Keep USB-CDC for flashing/console in the wifi build.
+- **Design Qs for Glenn (W2 start):** (1) keep USB path for console + add WiFi as the frame
+  transport — OK? (2) to flash `neti` without guessing the bench interlock DSL: `picotool save`
+  the config region, append `neti`, reflash the full set.
+- **Watch:** firmware size with CYW43+lwIP (~100KB+); `bus_controller.uf2` was ~414→464 KB
+  even at W1 (likely UF2-block overhead — confirm real `.bin`/`arm-none-eabi-size` at W2).
+
+### W3 — host zenoh-agent + container (later)
+Port `~/xiao_blocks/host/zenoh_agent/` (agent.lua + vendor/zenoh + Dockerfile) into
+`slow_bus/host/zenoh_agent/`, TCP mode, map slow_bus appcore/bus commands to a zenoh key.
+Router + agent containers on the Pi (`/mnt/ssd`). End-to-end: zenoh client → router → agent
+→ WiFi → Pico W → reply.
+
+### Bench (unchanged): master Pico W `E6616408437D6628`, slave plain Pico `E6605481DB611135`
+(addr 9). Build/flash on the Pi (`ssh robot`, `/mnt/ssd/slow_bus`); discover ttyACM by serial
+(re-enumerates on reboot). Host tooling: `tools/commission/lua/` (luajit). Memory:
+`pico-wifi-zenoh` (active), `chaintree-dsl-source` (chain-tree, paused).
 
 ---
 
