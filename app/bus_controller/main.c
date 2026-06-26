@@ -621,28 +621,53 @@ static int wifi_dial(const netcfg_t *nc) {
     return fd;
 }
 
+// Link is healthy only if associated AND we hold an IP. Checking the IP alone misses
+// the "silently disassociated but the netif IP lingers" case (the power-save drop), so
+// query the actual WiFi link state too — that's what makes the supervisor rejoin.
+static bool wifi_link_up(struct netif *nif) {
+    return cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) >= CYW43_LINK_JOIN
+           && !ip4_addr_isany(netif_ip4_addr(nif));
+}
+// Disable CYW43 power-save: default PM silently disassociates while link status still
+// reads "connected" (pico-sdk #2153). NO_POWERSAVE (CYW43_DEFAULT_PM & ~0xf) stops it.
+static void wifi_no_powersave(void) { cyw43_wifi_pm(&cyw43_state, CYW43_DEFAULT_PM & ~0xfu); }
+
 static void wifi_uplink_task(void *arg) {
     (void)arg;
     WIFI_HB();
     if (cyw43_arch_init() != 0) { for (;;) { WIFI_HB(); vTaskDelay(pdMS_TO_TICKS(200)); } }
     cyw43_arch_enable_sta_mode();
+    wifi_no_powersave();
     struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
     g_host_connected = false;
+    uint8_t join_fails = 0;
 
     for (;;) {
         WIFI_HB();
         if (!g_netcfg.present) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
 
-        // ---- ensure joined (async connect + polled wait for an IP) ----
-        if (ip4_addr_isany(netif_ip4_addr(nif))) {
+        // ---- supervisor: (re)join whenever the link is down (even if a stale IP lingers) ----
+        if (!wifi_link_up(nif)) {
             cyw43_arch_wifi_connect_async(g_netcfg.ssid, g_netcfg.pass, CYW43_AUTH_WPA2_AES_PSK);
-            for (int i = 0; i < 200; i++) {        // ~20 s, polled
+            for (int i = 0; i < 200; i++) {        // ~20 s, polled (HB kept fresh)
                 WIFI_HB();
                 if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) < 0) break;  // join failed -> retry
-                if (!ip4_addr_isany(netif_ip4_addr(nif))) break;        // got an IP
+                if (wifi_link_up(nif)) break;                                        // associated + IP
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
-            if (ip4_addr_isany(netif_ip4_addr(nif))) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+            if (!wifi_link_up(nif)) {
+                // Persistent failure -> the radio may be wedged. Reset just the CYW43
+                // (deinit/reinit reloads its firmware), MCU keeps running. No power-cycle.
+                if (++join_fails >= 5) {
+                    cyw43_arch_deinit(); vTaskDelay(pdMS_TO_TICKS(200));
+                    if (cyw43_arch_init() == 0) { cyw43_arch_enable_sta_mode(); wifi_no_powersave(); }
+                    join_fails = 0;
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            join_fails = 0;
+            wifi_no_powersave();   // re-assert after a (re)join
         }
 
         // ---- dial the zenoh-agent ----
@@ -664,6 +689,7 @@ static void wifi_uplink_task(void *arg) {
         bool link_ok = true;
         while (link_ok) {
             WIFI_HB();
+            if (!wifi_link_up(nif)) break;   // WiFi dropped under us -> back to the supervisor
             // Drain TX first so the banner/replies go out before we block on recv.
             LOCK();
             host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), true);
