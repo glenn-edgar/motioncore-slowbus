@@ -2,11 +2,68 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-06-26**. Branch: **`samd21-namespace-db`** (clean + pushed).
-**★RESUME HERE:** WiFi→zenoh — OBJECTIVE ACHIEVED + DEPLOYED: the BC talks WiFi to a zenoh
-container, HW-verified end-to-end (W1/W2/W3a/W3b.1/W3b.2 + WiFi hardening); router+agent run as
-managed containers on the Pi (`host/zenoh_agent/commission.sh`). WiFi ~66-100ms RTT, ~5-11
-msg/s serial. Next = follow-ons (disassoc field test, keep-alive, multi-net, pipelining). See WiFi section.★
+Last updated **2026-06-26 (EOD)**. Branch: **`samd21-namespace-db`** (clean + pushed).
+**★RESUME HERE: PICO 2 W PORT — step 5b = add an `il_parse_adc` arming path, then ADC/FFT/cepstrum
+spectral interlock conditions.** The Pico 2 W (RP2350) is a working DSP vibration node on the bus
+(3-channel 20kHz capture → FIR decimation → FFT/cepstrum) with the COMMON interlock engine live +
+the GP1 safety input driving the veto. Read the "PICO 2 W PORT" section just below. (Earlier major
+work this session, complete: WiFi dual-mode UDP/TCP transport + a GitHub credential remediation —
+see those sections.)★
+
+---
+
+## ★ PICO 2 W (RP2350) PORT — 2026-06-26 — steps 1–5 done; 5b = spectral conditions ★
+
+**Goal (Glenn):** a Pico 2 W (RP2350 + CYW43) **vibration/condition-monitoring** node on the SAME
+RS-485 bus, reusing the Pico firmware structure. master-OR-slave; fleet of ≥10. **Leave the RP2040
+`bus_controller` image ALONE** — too different. New app `app/vib_node`; **common interlock ENGINE,
+different MEASUREMENT** (spectral: FFT bins + cepstrum + I2C, not GPIO/raw-ADC).
+
+**DONE + HW-verified on a real Pico 2 W (all committed):**
+- **Build (`2f3bd34`):** CMake picks the FreeRTOS port from PICO_PLATFORM (rp2350→RP2350_ARM_NTZ).
+  Build Pico 2 W from a SEPARATE dir: `cmake -DPICO_BOARD=pico2_w -DPICO_PLATFORM=rp2350 -B build-pico2`.
+  RP2040 builds unchanged (default). Chassis boots SMP on RP2350.
+- **Pin map (`fcea2bc`) `port/rp2350/board.h`:** bus GP15/16 (matches Pico W harness); GP0 veto;
+  **GP1 interlock input (internal pull-up, active-low)**; GP2-4 plain GPIO; encoder A/B/Z GP6-8 (PIO);
+  20kHz PWM GP10; I2C0 GP12/13; SPI0 GP17-20; ADC0/1/2 GP26/27/28 (owned by the 20kHz subsystem).
+- **PHY (`66d5799`):** shared port .c (PIO RS-485 PHY) across RP2040/RP2350 via a per-board BOARD_DIR;
+  phy_test loopback 8/8 on RP2350.
+- **On the bus (`94c0c21`,`d033605`):** `app/vib_node` reuses node_role + shared core; commissioned
+  slave 0x09; echo round-trips zcli→zenoh→master→bus→Pico 2 W. **Pico 2 W commissioning:**
+  `cfg_image.lua --uid <UID> --chip 1 --variant 3 --addr 9 --flash-size 4194304 --family rp2350`
+  (chip 1=PICO2, 4MB→cfg base 0x103F0000, family rp2350 0xE48BFF59 — all REQUIRED).
+- **Measurement (4a-4c `1d3780e`,`74e36e9`,`27026d8`,`cf475f6`):** vendored CMSIS-DSP subset
+  (`vendor/cmsis_dsp`) + `port/rp2350/dsp/` (spectral.c rfft+cepstrum SPEC_N=1024; pipeline.c FIR
+  decimation 20k→1k(/20)→100→10; adc_capture.c 20kHz×3ch PWM-locked). **All 3 channels run a full
+  instance-based pipeline** (pipeline_t per channel); band_acc uses Welford FLOAT (M33 single-prec
+  FPU — double was the overrun cause); adc ring 512. ovr=0, bss=249KB/520KB.
+- **Interlock (5a `189c193` + GP1 `40bf560`,`c7f7cc7`):** the COMMON `interlock.c` engine is linked
+  into vib_node with the `il_plat` seam (ADC channel → `pipeline_tap(g_pipe[ch],0,TAP_RMS)` band-0
+  broadband rms). il_tick_task prio4/core1. **GP1 safety input HW-verified:** built-in slot-0
+  interlock `gp1il;cfg[(gp1):in,up,(gp0):out];watch[gp1:1];out_ok[gp0:0];out_err[gp0:1]` — pull-up
+  holds gp1 HIGH=OK (no trip, veto gp0=0); a device pulling gp1 LOW trips → veto gp0=1.
+
+**★NEXT = STEP 5b (needs CODE):** ADC/FFT/cepstrum spectral THRESHOLD conditions. **CRASH LESSON
+(cost a BOOTSEL recovery today):** `interlock_set_slot_dsl` (the ilcN config arming) uses `il_parse`
+(GPIO/mixed), **NOT `il_parse_adc`** (ADC streams) — flashing an ilc1 with an ADC watch crashed
+vib_node at boot (reboot loop, wedged the USB port). So 5b = add an `il_parse_adc` arming path before
+ADC-stream conditions can be flashed; THEN fft_bin/cepstrum = ADDITIVE DSL source types in
+interlock_dsl.c (RP2040 unaffected). Also still TODO: build-config SPI device chain (vib-analysis |
+9DOF IMU — compile-time personality) + I2C sensor values (not on the bench).
+
+**BENCH (EOD):** Pico 2 W `91D72FE5666105D5` = vib_node + CLEAN idnt config (GP1 interlock only,
+armed=1, veto clear), on a NEW usb port (the old one wedged). Spare Pico 2 W `8DC20D34BFAD4581`.
+master Pico W `E6616408437D6628` (bus_controller_wifi) — got bounced into BOOTSEL by a stray
+`picotool -f` during recovery; should have rejoined WiFi — **verify with a `zcli ping`**. Pico W
+slave `E6605481DB611135` unplugged.
+
+**BUILD/FLASH/GOTCHAS:** build on the Pi (`ssh robot`, `/mnt/ssd/slow_bus`, `source
+/mnt/ssd/pico/env.sh`). `cmake --build build-pico2 --target vib_node`. Flash:
+`picotool reboot -u -f --ser <UID>` → BOOTSEL → `picotool load build-pico2/vib_node.uf2` →
+`reboot -a`. **ALWAYS pass `--ser <UID>` to picotool** (a bare `-f` bounced the master). Console:
+pyserial, `p.dtr=True`, capture THROUGH a fresh boot (stdio_usb flushes only after DTR + the banner
+prints at boot+2s). A crashed/wedged USB port may need BOOTSEL on a DIFFERENT physical port. The il
+HAL only records pin OWNERSHIP — vib_node sets input direction/pull itself (no hwio_apply).
 
 ---
 
