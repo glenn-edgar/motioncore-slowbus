@@ -25,8 +25,8 @@
 #include "hardware/irq.h"
 #include "hardware/clocks.h"
 
-#define RING       256u           // power of two; ~12 ms backlog at 20 kHz
-#define RING_MASK  (RING - 1u)
+#define RING       512u           // power of two; ~25 ms backlog at 20 kHz (absorbs
+#define RING_MASK  (RING - 1u)     // transient drain stalls, e.g. a debug printf)
 
 static volatile uint16_t s_ring[ADC_CAP_CH][RING];
 static volatile uint32_t s_head[ADC_CAP_CH], s_tail[ADC_CAP_CH];

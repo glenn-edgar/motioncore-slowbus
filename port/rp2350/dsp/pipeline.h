@@ -3,13 +3,15 @@
 #include <stdint.h>
 #include "spectral.h"
 
-// Multi-rate signal-processing pipeline (the SAMD21-ADC model, scaled to 44 kHz).
-// One top-rate sample stream feeds a linear-phase FIR DECIMATION CASCADE producing
-// band-limited streams at progressively lower rates; each band carries running
-// rms/avg/min/max published as a band_stat_t. slow_bus Pico 2 W feeds it the
-// 20 kHz center-captured ADC stream; the interlock keys off a slow band, the FFT
-// taps the top band. Single writer (core1); readers (core0 bench/supervisor) read
-// the published band_stat_t (gen bumps per update).
+// Multi-rate signal-processing pipeline. One top-rate sample stream feeds a
+// linear-phase FIR DECIMATION CASCADE producing band-limited streams at
+// progressively lower rates; each band carries running rms/avg/min/max published
+// as a band_stat_t. slow_bus Pico 2 W feeds it the 20 kHz center-captured ADC
+// stream; the interlock keys off a slow band, the FFT taps the top band.
+//
+// INSTANCE-BASED: one pipeline_t per ADC channel (3 channels each get the full
+// decimation + coarse/fine FFT + cepstrum + band stats). Single writer (core1
+// feeds all instances sequentially); readers (core0) read the published results.
 //
 //   band 0 = 20 kHz   (full band, Nyquist 10 kHz) -> FFT/cepstrum tap
 //   band 1 = 1 kHz    (/20)   Nyquist 500 Hz       -> fine FFT tap
@@ -25,19 +27,18 @@ typedef struct {
     uint16_t mn, mx;
 } band_stat_t;
 
-void pipeline_init(float top_fs_hz);     // top_fs_hz = band-0 rate (e.g. 20000)
-void pipeline_feed(uint16_t sample);     // one top-rate sample (core1)
-const band_stat_t *pipeline_band(int n); // 0..PIPE_BANDS-1, published stats
+typedef struct pipeline pipeline_t;             // opaque; allocated from a fixed pool
 
-// FFT/cepstrum streams: 0 = coarse (band 0, 20 kHz, 19.5 Hz bins @ N=1024),
-//                       1 = fine   (band 1,  1 kHz, ~1 Hz bins, low-freq detail).
-const spec_result_t *pipeline_spectral(int which);
+pipeline_t *pipeline_create(float top_fs_hz);   // one per channel; NULL if pool exhausted
+void        pipeline_feed(pipeline_t *p, uint16_t sample);     // one top-rate sample (core1)
+const band_stat_t   *pipeline_band(pipeline_t *p, int n);      // 0..PIPE_BANDS-1
+const spec_result_t *pipeline_spectral(pipeline_t *p, int which); // 0=coarse(20k) 1=fine(1k)
 
 // ---- measurement tap: (stream, metric) -> value ----------------------------
-// The uniform measurement surface the bench, the interlock supervisor (the
-// chain_tree seat), and the future I2C register bank all read.
+// The uniform measurement surface the interlock engine + the future I2C register
+// bank read.
 enum { TAP_DC = 0, TAP_RMS, TAP_MIN, TAP_MAX, TAP_NMETRIC };
-uint16_t    pipeline_tap(int band, int metric);   // band 0..PIPE_BANDS-1, metric TAP_*
+uint16_t    pipeline_tap(pipeline_t *p, int band, int metric);
 const char *pipeline_metric_name(int metric);     // "dc"/"rms"/"min"/"max"
 int         pipeline_metric_parse(const char *s); // name -> TAP_*, or -1
 

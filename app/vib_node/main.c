@@ -42,26 +42,30 @@
 // capture (the wrap ISR enables on THIS core) and, for now, reports the capture
 // rate + per-channel sample range so we can verify the front end on HW. The DSP
 // (decimation pipeline + FFT/cepstrum -> interlock scalars) wires in here next.
+static pipeline_t *g_pipe[ADC_CAP_CH];   // one full pipeline per ADC channel
+static void pipeline_selftest(pipeline_t *p);   // defined below (self-test section)
+
 static void measure_task(void *arg) {
     (void)arg;
-    adc_capture_init();                 // PWM-wrap ISR enables on core1 (this task)
-    pipeline_init(20000.0f);            // 20 kHz top rate -> bands 20k/1k/100/10
+    for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) g_pipe[ch] = pipeline_create(20000.0f);
+    pipeline_selftest(g_pipe[0]);       // 4c: synthetic decimation check (before live)
+    adc_capture_init();                 // start the live capture ISR on core1 (this task)
     TickType_t next = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
     for (;;) {
-        // ch0 -> the decimation+FFT pipeline. ch1/ch2 are drained for now (a
-        // per-channel pipeline / multi-instance is the next design decision).
+        // Every ADC channel runs its own full pipeline (decimation + coarse/fine
+        // FFT + cepstrum + band stats). core1 feeds the instances sequentially.
         uint16_t s;
-        while (adc_capture_pop(0, &s)) pipeline_feed(s);
-        while (adc_capture_pop(1, &s)) { /* drain */ }
-        while (adc_capture_pop(2, &s)) { /* drain */ }
+        for (int ch = 0; ch < (int)ADC_CAP_CH; ch++)
+            while (adc_capture_pop(ch, &s)) pipeline_feed(g_pipe[ch], s);
         if (xTaskGetTickCount() >= next) {
-            const spec_result_t *hi = pipeline_spectral(0);
-            int hi_hz = (int)((float)hi->peak_bin * hi->fs / (float)SPEC_N + 0.5f);
-            printf("[vib_node] ch0 live: b0 dc=%u rms=%u | b3(10Hz) dc=%u rms=%u | "
-                   "coarse peak=%dHz mag=%d | ovr=%u\n",
-                   pipeline_tap(0, TAP_DC), pipeline_tap(0, TAP_RMS),
-                   pipeline_tap(3, TAP_DC), pipeline_tap(3, TAP_RMS),
-                   hi_hz, (int)hi->peak_mag, (unsigned)adc_capture_overrun(0));
+            for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) {
+                const spec_result_t *hi = pipeline_spectral(g_pipe[ch], 0);
+                int hi_hz = (int)((float)hi->peak_bin * hi->fs / (float)SPEC_N + 0.5f);
+                printf("[vib_node] ch%d: b0 dc=%u rms=%u | b3 rms=%u | coarse peak=%dHz mag=%d | ovr=%u\n",
+                       ch, pipeline_tap(g_pipe[ch], 0, TAP_DC), pipeline_tap(g_pipe[ch], 0, TAP_RMS),
+                       pipeline_tap(g_pipe[ch], 3, TAP_RMS), hi_hz, (int)hi->peak_mag,
+                       (unsigned)adc_capture_overrun(ch));
+            }
             next += pdMS_TO_TICKS(2000);
         }
         vTaskDelay(1);
@@ -125,20 +129,19 @@ static void dsp_selftest(void) {
 // Feed a 200 Hz tone (below band-1's 500 Hz Nyquist, so it survives the /20
 // decimation). Expect the coarse FFT (band 0, 20 kHz) AND the fine FFT (band 1,
 // 1 kHz) to both peak at ~200 Hz, and the band rates to be 20k/1k/100/10.
-static void pipeline_selftest(void) {
+static void pipeline_selftest(pipeline_t *p) {
     const float fs = 20000.0f, f = 200.0f, w = 6.28318530718f / fs;
-    pipeline_init(fs);
     for (uint32_t n = 0; n < 90000u; n++) {   // enough for one fine-FFT publish (band1 @1kHz)
         float v = 2048.0f + 1200.0f * sinf(w * f * (float)n);
-        pipeline_feed((uint16_t)(v + 0.5f));
+        pipeline_feed(p, (uint16_t)(v + 0.5f));
     }
-    const spec_result_t *hi = pipeline_spectral(0), *lo = pipeline_spectral(1);
+    const spec_result_t *hi = pipeline_spectral(p, 0), *lo = pipeline_spectral(p, 1);
     int hi_hz = (int)((float)hi->peak_bin * hi->fs / (float)SPEC_N + 0.5f);
     int lo_hz = (int)((float)lo->peak_bin * lo->fs / (float)SPEC_N + 0.5f);
     printf("[vib_node] pipeline selftest: 200Hz -> coarse(b0) peak=%dHz  fine(b1) peak=%dHz "
            "(both ~200 expected)\n", hi_hz, lo_hz);
     for (int b = 0; b < PIPE_BANDS; b++) {
-        const band_stat_t *s = pipeline_band(b);
+        const band_stat_t *s = pipeline_band(p, b);
         printf("[vib_node]   band%d rate=%dHz dc=%u rms=%u gen=%u\n",
                b, (int)s->rate, s->avg, s->rms, (unsigned)s->gen);
     }
@@ -198,7 +201,7 @@ int main(void) {
         printf("[vib_node] master variant -- master path TBD; running node responder for now\n");
 
     dsp_selftest();        // 4a: prove the CMSIS-DSP FFT/cepstrum on RP2350
-    pipeline_selftest();   // 4c: prove the 20 kHz FIR decimation cascade
+    // 4c pipeline self-test runs inside measure_task (on a real instance, core1).
 
     // 3b.1: run the shared node responder (PHY + bus_node + scheduler). The
     // heartbeat task is created first so it runs once node_role_run starts the
