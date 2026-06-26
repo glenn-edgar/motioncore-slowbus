@@ -1,9 +1,10 @@
 // ============================================================================
-// pipeline.c -- 44 kHz -> 10 Hz LINEAR-PHASE FIR decimation cascade (CMSIS-DSP).
-// Replaces the boxcar/CIC-1 with arm_fir_decimate_f32: symmetric (linear-phase)
-// windowed-sinc anti-alias FIRs -> clean band separation. Multistage so each
-// filter stays short:  44k --/4--> 11k --/11--> 1k --/10--> 100 --/10--> 10 Hz.
-// Published bands: 0=44k 1=1k 2=100 3=10 (11k is an internal intermediate).
+// pipeline.c -- 20 kHz -> 10 Hz LINEAR-PHASE FIR decimation cascade (CMSIS-DSP).
+// arm_fir_decimate_f32: symmetric (linear-phase) windowed-sinc anti-alias FIRs
+// -> clean band separation. Multistage so each filter stays short (slow_bus Pico
+// 2 W, re-cut from the vendor's 44 kHz):
+//   20k --/4--> 5k --/5--> 1k --/10--> 100 --/10--> 10 Hz.
+// Published bands: 0=20k 1=1k 2=100 3=10 (5k is an internal intermediate).
 //
 // Block-based: band 0 (FFT + stats) runs per-sample (spread); the FIR cascade
 // runs once per BLK (100 ms) -- a few arm_fir_decimate calls. Single writer
@@ -16,38 +17,39 @@
 #include <math.h>
 #include <string.h>
 
-#define BLK      4400u            // 100 ms at 44 kHz; cascades cleanly /4 /11 /10 /10
-#define N_11K    (BLK / 4u)       // 1100
-#define N_1K     (N_11K / 11u)    // 100
+#define BLK      2000u            // 100 ms at 20 kHz; cascades cleanly /4 /5 /10 /10
+#define N_5K     (BLK / 4u)       // 500
+#define N_1K     (N_5K / 5u)      // 100
 #define N_100    (N_1K / 10u)     // 10
 #define N_10     (N_100 / 10u)    // 1
 
 // stats window per band (samples at that band's rate) -> ~100 ms (band 3 = 1 s)
-static const uint32_t WIN[PIPE_BANDS] = { 4400, 100, 10, 10 };
+static const uint32_t WIN[PIPE_BANDS] = { 2000, 100, 10, 10 };
 
 // --- FIR decimators + their state buffers (size = numTaps + blockSize - 1) ---
 static arm_fir_decimate_instance_f32 D1a, D1b, D2, D3;
 static float st_D1a[FIR_D1A_N + BLK    - 1];
-static float st_D1b[FIR_D1B_N + N_11K  - 1];
+static float st_D1b[FIR_D1B_N + N_5K   - 1];
 static float st_D2 [FIR_D2_N  + N_1K   - 1];
 static float st_D3 [FIR_D3_N  + N_100  - 1];
 
 // --- scratch (the cascade's per-stage output) ---
 static uint16_t g_blk[BLK]; static uint32_t g_bn;
-static float    f_in[BLK], f_11k[N_11K], f_1k[N_1K], f_100[N_100], f_10[N_10];
+static float    f_in[BLK], f_5k[N_5K], f_1k[N_1K], f_100[N_100], f_10[N_10];
 
 // --- per-band stat accumulators + published results ---
 typedef struct { uint32_t sn; double ssum, ssq; uint16_t smn, smx; } acc_t;
 static acc_t       g_acc[PIPE_BANDS];
 static band_stat_t g_pub[PIPE_BANDS];
 
-// --- two FFT instances: coarse on band 0 (44 kHz, 172 Hz bins, 0-22 kHz) and
-//     fine on band 1 (1 kHz, 3.9 Hz bins, 0-500 Hz -- low-freq vibration). ---
+// --- two FFT instances: coarse on band 0 (20 kHz, 19.5 Hz bins, 0-10 kHz at
+//     N=1024) and fine on band 1 (1 kHz, ~1 Hz bins, 0-500 Hz -- low-freq
+//     vibration where bearing/gear faults live). ---
 static spectral_t  g_sp_hi, g_sp_lo;
 
 void pipeline_init(float top_fs_hz) {
     float r = top_fs_hz;
-    static const float RATE_DIV[PIPE_BANDS] = { 1.0f, 44.0f, 10.0f, 10.0f };
+    static const float RATE_DIV[PIPE_BANDS] = { 1.0f, 20.0f, 10.0f, 10.0f };
     for (int i = 0; i < PIPE_BANDS; i++) {
         if (i) r /= RATE_DIV[i];
         g_acc[i].sn = 0; g_acc[i].ssum = g_acc[i].ssq = 0.0; g_acc[i].smn = 4095; g_acc[i].smx = 0;
@@ -55,12 +57,12 @@ void pipeline_init(float top_fs_hz) {
         g_pub[i].avg = g_pub[i].rms = g_pub[i].mn = g_pub[i].mx = 0;
     }
     arm_fir_decimate_init_f32(&D1a, FIR_D1A_N, FIR_D1A_M, FIR_D1A_COEF, st_D1a, BLK);
-    arm_fir_decimate_init_f32(&D1b, FIR_D1B_N, FIR_D1B_M, FIR_D1B_COEF, st_D1b, N_11K);
+    arm_fir_decimate_init_f32(&D1b, FIR_D1B_N, FIR_D1B_M, FIR_D1B_COEF, st_D1b, N_5K);
     arm_fir_decimate_init_f32(&D2,  FIR_D2_N,  FIR_D2_M,  FIR_D2_COEF,  st_D2,  N_1K);
     arm_fir_decimate_init_f32(&D3,  FIR_D3_N,  FIR_D3_M,  FIR_D3_COEF,  st_D3,  N_100);
     g_bn = 0;
-    spectral_init(&g_sp_hi, top_fs_hz);              // coarse FFT on band 0 (44 kHz)
-    spectral_init(&g_sp_lo, top_fs_hz / 44.0f);      // fine FFT on band 1 (1 kHz)
+    spectral_init(&g_sp_hi, top_fs_hz);              // coarse FFT on band 0 (20 kHz)
+    spectral_init(&g_sp_lo, top_fs_hz / 20.0f);      // fine FFT on band 1 (1 kHz)
 }
 
 const spec_result_t *pipeline_spectral(int which) {  // 0 = hi/band0, 1 = lo/band1
@@ -84,11 +86,11 @@ static void band_acc(int i, float x) {
     }
 }
 
-// the FIR cascade: one 100 ms block of 44 kHz input -> bands 1/2/3.
+// the FIR cascade: one 100 ms block of 20 kHz input -> bands 1/2/3.
 static void run_cascade(void) {
     for (uint32_t j = 0; j < BLK; j++) f_in[j] = (float)g_blk[j];
-    arm_fir_decimate_f32(&D1a, f_in,  f_11k, BLK);    // 44k -> 11k
-    arm_fir_decimate_f32(&D1b, f_11k, f_1k,  N_11K);  // 11k -> 1k  (band 1)
+    arm_fir_decimate_f32(&D1a, f_in,  f_5k, BLK);     // 20k -> 5k
+    arm_fir_decimate_f32(&D1b, f_5k,  f_1k, N_5K);    // 5k  -> 1k  (band 1)
     for (uint32_t j = 0; j < N_1K;  j++) {
         band_acc(1, f_1k[j]);
         float v = f_1k[j]; uint16_t u = (v < 0) ? 0 : (v > 65535.0f ? 65535 : (uint16_t)(v + 0.5f));

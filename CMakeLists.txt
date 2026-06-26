@@ -274,6 +274,7 @@ add_executable(vib_node
     ${CORE_DIR}/bus_frame.c
     ${CORE_DIR}/bus_crc8.c
     ${DSP_DIR}/spectral.c
+    ${DSP_DIR}/pipeline.c
     ${CMAKE_CURRENT_LIST_DIR}/port/rp2350/adc_capture.c
     ${CMSIS_DSP_SRCS}
     ${PORT_SRCS})

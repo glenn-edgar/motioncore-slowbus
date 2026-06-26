@@ -31,6 +31,7 @@
 #include <math.h>
 #include "spectral.h"        // CMSIS-DSP rfft + cepstrum (vendored, M33 DSP ext)
 #include "adc_capture.h"     // 20kHz x3ch PWM-locked ADC front end
+#include "pipeline.h"        // FIR decimation cascade + FFT/cepstrum taps
 
 // SHELL_* status (mirrors app/bus_controller/main.c; only the ones we use here).
 #define SHELL_OK         0u
@@ -44,24 +45,23 @@
 static void measure_task(void *arg) {
     (void)arg;
     adc_capture_init();                 // PWM-wrap ISR enables on core1 (this task)
-    uint32_t last[ADC_CAP_CH] = {0};
-    uint16_t mn[ADC_CAP_CH] = {4095, 4095, 4095}, mx[ADC_CAP_CH] = {0, 0, 0};
+    pipeline_init(20000.0f);            // 20 kHz top rate -> bands 20k/1k/100/10
     TickType_t next = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
     for (;;) {
-        // Drain continuously so the ring never overflows (256 deep = ~13 ms @ 20 kHz);
-        // a 1 ms wake leaves wide margin. Track per-channel range between reports.
-        for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) {
-            uint16_t s;
-            while (adc_capture_pop(ch, &s)) { if (s < mn[ch]) mn[ch] = s; if (s > mx[ch]) mx[ch] = s; }
-        }
+        // ch0 -> the decimation+FFT pipeline. ch1/ch2 are drained for now (a
+        // per-channel pipeline / multi-instance is the next design decision).
+        uint16_t s;
+        while (adc_capture_pop(0, &s)) pipeline_feed(s);
+        while (adc_capture_pop(1, &s)) { /* drain */ }
+        while (adc_capture_pop(2, &s)) { /* drain */ }
         if (xTaskGetTickCount() >= next) {
-            for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) {
-                uint32_t c = adc_capture_count(ch);
-                printf("[vib_node] adc ch%d: %u/s  min=%u max=%u  ovr=%u\n",
-                       ch, (unsigned)((c - last[ch]) / 2u),
-                       (unsigned)mn[ch], (unsigned)mx[ch], (unsigned)adc_capture_overrun(ch));
-                last[ch] = c; mn[ch] = 4095; mx[ch] = 0;
-            }
+            const spec_result_t *hi = pipeline_spectral(0);
+            int hi_hz = (int)((float)hi->peak_bin * hi->fs / (float)SPEC_N + 0.5f);
+            printf("[vib_node] ch0 live: b0 dc=%u rms=%u | b3(10Hz) dc=%u rms=%u | "
+                   "coarse peak=%dHz mag=%d | ovr=%u\n",
+                   pipeline_tap(0, TAP_DC), pipeline_tap(0, TAP_RMS),
+                   pipeline_tap(3, TAP_DC), pipeline_tap(3, TAP_RMS),
+                   hi_hz, (int)hi->peak_mag, (unsigned)adc_capture_overrun(0));
             next += pdMS_TO_TICKS(2000);
         }
         vTaskDelay(1);
@@ -121,6 +121,29 @@ static void dsp_selftest(void) {
            (unsigned)SPEC_N, r->peak_bin, peak_hz, r->q_bin, q_hz, (unsigned)r->gen);
 }
 
+// ---- pipeline self-test (4c): prove the 20 kHz FIR decimation cascade --------
+// Feed a 200 Hz tone (below band-1's 500 Hz Nyquist, so it survives the /20
+// decimation). Expect the coarse FFT (band 0, 20 kHz) AND the fine FFT (band 1,
+// 1 kHz) to both peak at ~200 Hz, and the band rates to be 20k/1k/100/10.
+static void pipeline_selftest(void) {
+    const float fs = 20000.0f, f = 200.0f, w = 6.28318530718f / fs;
+    pipeline_init(fs);
+    for (uint32_t n = 0; n < 90000u; n++) {   // enough for one fine-FFT publish (band1 @1kHz)
+        float v = 2048.0f + 1200.0f * sinf(w * f * (float)n);
+        pipeline_feed((uint16_t)(v + 0.5f));
+    }
+    const spec_result_t *hi = pipeline_spectral(0), *lo = pipeline_spectral(1);
+    int hi_hz = (int)((float)hi->peak_bin * hi->fs / (float)SPEC_N + 0.5f);
+    int lo_hz = (int)((float)lo->peak_bin * lo->fs / (float)SPEC_N + 0.5f);
+    printf("[vib_node] pipeline selftest: 200Hz -> coarse(b0) peak=%dHz  fine(b1) peak=%dHz "
+           "(both ~200 expected)\n", hi_hz, lo_hz);
+    for (int b = 0; b < PIPE_BANDS; b++) {
+        const band_stat_t *s = pipeline_band(b);
+        printf("[vib_node]   band%d rate=%dHz dc=%u rms=%u gen=%u\n",
+               b, (int)s->rate, s->avg, s->rms, (unsigned)s->gen);
+    }
+}
+
 // ---- liveness beacon (3b.1: confirm the node stays up on RP2350) -----------
 static void heartbeat_task(void *arg) {
     (void)arg;
@@ -174,7 +197,8 @@ int main(void) {
     else if (variant_is_master(ident.variant))
         printf("[vib_node] master variant -- master path TBD; running node responder for now\n");
 
-    dsp_selftest();   // 4a: prove the vendored CMSIS-DSP FFT/cepstrum on RP2350
+    dsp_selftest();        // 4a: prove the CMSIS-DSP FFT/cepstrum on RP2350
+    pipeline_selftest();   // 4c: prove the 20 kHz FIR decimation cascade
 
     // 3b.1: run the shared node responder (PHY + bus_node + scheduler). The
     // heartbeat task is created first so it runs once node_role_run starts the
