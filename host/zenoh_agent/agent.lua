@@ -27,6 +27,11 @@ local TCP_PORT = tonumber(env("TCP_PORT", "47447"))
 local KEY      = env("RPC_KEY", "slow_bus/bc/cmd")
 local POLL_S   = (tonumber(env("POLL_MS", "5")) or 5) / 1000
 local EXEC_TO  = (tonumber(env("EXEC_MS", "2500")) or 2500) / 1000
+-- Agent-side keepalive (SAMD51 lesson): when idle, ping the BC every KEEPALIVE_S to keep
+-- the tunnel warm + detect a silently-dead link faster (a failed ping forces a re-accept).
+-- Safe on the Pico W (CYW43); on the RTL8720 a keepalive made the eRPC blip WORSE, so it
+-- was OFF there — tune per transport. 0 disables.
+local KEEPALIVE_S = tonumber(env("KEEPALIVE_S", "10")) or 10
 
 local function log(...) io.write("[slowbus-agent] ", ...); io.write("\n"); io.flush() end
 local function to_hex(s) return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end)) end
@@ -89,14 +94,20 @@ local q = srv:register(zt.hash(KEY), 32)
 srv:start()
 log(("zenoh %s locator=%s  serving '%s'"):format(MODE, table.concat(LOCATORS, ","), KEY))
 log("ready.")
+local last_act = os.time()
 while true do
     local req = q:poll()
     if req then
-        reply(req)
+        reply(req); last_act = os.time()
     elseif lk then
         -- Drain the BC's continuous REGISTER/HEARTBEAT frames so its TX buffer never
         -- fills (a full buffer makes the BC give up + re-dial, stranding our socket).
         pcall(function() lk:listen(POLL_S, function() end) end)
+        -- Keepalive: ping the BC if the link's been idle, to keep it warm + detect death.
+        if KEEPALIVE_S > 0 and (os.time() - last_act) >= KEEPALIVE_S then
+            pcall(dev_exec, pl.ADDR_APPCORE, pl.CMD_MON_PING, "")   -- failure -> dev_exec re-accepts
+            last_act = os.time()
+        end
     else
         pl.sleep(POLL_S)
     end
