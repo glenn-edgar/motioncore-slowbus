@@ -2,8 +2,9 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-06-24**. Branch: **`samd21-namespace-db`** (clean + pushed).
-**★RESUME HERE tomorrow:** WiFi→zenoh uplink, step **W2** — see the next section.★
+Last updated **2026-06-25**. Branch: **`samd21-namespace-db`** (clean + pushed).
+**★RESUME HERE:** WiFi→zenoh uplink — W1/W2a/W2b/W2c all DONE+HW-verified; next = **W3**
+(the real zenoh-agent). See the WiFi section.★
 
 ---
 
@@ -44,20 +45,38 @@ WiFi creds + agent endpoint in a new read-only config-FS file, flashed separatel
 - Verified locally (CBOR hand-decodes correct: `a5` map v/ss/pw/ip-bytes/pt; firmware builds
   + links). On-HW boot-banner check folds into W2 (needs a config reflash anyway).
 
-### W2 — NEXT: firmware WiFi+TCP uplink (`bus_controller_wifi`, the big piece)
-Bring up CYW43 + lwIP: join the `neti` AP, dial the agent at `neti` ip:port, stream the same
-libcomm frames `uplink_task` emits. Scaffolding exists: `port/rp2040/uplink_wifi_proxy.c`
-(SKELETON, all TODOs — `bus_uplink.h` seam) + CMake `WIFI=1` → `pico_cyw43_arch_lwip_sys_freertos`,
-`PICO_BOARD=pico_w`.
-- **GOTCHA (two codebases):** the `bus_uplink.h` seam is wired into the OLD `core/bus_sched.c`
-  skeleton, **NOT** the current `app/bus_controller/main.c` (which uses `host_link`/libcomm over
-  USB-CDC directly in `uplink_task`). So W2 = add CYW43/lwIP/TCP into main.c's `uplink_task`
-  (or integrate the seam). Keep USB-CDC for flashing/console in the wifi build.
-- **Design Qs for Glenn (W2 start):** (1) keep USB path for console + add WiFi as the frame
-  transport — OK? (2) to flash `neti` without guessing the bench interlock DSL: `picotool save`
-  the config region, append `neti`, reflash the full set.
-- **Watch:** firmware size with CYW43+lwIP (~100KB+); `bus_controller.uf2` was ~414→464 KB
-  even at W1 (likely UF2-block overhead — confirm real `.bin`/`arm-none-eabi-size` at W2).
+### W2 — firmware WiFi+TCP uplink — DONE + HW-VERIFIED (2026-06-25)
+host_link is transport-agnostic, so WiFi = feed/drain it over a TCP socket instead of USB.
+- **ENV (one-time, Pi SDK):** wireless submodules were uninitialized → `cd ~/pico/pico-sdk &&
+  git submodule update --init --recursive lib/cyw43-driver lib/lwip` + fresh cmake configure.
+- **W2a** (`296f3c5`): `app/wifi_test/` smoke target + `port/rp2040/lwipopts.h`. Pico W joins
+  `WIFI_SSID_REDACTED` from `neti`, DHCP `192.168.1.205`. (Also HW-confirms W1: `neti rc=0`.)
+- **W2b** (`de5b9dd`): lwIP TCP client echo round-trip over WiFi.
+- **W2c** (`90fc2b9`): **`bus_controller_wifi`** target (CMake `BC_SRCS` + `define_bus_controller()`
+  builds USB + WiFi images; proven `bus_controller` unchanged). `main.c` `#ifdef UPLINK_WIFI`
+  `wifi_uplink_task`: POLLED async join (HB_UPLINK kept fresh ⇒ 4s watchdog safe), blocking
+  dial, host_link feed/drain over the socket. HW: stable TCP conn, BC streams correctly-framed
+  libcomm `OP_REGISTER` (UID `e661..`, class `0x5E589000`) over WiFi; `-f` reflash works
+  (no USB-reset wedge, unlike wifi_test).
+- **HW gotchas (W2):** lwip non-blocking-connect+select didn't detect completion → blocking
+  connect; this lwIP reports SO_RCVTIMEO timeout as **recv()==0** → don't break on n==0 (treat
+  recv<=0 as no-data; a failed write detects a dead link); need `LWIP_SO_RCVTIMEO=1`; BC
+  force-includes a **printf-stub** so USB printf debug is a no-op in that image; wifi_test (the
+  smoke build) could wedge the USB-reset during a 20s blocking join (needs physical BOOTSEL) —
+  bus_controller_wifi's polled join avoids that. Persistent Pi servers via **tmux**
+  (`new-session -d ... </dev/null >/dev/null 2>&1`; plain `&` over ssh gets swallowed).
+
+### W3 — NEXT: host zenoh-agent + container (the operational round-trip)
+Port `~/xiao_blocks/host/zenoh_agent/` (agent.lua + vendor/zenoh + Dockerfile) →
+`slow_bus/host/zenoh_agent/`, TCP mode (`DEVICE=tcp:47447`), map slow_bus appcore/bus commands
+to a zenoh key. Run `eclipse/zenoh` router + the agent containers on the Pi (`/mnt/ssd`). The
+agent ACKs the BC's REGISTER (host_link → OPERATIONAL) and does command round-trips — the
+operational test a dumb echo/dump server can't do. End-to-end: zenoh client → router → agent
+→ WiFi → Pico W → reply. Then: harden re-dial/backoff; agent maps the chain-tree app echo +
+interlock commands.
+- **Bench state:** master is flashed **bus_controller_wifi** (on WiFi `192.168.1.205`, dialing
+  `192.168.1.66:47447`); config has `neti`. Restore the chain-tree/USB bench by flashing
+  `bus_controller` (USB) — full config incl `neti` saved at `/tmp/cfg_full.uf2` on the Pi.
 
 ### W3 — host zenoh-agent + container (later)
 Port `~/xiao_blocks/host/zenoh_agent/` (agent.lua + vendor/zenoh + Dockerfile) into
