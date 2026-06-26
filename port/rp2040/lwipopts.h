@@ -17,6 +17,8 @@
 // so full-duplex (separate reader/writer threads) isn't needed either.
 #define LWIP_NETCONN_SEM_PER_THREAD 0
 #define LWIP_NETCONN_FULLDUPLEX     0
+#define LWIP_SO_RCVTIMEO            1    // honor SO_RCVTIMEO (uplink loop relies on it)
+#define LWIP_SO_SNDTIMEO            1
 #define LWIP_TIMEVAL_PRIVATE        0    // use <sys/time.h> for struct timeval
 
 // ---- memory ----------------------------------------------------------------

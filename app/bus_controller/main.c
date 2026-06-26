@@ -60,6 +60,13 @@
 #include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
 #include "boot_hwio.h"       // read the frozen HIL pin-role map ('hwio' config file)
 #include "boot_netcfg.h"     // read WiFi creds + zenoh-agent endpoint ('neti' config file)
+#ifdef UPLINK_WIFI
+#include <errno.h>
+#include "pico/cyw43_arch.h" // CYW43 WiFi (UPLINK=wifi build only)
+#include "lwip/netif.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/sockets.h"
+#endif
 #include "boot_roster.h"     // read the master's slave roster ('slvr' config file)
 #include "interlock/interlock.h"  // Thread 2: ported SAMD21 interlock framework
 #include "interlock/il_hal.h"     //          + its pin HAL (platform seam below)
@@ -552,6 +559,7 @@ static void bc_load_cfg_roster(void) {
     g_poll_enabled = (g_roster_n > 0);   // a config roster -> poll immediately
 }
 
+#ifndef UPLINK_WIFI
 static void uplink_task(void *arg) {
     (void)arg;
     bool prev_conn = false;
@@ -586,6 +594,99 @@ static void uplink_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
+#endif // !UPLINK_WIFI
+
+#ifdef UPLINK_WIFI
+// ---- WiFi uplink (UPLINK=wifi): same host_link frame stream over TCP to the -----
+// Linux zenoh-agent instead of USB-CDC. host_link is transport-agnostic, so this is
+// the USB uplink_task with getchar/putchar swapped for lwip recv/send. EVERYTHING is
+// non-blocking/polled: the HW watchdog (4 s) gates on HB_UPLINK going stale >500 ms,
+// so the WiFi join (async + poll) and the agent connect (non-blocking + select) must
+// never block this task. USB-CDC stays enabled for flashing + the BOOTSEL reset path.
+#define WIFI_HB() do { g_hb[HB_UPLINK]++; g_hb_us[HB_UPLINK] = time_us_32(); } while (0)
+
+// Blocking TCP connect to the agent (fd>=0 connected, else -1). Same path wifi_test
+// proved; on this LAN it completes fast when the agent is up and fails fast (RST /
+// no-route) when it isn't, so it stays well inside the watchdog window. (A future
+// non-blocking+select variant can bound a silently-dropped SYN; not needed here.)
+static int wifi_dial(const netcfg_t *nc) {
+    int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = lwip_htons(nc->port);
+    a.sin_addr.s_addr = (uint32_t)nc->ip[0] | ((uint32_t)nc->ip[1] << 8) |
+                        ((uint32_t)nc->ip[2] << 16) | ((uint32_t)nc->ip[3] << 24);
+    WIFI_HB();
+    if (lwip_connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { lwip_close(fd); return -1; }
+    return fd;
+}
+
+static void wifi_uplink_task(void *arg) {
+    (void)arg;
+    WIFI_HB();
+    if (cyw43_arch_init() != 0) { for (;;) { WIFI_HB(); vTaskDelay(pdMS_TO_TICKS(200)); } }
+    cyw43_arch_enable_sta_mode();
+    struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+    g_host_connected = false;
+
+    for (;;) {
+        WIFI_HB();
+        if (!g_netcfg.present) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+
+        // ---- ensure joined (async connect + polled wait for an IP) ----
+        if (ip4_addr_isany(netif_ip4_addr(nif))) {
+            cyw43_arch_wifi_connect_async(g_netcfg.ssid, g_netcfg.pass, CYW43_AUTH_WPA2_AES_PSK);
+            for (int i = 0; i < 200; i++) {        // ~20 s, polled
+                WIFI_HB();
+                if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) < 0) break;  // join failed -> retry
+                if (!ip4_addr_isany(netif_ip4_addr(nif))) break;        // got an IP
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (ip4_addr_isany(netif_ip4_addr(nif))) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+        }
+
+        // ---- dial the zenoh-agent ----
+        int fd = wifi_dial(&g_netcfg);
+        if (fd < 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+        struct timeval rtv = { 0, 50000 };         // 50 ms recv timeout (bounds the loop block)
+        lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
+
+        // ---- connected: run host_link over the socket ----
+        LOCK();
+        host_link_reset_boot(&g_hl);
+        g_cmd_pending = false;
+        bc_load_cfg_roster();   // restore the commissioned roster on a fresh link
+        UNLOCK();
+        g_host_connected = true;
+        bc_emit_boot_banner();  // announce identity to the agent
+
+        uint8_t rx[128], out[256];
+        bool link_ok = true;
+        while (link_ok) {
+            WIFI_HB();
+            // Drain TX first so the banner/replies go out before we block on recv.
+            LOCK();
+            host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), true);
+            appcore_rep_t up;
+            while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)
+                (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
+            uint32_t m = host_link_tx_drain(&g_hl, out, sizeof out);
+            UNLOCK();
+            if (m && lwip_write(fd, out, m) < 0) { link_ok = false; break; }  // dead link -> re-dial
+            // RX. A recv timeout/no-data returns <=0 (this lwIP can report timeout as 0 OR
+            // -1/EWOULDBLOCK/ETIMEDOUT) — all mean "nothing this round", so keep looping; a
+            // genuinely dead socket is caught by the next write failing.
+            int n = lwip_recv(fd, rx, sizeof rx, 0);
+            if (n > 0) { LOCK(); for (int i = 0; i < n; i++) host_link_feed(&g_hl, rx[i]); UNLOCK(); }
+            else vTaskDelay(pdMS_TO_TICKS(5));   // avoid a tight spin if recv returns immediately
+        }
+
+        g_host_connected = false;
+        lwip_close(fd);
+        vTaskDelay(pdMS_TO_TICKS(500));   // re-dial after a brief pause
+    }
+}
+#endif // UPLINK_WIFI
 
 // ---- core1 application engine: the chain_tree KB0 (static-link) -------------
 // cfl_runtime_run is the forever loop = this thread's body. The RP2040 timer
@@ -1881,7 +1982,11 @@ int main(void) {
     // the tightest at ~360 B headroom and the chain_tree walker deepens with each
     // KB; FreeRTOS heap has the room. Watchdog stays at 2 KB (trivial loop).
     xTaskCreate(bus_control_task, "bus",    configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_bus);
+#ifdef UPLINK_WIFI
+    xTaskCreate(wifi_uplink_task, "uplink", configMINIMAL_STACK_SIZE * 12, NULL, 2, &t_up);
+#else
     xTaskCreate(uplink_task,      "uplink", configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_up);
+#endif
     xTaskCreate(app_engine_task,  "app",    configMINIMAL_STACK_SIZE * 8, NULL, 3, &t_app);
     xTaskCreate(watchdog_task,    "wd",     configMINIMAL_STACK_SIZE * 2, NULL, 1, &t_wd);
     xTaskCreate(servo_feeder_task,"servo",  configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL); // float; idle until a servo is configured

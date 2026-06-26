@@ -76,7 +76,7 @@ set(NODE_DIR ${CMAKE_CURRENT_LIST_DIR}/node)
 file(GLOB KB0_ENGINE_SRCS CONFIGURE_DEPENDS ${BC_DIR}/engine/src/*.c)
 file(GLOB KB0_INCR_SRCS   CONFIGURE_DEPENDS ${BC_DIR}/kb0/incr/*.c)
 
-add_executable(bus_controller
+set(BC_SRCS
     ${CMAKE_CURRENT_LIST_DIR}/app/bus_controller/main.c
     ${NODE_DIR}/boot_identity.c
     ${NODE_DIR}/boot_hwio.c          # frozen HIL pin-role map ('hwio' config file)
@@ -100,26 +100,42 @@ add_executable(bus_controller
     ${KB0_ENGINE_SRCS}
     ${KB0_INCR_SRCS}
     ${BC_DIR}/kb0/user_functions.c)
-pico_generate_pio_header(bus_controller ${PORT_DIR}/rs485.pio)
-pico_generate_pio_header(bus_controller ${PORT_DIR}/servo_bank.pio)          # 8-servo bank
-target_include_directories(bus_controller PRIVATE
-    ${COMMON_INC} ${NODE_DIR} ${NODE_DIR}/interlock ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
-    ${BC_DIR}/engine/include ${BC_DIR}/kb0/incr)
-target_compile_definitions(bus_controller PRIVATE
-    PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0 CFL_32BIT=1)
-# Force-include the printf-stub so the chain_tree runtime's diagnostics can't
-# corrupt the binary USB frame stream. -Wno-* keeps the vendored engine quiet.
-target_compile_options(bus_controller PRIVATE -Wall -Wextra -Wno-unused-parameter
-    $<$<COMPILE_LANGUAGE:C>:-include>
-    $<$<COMPILE_LANGUAGE:C>:${BC_DIR}/engine/cfl_embed_stubs.h>)
-target_link_options(bus_controller PRIVATE -Wl,--gc-sections)
-target_link_libraries(bus_controller
-    pico_stdlib pico_multicore hardware_watchdog hardware_flash pico_unique_id
-    hardware_pio hardware_clocks hardware_adc hardware_pwm hardware_i2c pico_i2c_slave pico_async_context_freertos
-    FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
-pico_enable_stdio_usb(bus_controller 1)
-pico_enable_stdio_uart(bus_controller 0)
-pico_add_extra_outputs(bus_controller)
+
+# One definition for both images. WIFI -> CYW43/lwIP + UPLINK_WIFI (host_link over TCP
+# to the zenoh-agent); without WIFI -> USB-CDC uplink + the plain async context.
+function(define_bus_controller name)
+    cmake_parse_arguments(A "WIFI" "" "" ${ARGN})
+    add_executable(${name} ${BC_SRCS})
+    pico_generate_pio_header(${name} ${PORT_DIR}/rs485.pio)
+    pico_generate_pio_header(${name} ${PORT_DIR}/servo_bank.pio)              # 8-servo bank
+    target_include_directories(${name} PRIVATE
+        ${COMMON_INC} ${NODE_DIR} ${NODE_DIR}/interlock ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
+        ${BC_DIR}/engine/include ${BC_DIR}/kb0/incr)
+    target_compile_definitions(${name} PRIVATE
+        PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0 CFL_32BIT=1)
+    # Force-include the printf-stub so the chain_tree runtime's diagnostics can't
+    # corrupt the binary USB frame stream. -Wno-* keeps the vendored engine quiet.
+    target_compile_options(${name} PRIVATE -Wall -Wextra -Wno-unused-parameter
+        $<$<COMPILE_LANGUAGE:C>:-include>
+        $<$<COMPILE_LANGUAGE:C>:${BC_DIR}/engine/cfl_embed_stubs.h>)
+    target_link_options(${name} PRIVATE -Wl,--gc-sections)
+    target_link_libraries(${name}
+        pico_stdlib pico_multicore hardware_watchdog hardware_flash pico_unique_id
+        hardware_pio hardware_clocks hardware_adc hardware_pwm hardware_i2c pico_i2c_slave
+        FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
+    if(A_WIFI)
+        target_link_libraries(${name} pico_cyw43_arch_lwip_sys_freertos)
+        target_compile_definitions(${name} PRIVATE UPLINK_WIFI=1)
+    else()
+        target_link_libraries(${name} pico_async_context_freertos)
+    endif()
+    pico_enable_stdio_usb(${name} 1)
+    pico_enable_stdio_uart(${name} 0)
+    pico_add_extra_outputs(${name})
+endfunction()
+
+define_bus_controller(bus_controller)            # USB-CDC uplink (proven)
+define_bus_controller(bus_controller_wifi WIFI)  # WiFi uplink to the zenoh-agent (W2c)
 # Opt-in i2c0->i2c1 loopback self-test (claims GP20/21 as i2c0 slave 0x42).
 # Configure with -DI2C_SELFTEST=ON to build it in.
 option(I2C_SELFTEST "i2c0->i2c1 loopback self-test fixture" OFF)
