@@ -244,6 +244,33 @@ pico_enable_stdio_uart(phy_test 0)
 pico_add_extra_outputs(phy_test)
 
 # ---------------------------------------------------------------------------
+# vib_node — Pico 2 W (RP2350) vibration/condition-monitoring node. NEW app that
+# reuses the shared bus core + node_role responder (bus_controller is untouched).
+# Build for Pico 2 W only:  cmake -DPICO_BOARD=pico2_w -DPICO_PLATFORM=rp2350
+# Step 3b.1 skeleton: echo responder + stub interlock/engine (measurement DSP +
+# common interlock engine land in later steps).
+# ---------------------------------------------------------------------------
+add_executable(vib_node
+    ${CMAKE_CURRENT_LIST_DIR}/app/vib_node/main.c
+    ${NODE_DIR}/node_role.c
+    ${NODE_DIR}/boot_identity.c
+    ${NODE_DIR}/cfg_file.c
+    ${CORE_DIR}/bus_node.c
+    ${CORE_DIR}/bus_frame.c
+    ${CORE_DIR}/bus_crc8.c
+    ${PORT_SRCS})
+pico_generate_pio_header(vib_node ${PORT_DIR}/rs485.pio)
+target_include_directories(vib_node PRIVATE ${COMMON_INC} ${NODE_DIR})
+target_compile_definitions(vib_node PRIVATE PICO_PRINTF_SUPPORT_FLOAT=0)
+target_compile_options(vib_node PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_link_libraries(vib_node
+    pico_stdlib pico_multicore hardware_pio hardware_watchdog hardware_flash
+    FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
+pico_enable_stdio_usb(vib_node 1)
+pico_enable_stdio_uart(vib_node 0)
+pico_add_extra_outputs(vib_node)
+
+# ---------------------------------------------------------------------------
 # 2-node bring-up: BC polls the SAMD21 slave (addr 3) on the real wire (RX=GP21).
 # ---------------------------------------------------------------------------
 add_executable(bus2_test
