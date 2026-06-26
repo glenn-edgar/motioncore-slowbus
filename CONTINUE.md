@@ -2,9 +2,10 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-06-25**. Branch: **`samd21-namespace-db`** (clean + pushed).
-**★RESUME HERE:** WiFi→zenoh uplink — W1/W2a/W2b/W2c all DONE+HW-verified; next = **W3**
-(the real zenoh-agent). See the WiFi section.★
+Last updated **2026-06-26**. Branch: **`samd21-namespace-db`** (clean + pushed).
+**★RESUME HERE:** WiFi→zenoh — OBJECTIVE ACHIEVED: the BC talks WiFi to a zenoh container,
+HW-verified end-to-end (W1/W2/W3a/W3b + WiFi hardening). Remaining = **W3b.2** (containerize
+the agent). See the WiFi section.★
 
 ---
 
@@ -66,7 +67,36 @@ host_link is transport-agnostic, so WiFi = feed/drain it over a TCP socket inste
   bus_controller_wifi's polled join avoids that. Persistent Pi servers via **tmux**
   (`new-session -d ... </dev/null >/dev/null 2>&1`; plain `&` over ssh gets swallowed).
 
-### W3 — NEXT: host zenoh-agent + container (the operational round-trip)
+### W3 — DONE + HW-VERIFIED (2026-06-26): the BC talks WiFi to a zenoh container
+**OBJECTIVE ACHIEVED.** Full path proven: `zcli → eclipse/zenoh router (Pi :46170) →
+slow_bus agent → WiFi → bus_controller_wifi → host_link/engine → reply`.
+- **W3a** (`7ede83a`): `picolink.listen_tcp` (TCP-server mode) + `pico_wifi_agent.lua` —
+  operational host_link round-trip over WiFi (the test the W2c dump server couldn't do).
+- **W3b.1** (`d84f6d0`): `host/zenoh_agent/agent.lua` (zenoh RPC server, key `slow_bus/bc/cmd`,
+  ops ping/app_echo/app_echo_to/il_status/il_clear/exec) + `zcli.lua` + vendored zenoh runtime
+  (`vendor/zenoh/`, aarch64 .so — `LD_LIBRARY_PATH=vendor/zenoh/lib`). Agent drains the BC's
+  REGISTER stream when idle so its TX buffer can't fill + force a re-dial.
+- **WiFi hardening** (`799c69c`): recovery ladder on `bus_controller_wifi` — power-save OFF,
+  link-status supervisor (rejoin on silent disassoc even if IP lingers), CYW43 chip-reinit
+  fallback (deinit/init), all watchdog-safe. Fixes the un-hardened hard-wedge (which dropped
+  USB+WiFi and needed a physical reset).
+- **HW results:** ping/app_echo/app_echo_to(9)/il_status all `status=0` via zenoh; stable over
+  5 idle-gapped rounds (~30s, no drop); agent kill+restart → BC auto re-dials + reconnects.
+- **Run it (Pi):** router = `docker run -d --name slowbus-zenoh-router --network=host --restart
+  unless-stopped eclipse/zenoh:latest -l tcp/0.0.0.0:46170 --no-multicast-scouting`; agent (in
+  tmux) = `LD_LIBRARY_PATH=vendor/zenoh/lib ZENOH_LOCATOR=tcp/127.0.0.1:46170 TCP_PORT=47447
+  RPC_KEY=slow_bus/bc/cmd luajit host/zenoh_agent/agent.lua`; test = `zcli.lua tcp/127.0.0.1:46170
+  slow_bus/bc/cmd '{"op":...}'`. Router on **:46170** (xiao's router owns :46169). BC dials :47447.
+- **GOTCHA (today):** the un-hardened W2c firmware can hard-wedge (USB enumeration gone) →
+  needs physical BOOTSEL (unplug → hold BOOTSEL → replug). The hardened build self-heals.
+
+### W3b.2 — NEXT: containerize the agent
+Currently the agent runs in tmux via luajit. Port the xiao_blocks Dockerfile + commission.sh
+to `host/zenoh_agent/` so router + agent come up as managed `--restart unless-stopped`
+containers on the Pi (debian+luajit+tini; copy vendor/zenoh + tools/commission/lua/picolink).
+Then: WiFi-recovery field test (force a real disassoc), host-side keep-alive, multi-net neti.
+
+### (W3 original plan, now done) host zenoh-agent + container
 Port `~/xiao_blocks/host/zenoh_agent/` (agent.lua + vendor/zenoh + Dockerfile) →
 `slow_bus/host/zenoh_agent/`, TCP mode (`DEVICE=tcp:47447`), map slow_bus appcore/bus commands
 to a zenoh key. Run `eclipse/zenoh` router + the agent containers on the Pi (`/mnt/ssd`). The
