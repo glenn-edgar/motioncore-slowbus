@@ -34,15 +34,23 @@ set(CORE_SRCS
     ${CORE_DIR}/bus_node.c
 )
 
-# --- RP2040 port (PHY + board glue) -----------------------------------------
-set(PORT_DIR ${CMAKE_CURRENT_LIST_DIR}/port/rp2040)
+# --- port layer: SHARED PHY/board .c (platform-agnostic PIO) + per-board header -
+# board.c / phy_pio_rs485.c / rs485.pio work on both RP2040 and RP2350 (PIO + SDK
+# clock APIs auto-adapt). Only board.h (pin map) + lwipopts.h are per-board.
+set(PORT_DIR ${CMAKE_CURRENT_LIST_DIR}/port/rp2040)        # shared port sources
+if(PICO_PLATFORM MATCHES "rp2350")
+    set(BOARD_DIR ${CMAKE_CURRENT_LIST_DIR}/port/rp2350)   # Pico 2 W board.h
+else()
+    set(BOARD_DIR ${PORT_DIR})                             # Pico W board.h
+endif()
 set(PORT_SRCS
     ${PORT_DIR}/board.c
     ${PORT_DIR}/phy_pio_rs485.c
 )
 
 set(LIBCOMM_DIR ${PORT_DIR}/vendor/libcomm)
-set(COMMON_INC ${CORE_DIR} ${PORT_DIR} ${CMAKE_CURRENT_LIST_DIR})
+# BOARD_DIR first so #include "board.h" resolves to the active board's pin map.
+set(COMMON_INC ${CORE_DIR} ${BOARD_DIR} ${PORT_DIR} ${CMAKE_CURRENT_LIST_DIR})
 
 # Helper: define a firmware image for a role with its own uplink + extra srcs.
 # WIFI=1 links the CYW43 stack (BC + UPLINK=wifi); slaves never set it.
@@ -219,15 +227,16 @@ chassis_image(chassis_stall      DEFS CHASSIS_STALL_TEST=1)       # WDT negative
 chassis_image(chassis_commission DEFS CHASSIS_COMMISSION_TEST=1)  # writes a test identity
 
 # ---------------------------------------------------------------------------
-# PIO PHY internal-loopback self-test (gating task): RX SM samples the TX pin
-# (PHY_RX_PIN=20=GP20) so the 9-bit PHY loops back on-chip, no external wiring.
+# PIO PHY internal-loopback self-test: PHY_RX_PIN=BUS_PIN_DI makes the RX SM
+# sample the TX pin on-chip, so the 9-bit PHY loops back with NO external wiring
+# (works on both RP2040 and RP2350 — board.h comes from BOARD_DIR).
 # ---------------------------------------------------------------------------
 add_executable(phy_test
     ${CMAKE_CURRENT_LIST_DIR}/app/phy_test/main.c
     ${PORT_DIR}/phy_pio_rs485.c)
 pico_generate_pio_header(phy_test ${PORT_DIR}/rs485.pio)
 target_include_directories(phy_test PRIVATE ${COMMON_INC})
-target_compile_definitions(phy_test PRIVATE PICO_PRINTF_SUPPORT_FLOAT=0)  # RX=BUS_PIN_RO(GP15): external GP16->GP15 jumper
+target_compile_definitions(phy_test PRIVATE PICO_PRINTF_SUPPORT_FLOAT=0 PHY_RX_PIN=BUS_PIN_DI)
 target_compile_options(phy_test PRIVATE -Wall -Wextra)
 target_link_libraries(phy_test pico_stdlib hardware_pio hardware_clocks)
 pico_enable_stdio_usb(phy_test 1)
