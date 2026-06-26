@@ -134,6 +134,13 @@ void node_thread2_start(void) {
     // (il_plat_adc_latest -> g_pipe). Empty pipelines read rms=0 until fed.
     for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) g_pipe[ch] = pipeline_create(20000.0f);
 
+    // Configure the GP1 interlock input HW: input + internal pull-up. The il HAL
+    // only records ownership (RP2040 relied on hwio_apply for pin direction/pull);
+    // vib_node has no hwio, so set the pull here. Safe = HIGH; pulled LOW -> trip.
+    gpio_init(INTERLOCK_IN_PIN);
+    gpio_set_dir(INTERLOCK_IN_PIN, GPIO_IN);
+    gpio_pull_up(INTERLOCK_IN_PIN);
+
     // Common interlock engine: warm-restore the armed set, re-arm from the flashed
     // ilc0..ilc9 config when it changed / on cold boot (same path as the RP2040 node).
     interlock_boot_decide();
@@ -150,12 +157,12 @@ void node_thread2_start(void) {
         }
         g_interlock_persist.cfg_fingerprint = fp;
     }
-    // Built-in GP1 high-Z interlock input (active-low), slot 0, ALWAYS armed via the
-    // COMMON engine: gp1 high = OK; a device pulling gp1 LOW fails the watch -> trips
-    // -> veto (gp0 high). This is the hardwired safety input (no ilcN needed).
+    // Built-in GP1 interlock input (internal PULL-UP, active-low), slot 0, ALWAYS
+    // armed via the COMMON engine: the pull-up holds gp1 HIGH = OK; a device pulling
+    // gp1 LOW fails the watch -> trips -> veto (gp0 high). Hardwired safety input.
     {
         static const char gp1_il[] =
-            "gp1il;cfg[(gp1):in,(gp0):out];watch[gp1:1];out_ok[gp0:0];out_err[gp0:1]";
+            "gp1il;cfg[(gp1):in,up,(gp0):out];watch[gp1:1];out_ok[gp0:0];out_err[gp0:1]";
         uint8_t err[3];
         interlock_disarm_slot(0);
         uint8_t st = interlock_set_slot_dsl(0, gp1_il, (uint16_t)(sizeof gp1_il - 1u), err);

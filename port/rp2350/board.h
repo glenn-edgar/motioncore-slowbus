@@ -28,10 +28,10 @@
 // --- interlock hard veto (GPIO, fail-safe) — Thread 2 owns it ---------------
 #define INTERLOCK_VETO_PIN 0u        // GP0 (header pin 1)
 
-// --- interlock INPUT (GP1, high-Z, ACTIVE-LOW) ------------------------------
-// GP1 is the dedicated interlock input: configured high-Z (no internal pull). The
-// SAFE state is HIGH (held by the external circuit); an external device that pulls
-// GP1 LOW trips the interlock -> veto (GP0). DSL: watch[gp1:1] (pass when high).
+// --- interlock INPUT (GP1, internal PULL-UP, ACTIVE-LOW) --------------------
+// GP1 is the dedicated interlock input with the INTERNAL PULL-UP enabled, so the
+// SAFE state is HIGH (the pull-up holds it high when idle); a device that pulls
+// GP1 LOW trips the interlock -> veto (GP0). DSL: cfg (gp1):in,up; watch[gp1:1].
 #define INTERLOCK_IN_PIN   1u        // GP1 (header pin 2)
 
 // --- plain GPIO block (3 regular digital I/O, GP2..GP4 = header pins 4/5/6) --
