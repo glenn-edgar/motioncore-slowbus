@@ -32,6 +32,14 @@
 #include "spectral.h"        // CMSIS-DSP rfft + cepstrum (vendored, M33 DSP ext)
 #include "adc_capture.h"     // 20kHz x3ch PWM-locked ADC front end
 #include "pipeline.h"        // FIR decimation cascade + FFT/cepstrum taps
+#include "interlock.h"       // Thread-2 common interlock engine + DSL
+#include "il_hal.h"          // pin HAL contract (il_plat_* seam below)
+#include "cfg_file.h"        // cfg_load (ilcN interlock config)
+
+// ---- symbols the shared interlock framework expects from the app ------------
+volatile uint16_t g_stack_hwm_bytes;   // stack telemetry (unused detail here)
+volatile uint32_t g_last_m2s_rx_ms;    // last master->slave rx ms (comms-loss source)
+extern interlock_persist_t g_interlock_persist;   // defined in interlock.c (.uninitialized_data)
 
 // SHELL_* status (mirrors app/bus_controller/main.c; only the ones we use here).
 #define SHELL_OK         0u
@@ -42,14 +50,11 @@
 // capture (the wrap ISR enables on THIS core) and, for now, reports the capture
 // rate + per-channel sample range so we can verify the front end on HW. The DSP
 // (decimation pipeline + FFT/cepstrum -> interlock scalars) wires in here next.
-static pipeline_t *g_pipe[ADC_CAP_CH];   // one full pipeline per ADC channel
-static void pipeline_selftest(pipeline_t *p);   // defined below (self-test section)
+static pipeline_t *g_pipe[ADC_CAP_CH];   // one full pipeline per channel (made in node_thread2_start)
 
 static void measure_task(void *arg) {
     (void)arg;
-    for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) g_pipe[ch] = pipeline_create(20000.0f);
-    pipeline_selftest(g_pipe[0]);       // 4c: synthetic decimation check (before live)
-    adc_capture_init();                 // start the live capture ISR on core1 (this task)
+    adc_capture_init();                 // start the live capture ISR on core1 (g_pipe already created)
     TickType_t next = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
     for (;;) {
         // Every ADC channel runs its own full pipeline (decimation + coarse/fine
@@ -72,14 +77,80 @@ static void measure_task(void *arg) {
     }
 }
 
+// ---- il_plat seam: the interlock's measurement + pin-capability surface -----
+// The Pico 2 W maps the 3 "ADC channels" to their pipeline BROADBAND AC-RMS
+// (band 0), so the EXISTING ADC-stream interlock conditions threshold vibration
+// level with no engine/DSL change (common engine, different measurement). Only
+// the plain GPIO (GP1..4) + the GP0 veto are bindable; bus/SPI/I2C/encoder/PWM/
+// ADC pins are reserved.
+bool il_plat_pin_reserved(uint8_t gpio) {
+    if (gpio == INTERLOCK_VETO_PIN) return false;                         // GP0 veto
+    if (gpio >= GPIO_BASE && gpio < GPIO_BASE + GPIO_COUNT) return false; // GP1..4
+    if (gpio >= ADC_PIN_CH0 && gpio <= ADC_PIN_CH2) return false;         // GP26..28
+    return true;
+}
+bool il_plat_pin_cap(uint8_t gpio, hal_pin_mode_t mode) {
+    if (mode == HAL_PIN_MODE_GPIO_OUT)
+        return gpio == INTERLOCK_VETO_PIN ||
+               (gpio >= GPIO_BASE && gpio < GPIO_BASE + GPIO_COUNT);
+    return gpio >= GPIO_BASE && gpio < GPIO_BASE + GPIO_COUNT;  // input modes: plain GPIO
+}
+uint8_t il_plat_adc_channel(uint8_t gpio) {
+    if (gpio == ADC_PIN_CH0) return 0;
+    if (gpio == ADC_PIN_CH1) return 1;
+    if (gpio == ADC_PIN_CH2) return 2;
+    return 0xFFu;
+}
+uint16_t il_plat_adc_latest(uint8_t ch) {   // "decimated ADC" = channel broadband AC-rms
+    return (ch < ADC_CAP_CH && g_pipe[ch]) ? pipeline_tap(g_pipe[ch], 0, TAP_RMS) : 0u;
+}
+
+// FNV-1a over the flashed ilc0..ilc9 config (re-arm when the config changes).
+static uint32_t interlock_cfg_fingerprint(void) {
+    uint32_t fp = 2166136261u;
+    for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
+        const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
+        uint8_t buf[CFG_FILE_MAX]; uint32_t len;
+        if (cfg_load(name, buf, sizeof buf, &len) != 0 || len == 0) continue;
+        fp = (fp ^ (uint32_t)(slot + 1)) * 16777619u;
+        for (uint32_t i = 0; i < len; i++) fp = (fp ^ buf[i]) * 16777619u;
+    }
+    return fp;
+}
+
+static void il_tick_task(void *arg) {
+    (void)arg;
+    for (;;) { interlock_tick_all(); vTaskDelay(pdMS_TO_TICKS(2)); }  // ~2 ms veto response
+}
+
 void node_thread2_start(void) {
-    // 4b: start the measurement task pinned to core1 (the DSP core). It calls
-    // adc_capture_init() itself so the PWM-wrap ISR + ADC reads run on core1,
-    // off the core0 bus responder. (The COMMON interlock engine wires in here in
-    // step 5, reading the DSP measurement scalars.)
-    TaskHandle_t t;
-    xTaskCreate(measure_task, "meas", configMINIMAL_STACK_SIZE * 4, NULL, 2, &t);
-    vTaskCoreAffinitySet(t, 1u << 1);   // core1
+    // Create the per-channel pipelines BEFORE the interlock can read them
+    // (il_plat_adc_latest -> g_pipe). Empty pipelines read rms=0 until fed.
+    for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) g_pipe[ch] = pipeline_create(20000.0f);
+
+    // Common interlock engine: warm-restore the armed set, re-arm from the flashed
+    // ilc0..ilc9 config when it changed / on cold boot (same path as the RP2040 node).
+    interlock_boot_decide();
+    interlock_warm_restore();
+    uint32_t fp = interlock_cfg_fingerprint();
+    if (fp != g_interlock_persist.cfg_fingerprint || interlock_armed_count() == 0) {
+        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) interlock_disarm_slot(slot);
+        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
+            const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
+            uint8_t buf[CFG_FILE_MAX]; uint32_t len; uint8_t err[3];
+            if (cfg_load(name, buf, sizeof buf, &len) != 0 || len == 0) continue;
+            (void)interlock_set_slot_dsl(slot, (const char *)buf, (uint16_t)len, err);
+        }
+        g_interlock_persist.cfg_fingerprint = fp;
+    }
+    printf("[vib_node] interlock: armed=%u slots (ADC ch -> band0 broadband rms)\n",
+           interlock_armed_count());
+
+    TaskHandle_t tm, ti;
+    xTaskCreate(measure_task, "meas", configMINIMAL_STACK_SIZE * 4, NULL, 2, &tm);
+    vTaskCoreAffinitySet(tm, 1u << 1);            // core1: the DSP
+    xTaskCreate(il_tick_task, "il",   configMINIMAL_STACK_SIZE * 4, NULL, 4, &ti);
+    vTaskCoreAffinitySet(ti, 1u << 1);            // core1, prio4 > engine: safety preempts app
 }
 void node_engine_start(void) {
     // TODO(step 3b/later): bring up the chain-tree engine (kbapp). No-op for now.
@@ -125,27 +196,8 @@ static void dsp_selftest(void) {
            (unsigned)SPEC_N, r->peak_bin, peak_hz, r->q_bin, q_hz, (unsigned)r->gen);
 }
 
-// ---- pipeline self-test (4c): prove the 20 kHz FIR decimation cascade --------
-// Feed a 200 Hz tone (below band-1's 500 Hz Nyquist, so it survives the /20
-// decimation). Expect the coarse FFT (band 0, 20 kHz) AND the fine FFT (band 1,
-// 1 kHz) to both peak at ~200 Hz, and the band rates to be 20k/1k/100/10.
-static void pipeline_selftest(pipeline_t *p) {
-    const float fs = 20000.0f, f = 200.0f, w = 6.28318530718f / fs;
-    for (uint32_t n = 0; n < 90000u; n++) {   // enough for one fine-FFT publish (band1 @1kHz)
-        float v = 2048.0f + 1200.0f * sinf(w * f * (float)n);
-        pipeline_feed(p, (uint16_t)(v + 0.5f));
-    }
-    const spec_result_t *hi = pipeline_spectral(p, 0), *lo = pipeline_spectral(p, 1);
-    int hi_hz = (int)((float)hi->peak_bin * hi->fs / (float)SPEC_N + 0.5f);
-    int lo_hz = (int)((float)lo->peak_bin * lo->fs / (float)SPEC_N + 0.5f);
-    printf("[vib_node] pipeline selftest: 200Hz -> coarse(b0) peak=%dHz  fine(b1) peak=%dHz "
-           "(both ~200 expected)\n", hi_hz, lo_hz);
-    for (int b = 0; b < PIPE_BANDS; b++) {
-        const band_stat_t *s = pipeline_band(p, b);
-        printf("[vib_node]   band%d rate=%dHz dc=%u rms=%u gen=%u\n",
-               b, (int)s->rate, s->avg, s->rms, (unsigned)s->gen);
-    }
-}
+// (pipeline decimation self-test lived here through 4c; removed now that the
+// pipeline is fed live by measure_task and read by the interlock.)
 
 // ---- liveness beacon (3b.1: confirm the node stays up on RP2350) -----------
 static void heartbeat_task(void *arg) {

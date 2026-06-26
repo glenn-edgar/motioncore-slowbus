@@ -270,6 +270,10 @@ add_executable(vib_node
     ${NODE_DIR}/node_role.c
     ${NODE_DIR}/boot_identity.c
     ${NODE_DIR}/cfg_file.c
+    ${NODE_DIR}/interlock/interlock.c       # Thread-2 COMMON interlock engine
+    ${NODE_DIR}/interlock/interlock_dsl.c   #           DSL parser ('ilcN' config)
+    ${NODE_DIR}/interlock/il_hal_rp2040.c   #           pin HAL (SDK gpio; works on RP2350)
+    ${NODE_DIR}/interlock/il_pin_table.c    #           DSL pin-name resolution
     ${CORE_DIR}/bus_node.c
     ${CORE_DIR}/bus_frame.c
     ${CORE_DIR}/bus_crc8.c
@@ -279,7 +283,7 @@ add_executable(vib_node
     ${CMSIS_DSP_SRCS}
     ${PORT_SRCS})
 pico_generate_pio_header(vib_node ${PORT_DIR}/rs485.pio)
-target_include_directories(vib_node PRIVATE ${COMMON_INC} ${NODE_DIR} ${DSP_DIR} ${CMSIS_DSP_DIR}/Include)
+target_include_directories(vib_node PRIVATE ${COMMON_INC} ${NODE_DIR} ${NODE_DIR}/interlock ${DSP_DIR} ${CMSIS_DSP_DIR}/Include)
 target_compile_definitions(vib_node PRIVATE PICO_PRINTF_SUPPORT_FLOAT=0)
 target_compile_options(vib_node PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(vib_node
