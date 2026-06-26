@@ -127,6 +127,22 @@ if(I2C_SELFTEST)
     target_compile_definitions(bus_controller PRIVATE I2C_SELFTEST)
 endif()
 
+# ---- W2a: standalone WiFi smoke test (CYW43 + lwIP join from 'neti') --------
+# De-risks the brand-new WiFi stack independent of the BC image. Text stdio over
+# USB-CDC. lwipopts.h lives in PORT_DIR (on COMMON_INC). Build: pi-build.sh wifi_test
+add_executable(wifi_test
+    ${CMAKE_CURRENT_LIST_DIR}/app/wifi_test/main.c
+    ${NODE_DIR}/boot_netcfg.c
+    ${NODE_DIR}/cfg_file.c
+    ${CORE_DIR}/bus_crc8.c)
+target_include_directories(wifi_test PRIVATE ${COMMON_INC} ${NODE_DIR})
+target_link_libraries(wifi_test
+    pico_stdlib pico_cyw43_arch_lwip_sys_freertos hardware_flash
+    FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
+pico_enable_stdio_usb(wifi_test 1)
+pico_enable_stdio_uart(wifi_test 0)
+pico_add_extra_outputs(wifi_test)
+
 # ---- Thread 2 (interlock) compile-check ------------------------------------
 # Builds the ported interlock module in ISOLATION so the main image stays green
 # while the port is staged. An OBJECT library (no link step), so the platform-
