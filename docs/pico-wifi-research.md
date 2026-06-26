@@ -25,8 +25,19 @@ FreeRTOS-SMP, lwIP BSD sockets, blocking TCP client, 4 s heartbeat watchdog.
 2. **Reconnect supervisor**: the CYW43 does NOT auto-reconnect after `CYW43_EV_DISASSOC`.
    Our re-dial loop rejoins only when there's no IP; also **rejoin on link-down even if
    the IP lingers** (poll `cyw43_wifi_link_status`/`cyw43_tcpip_link_status`). [#2316, #2153]
-3. **`TCPIP_THREAD_PRIO` > app task priority** in lwipopts (belt-and-suspenders). [#917]
-4. **SMP init fragility**: `cyw43_arch_init()` from inside a FreeRTOS task under SMP can
+3. **DO NOT raise `TCPIP_THREAD_PRIO`** (the #917 "belt-and-suspenders" tip is WRONG for
+   our safety architecture — it's the ESP32-style footgun). We use the async polled join,
+   so we don't need it. Keep `TCPIP_THREAD_PRIO` at the lwIP default (1) so it stays BELOW
+   the interlock (prio 4) and chain-tree engine (prio 3) — they always preempt it.
+4. **Core affinity is the real guarantee (the deferred "core-affinity thread-review").**
+   Interlock (4) + engine (3) are pinned to **core1**; our `wifi_uplink_task` (2) to
+   **core0**. The CYW43 worker defaults to **prio 4 (== interlock!)** but the SDK pins it
+   to whichever core ran `cyw43_arch_init()` — we init from the core0-pinned uplink task,
+   so it lands on **core0**, off the safety core. W3: (a) confirm/pin the lwIP **tcpip
+   thread** to core0 (default prio 1 makes it harmless even on core1, but pin for
+   airtightness); (b) the CYW43-worker==interlock prio tie is safe only because they're on
+   different cores — never let a WiFi thread onto core1 (or bump the interlock to 5).
+5. **SMP init fragility**: `cyw43_arch_init()` from inside a FreeRTOS task under SMP can
    hang at `multicore_fifo_pop_blocking` (#1718). Works for us; watch it. Respect
    `CYW43_TASK_PRIORITY` / be deliberate about init core/timing.
 

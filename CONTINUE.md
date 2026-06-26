@@ -78,10 +78,15 @@ interlock commands.
   our W2c async-join + recv≤0 handling):** (1) **disable WiFi power-save** after join —
   `cyw43_wifi_pm(&cyw43_state, CYW43_DEFAULT_PM & ~0xf)` (0xa11140); default PM silently
   disassociates while link status still says "connected". (2) reconnect supervisor must
-  rejoin on **link-down even if the IP lingers** (CYW43 never auto-reconnects). (3) set
-  `TCPIP_THREAD_PRIO` > app task prio in lwipopts. (4) SMP `cyw43_arch_init()`-from-task can
-  hang (#1718) — works for us, watch it. Pico2 W: FreeRTOS/RP2350 was submodule-only at
-  sdk 2.1.1; same cyw43 driver/behaviors as Pico W.
+  rejoin on **link-down even if the IP lingers** (CYW43 never auto-reconnects). (3) **do NOT
+  raise `TCPIP_THREAD_PRIO`** — keep it at lwIP default (1), BELOW the interlock (prio 4) +
+  engine (prio 3), so WiFi can't starve safety (the ESP32 footgun). Protection is **core
+  affinity**: interlock+engine on core1, WiFi (our uplink + the CYW43 worker, which
+  auto-pins to the core that ran cyw43_arch_init = our core0 uplink task) on core0. W3
+  core-affinity-review: confirm/pin the lwIP tcpip thread to core0; note CYW43 worker prio
+  = interlock prio (4), safe only because different cores. (4) SMP `cyw43_arch_init()`-from
+  -task can hang (#1718) — works for us, watch it. Pico2 W: FreeRTOS/RP2350 was
+  submodule-only at sdk 2.1.1; same cyw43 driver/behaviors as Pico W.
 - **Bench state:** master is flashed **bus_controller_wifi** (on WiFi `192.168.1.205`, dialing
   `192.168.1.66:47447`); config has `neti`. Restore the chain-tree/USB bench by flashing
   `bus_controller` (USB) — full config incl `neti` saved at `/tmp/cfg_full.uf2` on the Pi.
