@@ -12,9 +12,39 @@
 #include "pico/cyw43_arch.h"
 #include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/sockets.h"
+#include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
 #include "boot_netcfg.h"
+
+// W2b: dial the agent endpoint over TCP and round-trip a test string (proves the
+// lwIP BSD socket client works over WiFi). Pair with a TCP echo server on the Pi.
+static void tcp_echo_once(const netcfg_t *nc) {
+    int s = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { printf("[wifi_test] socket() failed\n"); return; }
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port   = lwip_htons(nc->port);
+    a.sin_addr.s_addr = (uint32_t)nc->ip[0] | ((uint32_t)nc->ip[1] << 8) |
+                        ((uint32_t)nc->ip[2] << 16) | ((uint32_t)nc->ip[3] << 24);
+    if (lwip_connect(s, (struct sockaddr *)&a, sizeof a) != 0) {
+        printf("[wifi_test] connect %u.%u.%u.%u:%u FAILED\n",
+               nc->ip[0], nc->ip[1], nc->ip[2], nc->ip[3], nc->port);
+        lwip_close(s); return;
+    }
+    static const char msg[] = "PING-over-wifi";
+    lwip_write(s, msg, sizeof msg - 1);
+    char buf[64]; int n = lwip_read(s, buf, sizeof buf - 1);
+    if (n > 0) {
+        buf[n] = 0;
+        printf("[wifi_test] TCP echo rx %d=\"%s\" %s\n", n, buf,
+               (n == (int)(sizeof msg - 1) && memcmp(buf, msg, n) == 0) ? "OK ✓" : "MISMATCH");
+    } else {
+        printf("[wifi_test] TCP read n=%d\n", n);
+    }
+    lwip_close(s);
+}
 
 static void wifi_task(void *arg) {
     (void)arg;
@@ -31,14 +61,19 @@ static void wifi_task(void *arg) {
     if (cyw43_arch_init()) { printf("[wifi_test] cyw43_arch_init FAILED\n"); for (;;) vTaskDelay(1000); }
     cyw43_arch_enable_sta_mode();
 
-    printf("[wifi_test] joining \"%s\" ...\n", nc.ssid);
-    int r = cyw43_arch_wifi_connect_timeout_ms(nc.ssid, nc.pass, CYW43_AUTH_WPA2_AES_PSK, 30000);
-    if (r) { printf("[wifi_test] connect FAILED rc=%d\n", r); for (;;) vTaskDelay(1000); }
+    int r = -1;
+    for (int attempt = 1; attempt <= 10 && r; attempt++) {
+        printf("[wifi_test] joining \"%s\" (attempt %d) ...\n", nc.ssid, attempt);
+        r = cyw43_arch_wifi_connect_timeout_ms(nc.ssid, nc.pass, CYW43_AUTH_WPA2_AES_PSK, 20000);
+        if (r) { printf("[wifi_test] join rc=%d, retrying\n", r); vTaskDelay(pdMS_TO_TICKS(2000)); }
+    }
+    if (r) { printf("[wifi_test] join gave up rc=%d\n", r); for (;;) vTaskDelay(1000); }
 
     struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+    printf("[wifi_test] JOINED \"%s\"  ip=%s  link=%d\n",
+           nc.ssid, ip4addr_ntoa(netif_ip4_addr(nif)), netif_is_link_up(nif));
     for (;;) {
-        printf("[wifi_test] JOINED \"%s\"  ip=%s  link=%d\n",
-               nc.ssid, ip4addr_ntoa(netif_ip4_addr(nif)), netif_is_link_up(nif));
+        tcp_echo_once(&nc);
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
