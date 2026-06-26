@@ -50,12 +50,21 @@ HTTP-client example **leaks a pbuf** (no `pbuf_free` in the recv cb) → ~`PBUF_
 requests then stalls — don't copy that pattern. [pico-examples #605]
 
 ## Pico 2 W / RP2350
-Same CYW43439 driver + behaviors as Pico W. FreeRTOS/RP2350 support was still in a
-**submodule** (not an official FreeRTOS-Kernel release) as of pico-sdk 2.1.1 → build
-FreeRTOS-Kernel from main + init submodules for the future Pico2 build. No confirmed
-unique RP2350 *WiFi* silicon bug in these reports (several such theories were refuted) —
-it's tooling maturity + shared-driver behavior. **pico-sdk 2.1.1** updated the cyw43
-driver to `c1075d4b` and "fixed a rare firmware-load issue" — be on ≥2.1.1.
+Same CYW43439 driver + behaviors as Pico W. No confirmed unique RP2350 *WiFi* silicon bug
+in these reports (several such theories were refuted) — it's tooling maturity + shared
+driver behavior. **pico-sdk 2.1.1** updated the cyw43 driver to `c1075d4b` and "fixed a
+rare firmware-load issue" — be on ≥2.1.1.
+
+**RP2350 dual-core FreeRTOS is ALREADY WORKING in `~/xiao_blocks/firmware/rp2350` (branch
+`pico2`)** — supersedes the research's "submodule-only/not-in-official-release" caveat for
+us. Reuse it for the Pico 2 W build:
+- `FreeRTOSConfig.h`: `configNUMBER_OF_CORES 2` + `configRUN_MULTIPLE_PRIORITIES 1` +
+  `configUSE_CORE_AFFINITY 1` (full SMP + affinity — what our interlock/engine pinning needs).
+- Kernel: **`RP2350_ARM_NTZ`** port — `include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/
+  GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake)`; `FREERTOS_KERNEL_PATH=~/pico/FreeRTOS-Kernel`
+  on the Pi already has the port. `PICO_PLATFORM=rp2350-arm-s`. Has a `bringup.uf2` SMP diag.
+- CAVEAT: XIAO RP2350 has **no CYW43/WiFi**. So this gives the RP2350 SMP FreeRTOS base only;
+  Pico 2 W WiFi = that base + our Pico W CYW43/lwIP work + `PICO_BOARD=pico2_w`.
 
 ## Unresolved (research couldn't pin; matches our experience)
 - Exact `recv()` SO_RCVTIMEO return (0 vs −1/EAGAIN/ETIMEDOUT) is version-dependent —
