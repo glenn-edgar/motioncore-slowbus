@@ -32,6 +32,14 @@ ffi.cdef [[
     struct timeval { long tv_sec; long tv_usec; };
     int  gettimeofday(struct timeval *tv, void *tz);
     int  usleep(unsigned int usec);
+    /* TCP server (agent mode): the BC dials in over WiFi, we accept + speak host_link. */
+    int  socket(int domain, int type, int protocol);
+    int  bind(int fd, const void *addr, unsigned addrlen);
+    int  listen(int fd, int backlog);
+    int  accept(int fd, void *addr, unsigned *addrlen);
+    int  setsockopt(int fd, int level, int optname, const void *optval, unsigned optlen);
+    unsigned short htons(unsigned short x);
+    struct sockaddr_in { short sin_family; unsigned short sin_port; unsigned int sin_addr; char sin_zero[8]; };
 ]]
 local C = ffi.C
 local O_RDWR, O_NOCTTY, O_NONBLOCK, TCSANOW, B115200, POLLIN = 0x0002, 0x100, 0x800, 0, 4098, 0x001
@@ -171,6 +179,36 @@ function M.open(port, timeout)
     tio.c_cc[6], tio.c_cc[5] = 0, 0   -- VMIN=0, VTIME=0: non-blocking reads, gated by poll()
     C.tcsetattr(fd, TCSANOW, tio)
     return setmetatable({ fd = fd, port = port, timeout = timeout or 1.0, seq = 0,
+                          req = math.floor(now_ms()) % 65536 }, Link)
+end
+
+-- Agent mode: listen on `port`, wait for the BC to dial in (over WiFi), accept ONE
+-- connection, and return a Link wrapping that socket. Same host_link codec as a serial
+-- Link, so exec()/listen() work unchanged. `accept_timeout` (s, default 30) bounds the wait.
+function M.listen_tcp(port, timeout, accept_timeout)
+    local AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR = 2, 1, 1, 2
+    local srv = C.socket(AF_INET, SOCK_STREAM, 0)
+    if srv < 0 then error("socket(): " .. ffi.string(C.strerror(ffi.errno()))) end
+    local one = ffi.new("int[1]", 1)
+    C.setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, one, ffi.sizeof("int"))
+    local a = ffi.new("struct sockaddr_in"); a.sin_family = AF_INET
+    a.sin_port = C.htons(port); a.sin_addr = 0   -- INADDR_ANY
+    if C.bind(srv, a, ffi.sizeof("struct sockaddr_in")) ~= 0 then
+        C.close(srv); error("bind(" .. port .. "): " .. ffi.string(C.strerror(ffi.errno())))
+    end
+    if C.listen(srv, 4) ~= 0 then C.close(srv); error("listen()") end
+    local pfd = ffi.new("struct pollfd[1]"); pfd[0].fd = srv; pfd[0].events = POLLIN
+    local deadline = now_ms() + (accept_timeout or 30) * 1000
+    local got = false
+    while now_ms() < deadline do
+        local left = math.max(0, math.floor(deadline - now_ms()))
+        if C.poll(pfd, 1, left) > 0 then got = true; break end
+    end
+    if not got then C.close(srv); error("listen_tcp: no BC dialed in within " .. (accept_timeout or 30) .. "s") end
+    local cli = C.accept(srv, nil, nil)
+    C.close(srv)   -- one-shot: stop accepting once the BC is connected
+    if cli < 0 then error("accept(): " .. ffi.string(C.strerror(ffi.errno()))) end
+    return setmetatable({ fd = cli, port = "tcp:" .. port, timeout = timeout or 2.0, seq = 0,
                           req = math.floor(now_ms()) % 65536 }, Link)
 end
 
