@@ -97,7 +97,8 @@ while i <= #arg do
     elseif a == "--ssid"       then opt.ssid = nextval()        -- neti: WiFi AP SSID (-> 'neti' file)
     elseif a == "--pass"       then opt.pass = nextval()        -- neti: WiFi AP passphrase ("" = open)
     elseif a == "--agent-ip"   then opt.agent_ip = nextval()    -- neti: zenoh-agent IPv4 "a.b.c.d"
-    elseif a == "--agent-port" then opt.agent_port = tonumber(nextval())  -- neti: zenoh-agent TCP port
+    elseif a == "--agent-port" then opt.agent_port = tonumber(nextval())  -- neti: zenoh-agent port
+    elseif a == "--transport"  then opt.transport = nextval()             -- neti: uplink transport "udp"(default)|"tcp"
     else error("unknown arg: " .. a) end
     i = i + 1
 end
@@ -213,7 +214,10 @@ end
 -- flashed UF2, never in source/git.
 local neti_desc = ""
 if opt.ssid then
-    local nm = { v = 1, ss = opt.ssid, pw = opt.pass or "" }
+    local tp = (opt.transport == "tcp") and 1 or 0   -- default 0 = UDP
+    assert(not opt.transport or opt.transport == "udp" or opt.transport == "tcp",
+           "--transport wants udp|tcp: " .. tostring(opt.transport))
+    local nm = { v = 1, ss = opt.ssid, pw = opt.pass or "", tp = tp }
     if opt.agent_ip then
         local o = {}
         for b in opt.agent_ip:gmatch("(%d+)") do o[#o + 1] = tonumber(b) end
@@ -228,9 +232,10 @@ if opt.ssid then
     local neti = cbor.encode(nm)
     assert(#neti <= STORE_DATA_MAX, "neti CBOR too big: " .. #neti .. " B (>" .. STORE_DATA_MAX .. ")")
     entries[#entries + 1] = { name = "neti", data = neti }
-    neti_desc = (" + neti{ssid=%q%s%s}"):format(opt.ssid,
+    neti_desc = (" + neti{ssid=%q%s%s,tp=%s}"):format(opt.ssid,
         opt.agent_ip and (",ip=" .. opt.agent_ip) or "",
-        opt.agent_port and (":" .. opt.agent_port) or "")
+        opt.agent_port and (":" .. opt.agent_port) or "",
+        (tp == 1) and "tcp" or "udp")
 end
 
 -- ---- entries -> rows -> multi-block UF2 ------------------------------------

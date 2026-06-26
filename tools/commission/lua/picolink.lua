@@ -37,6 +37,8 @@ ffi.cdef [[
     int  bind(int fd, const void *addr, unsigned addrlen);
     int  listen(int fd, int backlog);
     int  accept(int fd, void *addr, unsigned *addrlen);
+    int  connect(int fd, const void *addr, unsigned addrlen);
+    long recvfrom(int fd, void *buf, unsigned long n, int flags, void *addr, unsigned *addrlen);
     int  setsockopt(int fd, int level, int optname, const void *optval, unsigned optlen);
     unsigned short htons(unsigned short x);
     struct sockaddr_in { short sin_family; unsigned short sin_port; unsigned int sin_addr; char sin_zero[8]; };
@@ -209,6 +211,39 @@ function M.listen_tcp(port, timeout, accept_timeout)
     C.close(srv)   -- one-shot: stop accepting once the BC is connected
     if cli < 0 then error("accept(): " .. ffi.string(C.strerror(ffi.errno()))) end
     return setmetatable({ fd = cli, port = "tcp:" .. port, timeout = timeout or 2.0, seq = 0,
+                          req = math.floor(now_ms()) % 65536 }, Link)
+end
+
+-- Agent mode, UDP: bind `port`, wait for the BC's first datagram to learn its address,
+-- connect() the socket to it (so the Link's read/write target the BC), and return a Link.
+-- Connectionless: no accept/re-dial — if the BC's addr changes, the caller re-opens.
+function M.recv_udp(port, timeout, accept_timeout)
+    local AF_INET, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR = 2, 2, 1, 2
+    local fd = C.socket(AF_INET, SOCK_DGRAM, 0)
+    if fd < 0 then error("socket(udp): " .. ffi.string(C.strerror(ffi.errno()))) end
+    local one = ffi.new("int[1]", 1)
+    C.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, ffi.sizeof("int"))
+    local a = ffi.new("struct sockaddr_in"); a.sin_family = AF_INET
+    a.sin_port = C.htons(port); a.sin_addr = 0   -- INADDR_ANY
+    if C.bind(fd, a, ffi.sizeof("struct sockaddr_in")) ~= 0 then
+        C.close(fd); error("bind(udp " .. port .. "): " .. ffi.string(C.strerror(ffi.errno())))
+    end
+    local pfd = ffi.new("struct pollfd[1]"); pfd[0].fd = fd; pfd[0].events = POLLIN
+    local deadline = now_ms() + (accept_timeout or 30) * 1000
+    local got = false
+    while now_ms() < deadline do
+        local left = math.max(0, math.floor(deadline - now_ms()))
+        if C.poll(pfd, 1, left) > 0 then got = true; break end
+    end
+    if not got then C.close(fd); error("recv_udp: no datagram within " .. (accept_timeout or 30) .. "s") end
+    local peer = ffi.new("struct sockaddr_in")
+    local plen = ffi.new("unsigned int[1]", ffi.sizeof("struct sockaddr_in"))
+    local tmp  = ffi.new("uint8_t[256]")
+    C.recvfrom(fd, tmp, 256, 0, peer, plen)       -- learn the BC addr (this datagram is discarded)
+    if C.connect(fd, peer, ffi.sizeof("struct sockaddr_in")) ~= 0 then
+        C.close(fd); error("connect(udp peer): " .. ffi.string(C.strerror(ffi.errno())))
+    end
+    return setmetatable({ fd = fd, port = "udp:" .. port, timeout = timeout or 2.0, seq = 0,
                           req = math.floor(now_ms()) % 65536 }, Link)
 end
 

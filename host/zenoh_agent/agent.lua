@@ -23,7 +23,8 @@ local function env(k, d) local v = os.getenv(k); if v == nil or v == "" then ret
 local LOCATORS = {}
 for s in (env("ZENOH_LOCATOR", "tcp/127.0.0.1:46169")):gmatch("[^,]+") do LOCATORS[#LOCATORS+1] = s end
 local MODE     = env("ZENOH_MODE", "client")
-local TCP_PORT = tonumber(env("TCP_PORT", "47447"))
+local TCP_PORT  = tonumber(env("TCP_PORT", "47447"))   -- port the BC connects to (TCP or UDP)
+local TRANSPORT = env("TRANSPORT", "udp")              -- must match the BC's neti.tp (udp default)
 local KEY      = env("RPC_KEY", "slow_bus/bc/cmd")
 local POLL_S   = (tonumber(env("POLL_MS", "5")) or 5) / 1000
 local EXEC_TO  = (tonumber(env("EXEC_MS", "2500")) or 2500) / 1000
@@ -41,8 +42,9 @@ local function from_hex(h) h = h or ""; return (h:gsub("%x%x", function(b) retur
 local lk
 local function bc_accept()
     if lk then pcall(function() lk:close() end); lk = nil end
-    log(("waiting for the BC to dial in on tcp/%d ..."):format(TCP_PORT))
-    lk = pl.listen_tcp(TCP_PORT, EXEC_TO, 86400)   -- block until the BC connects
+    log(("waiting for the BC (%s) on port %d ..."):format(TRANSPORT, TCP_PORT))
+    if TRANSPORT == "tcp" then lk = pl.listen_tcp(TCP_PORT, EXEC_TO, 86400)
+    else                       lk = pl.recv_udp(TCP_PORT, EXEC_TO, 86400) end  -- udp = default
     log("BC connected.")
 end
 -- exec with one re-accept on transport failure (BC re-dial after a WiFi blip).

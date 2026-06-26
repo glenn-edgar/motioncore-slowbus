@@ -29,11 +29,16 @@ enum {
     NETI_ERR_SCHEMA  = -3,   // schema_ver mismatch
 };
 
+// Uplink transport to the zenoh-agent. DEFAULT (field absent) = UDP: connectionless,
+// no dial/re-dial churn; req/reply is made reliable by host_link's req_id+timeout.
+enum { NETI_TP_UDP = 0, NETI_TP_TCP = 1 };
+
 typedef struct {
     char     ssid[NETI_SSID_MAX];   // AP SSID (required)
     char     pass[NETI_PASS_MAX];   // AP passphrase ("" = open)
     uint8_t  ip[4];                 // zenoh-agent IPv4 (a.b.c.d); 0.0.0.0 if absent
-    uint16_t port;                  // zenoh-agent TCP port; 0 if absent
+    uint16_t port;                  // zenoh-agent port; 0 if absent
+    uint8_t  transport;             // NETI_TP_UDP (0, default) or NETI_TP_TCP (1)
     uint8_t  present;               // 1 if a valid 'neti' was loaded
 } netcfg_t;
 

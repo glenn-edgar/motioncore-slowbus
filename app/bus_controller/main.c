@@ -632,6 +632,60 @@ static bool wifi_link_up(struct netif *nif) {
 // reads "connected" (pico-sdk #2153). NO_POWERSAVE (CYW43_DEFAULT_PM & ~0xf) stops it.
 static void wifi_no_powersave(void) { cyw43_wifi_pm(&cyw43_state, CYW43_DEFAULT_PM & ~0xfu); }
 
+// UDP transport (neti default): connectionless. connect() just sets the default peer on
+// lwIP (no handshake), so the shared serve loop's send/recv work unchanged AND there's no
+// dial/re-dial to fail or wedge. fd>=0, or -1. SLIP framing tolerates datagram boundaries.
+static int wifi_udp_open(const netcfg_t *nc) {
+    int fd = lwip_socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = lwip_htons(nc->port);
+    a.sin_addr.s_addr = (uint32_t)nc->ip[0] | ((uint32_t)nc->ip[1] << 8) |
+                        ((uint32_t)nc->ip[2] << 16) | ((uint32_t)nc->ip[3] << 24);
+    if (lwip_connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { lwip_close(fd); return -1; }
+    return fd;
+}
+
+// Run host_link over a connected socket (TCP or UDP — identical once connected) until the
+// link drops, then close. Shared by both transports; only the socket-open differs.
+static void wifi_serve(int fd, struct netif *nif) {
+    struct timeval rtv = { 0, 50000 };         // 50 ms recv timeout (bounds the loop block)
+    lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
+    LOCK();
+    host_link_reset_boot(&g_hl);
+    g_cmd_pending = false;
+    bc_load_cfg_roster();   // restore the commissioned roster on a fresh link
+    UNLOCK();
+    g_host_connected = true;
+    bc_emit_boot_banner();  // announce identity to the agent
+
+    uint8_t rx[128], out[256];
+    bool link_ok = true;
+    while (link_ok) {
+        WIFI_HB();
+        if (!wifi_link_up(nif)) break;   // WiFi dropped under us -> back to the supervisor
+        // Drain TX first so the banner/replies go out before we block on recv.
+        LOCK();
+        host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), true);
+        appcore_rep_t up;
+        while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)
+            (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
+        uint32_t m = host_link_tx_drain(&g_hl, out, sizeof out);
+        UNLOCK();
+        if (m && lwip_write(fd, out, m) < 0) { link_ok = false; break; }  // dead link
+        // RX: MSG_DONTWAIT makes recv return immediately when there's no data (this lwIP
+        // does NOT honor SO_RCVTIMEO on the UDP recvmbox — a blocking recv there hangs the
+        // task >4 s and the HW watchdog reboots us, the UDP-mode reboot loop). Per-call
+        // non-blocking keeps writes blocking, so a transient EWOULDBLOCK can't false-break.
+        // <=0 (timeout/no-data/EWOULDBLOCK) all mean "nothing this round"; keep looping.
+        int n = lwip_recv(fd, rx, sizeof rx, MSG_DONTWAIT);
+        if (n > 0) { LOCK(); for (int i = 0; i < n; i++) host_link_feed(&g_hl, rx[i]); UNLOCK(); }
+        else vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    g_host_connected = false;
+    lwip_close(fd);
+}
+
 static void wifi_uplink_task(void *arg) {
     (void)arg;
     WIFI_HB();
@@ -670,46 +724,12 @@ static void wifi_uplink_task(void *arg) {
             wifi_no_powersave();   // re-assert after a (re)join
         }
 
-        // ---- dial the zenoh-agent ----
-        int fd = wifi_dial(&g_netcfg);
+        // ---- connect to the agent + serve host_link (UDP default; TCP if neti.tp=TCP) ----
+        int fd = (g_netcfg.transport == NETI_TP_TCP) ? wifi_dial(&g_netcfg)
+                                                     : wifi_udp_open(&g_netcfg);
         if (fd < 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
-        struct timeval rtv = { 0, 50000 };         // 50 ms recv timeout (bounds the loop block)
-        lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
-
-        // ---- connected: run host_link over the socket ----
-        LOCK();
-        host_link_reset_boot(&g_hl);
-        g_cmd_pending = false;
-        bc_load_cfg_roster();   // restore the commissioned roster on a fresh link
-        UNLOCK();
-        g_host_connected = true;
-        bc_emit_boot_banner();  // announce identity to the agent
-
-        uint8_t rx[128], out[256];
-        bool link_ok = true;
-        while (link_ok) {
-            WIFI_HB();
-            if (!wifi_link_up(nif)) break;   // WiFi dropped under us -> back to the supervisor
-            // Drain TX first so the banner/replies go out before we block on recv.
-            LOCK();
-            host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), true);
-            appcore_rep_t up;
-            while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)
-                (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
-            uint32_t m = host_link_tx_drain(&g_hl, out, sizeof out);
-            UNLOCK();
-            if (m && lwip_write(fd, out, m) < 0) { link_ok = false; break; }  // dead link -> re-dial
-            // RX. A recv timeout/no-data returns <=0 (this lwIP can report timeout as 0 OR
-            // -1/EWOULDBLOCK/ETIMEDOUT) — all mean "nothing this round", so keep looping; a
-            // genuinely dead socket is caught by the next write failing.
-            int n = lwip_recv(fd, rx, sizeof rx, 0);
-            if (n > 0) { LOCK(); for (int i = 0; i < n; i++) host_link_feed(&g_hl, rx[i]); UNLOCK(); }
-            else vTaskDelay(pdMS_TO_TICKS(5));   // avoid a tight spin if recv returns immediately
-        }
-
-        g_host_connected = false;
-        lwip_close(fd);
-        vTaskDelay(pdMS_TO_TICKS(500));   // re-dial after a brief pause
+        wifi_serve(fd, nif);   // runs until the link drops, then closes fd
+        vTaskDelay(pdMS_TO_TICKS(500));   // brief pause before reconnecting
     }
 }
 #endif // UPLINK_WIFI

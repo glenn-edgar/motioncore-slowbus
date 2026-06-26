@@ -50,6 +50,9 @@ int boot_read_netcfg(netcfg_t *out) {
         } else if (CBOR_KEY(k, kn, "pt")) {
             uint64_t p; if (!cbor_uint(&c, &p)) return NETI_ERR_FORMAT;
             out->port = (uint16_t)p;
+        } else if (CBOR_KEY(k, kn, "tp")) {
+            uint64_t t; if (!cbor_uint(&c, &t)) return NETI_ERR_FORMAT;
+            out->transport = (uint8_t)t;        // 0=UDP (default), 1=TCP
         } else if (!cbor_skip(&c)) {
             return NETI_ERR_FORMAT;                           // unknown key -> fwd-compat
         }

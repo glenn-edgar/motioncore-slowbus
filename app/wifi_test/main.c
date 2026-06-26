@@ -46,6 +46,36 @@ static void tcp_echo_once(const netcfg_t *nc) {
     lwip_close(s);
 }
 
+// UDP probe: mirrors the bus_controller UDP path with per-call prints, so a blocking
+// lwIP call freezes the console at its line (no watchdog here to mask it).
+static void udp_echo_once(const netcfg_t *nc) {
+    printf("[udp] socket()...\n");
+    int s = lwip_socket(AF_INET, SOCK_DGRAM, 0);
+    printf("[udp] socket -> %d\n", s);
+    if (s < 0) return;
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port   = lwip_htons(nc->port);
+    a.sin_addr.s_addr = (uint32_t)nc->ip[0] | ((uint32_t)nc->ip[1] << 8) |
+                        ((uint32_t)nc->ip[2] << 16) | ((uint32_t)nc->ip[3] << 24);
+    printf("[udp] connect %u.%u.%u.%u:%u ...\n", nc->ip[0],nc->ip[1],nc->ip[2],nc->ip[3],nc->port);
+    int rc = lwip_connect(s, (struct sockaddr *)&a, sizeof a);
+    printf("[udp] connect -> %d\n", rc);
+    if (rc != 0) { lwip_close(s); return; }
+    static const char msg[] = "UDP-over-wifi";
+    printf("[udp] write %u ...\n", (unsigned)(sizeof msg - 1));
+    int w = lwip_write(s, msg, sizeof msg - 1);
+    printf("[udp] write -> %d\n", w);
+    for (int i = 0; i < 20; i++) {        // poll ~1s for the echo, non-blocking
+        char buf[64];
+        int n = lwip_recv(s, buf, sizeof buf - 1, MSG_DONTWAIT);
+        if (n > 0) { buf[n] = 0; printf("[udp] recv %d=\"%s\" OK\n", n, buf); break; }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    lwip_close(s);
+    printf("[udp] closed\n");
+}
+
 static void wifi_task(void *arg) {
     (void)arg;
     // Give the USB-CDC console a moment to enumerate so the first lines aren't lost.
@@ -73,7 +103,7 @@ static void wifi_task(void *arg) {
     printf("[wifi_test] JOINED \"%s\"  ip=%s  link=%d\n",
            nc.ssid, ip4addr_ntoa(netif_ip4_addr(nif)), netif_is_link_up(nif));
     for (;;) {
-        tcp_echo_once(&nc);
+        udp_echo_once(&nc);
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }

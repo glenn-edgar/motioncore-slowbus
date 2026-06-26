@@ -31,9 +31,9 @@ so this is "the same frames over WiFi."
 
 **Glenn's answers (2026-06-24):** (1) proxy model — yes. (2) agent on the **Pi** (`robot`,
 `/mnt/ssd`, container) — location flexible, Pi preferred. (3) agent not written — port from
-xiao_blocks. (4) WiFi creds via the secondary-flash config file; SSID **`WIFI_SSID_REDACTED`** /
-pass **`WIFI_PASS_REDACTED`** — **NEVER commit these** (cfg_image.lua CLI args only). Agent/zenoh TCP
-port = a random configurable number unused by existing containers.
+xiao_blocks. (4) WiFi creds via the secondary-flash config file — **NEVER commit these**
+(cfg_image.lua CLI args only; SSID/pass live out-of-band). Agent/zenoh TCP port = a random
+configurable number unused by existing containers.
 
 ### W1 — 'neti' config file (secondary flash) — DONE + committed `785866a`
 WiFi creds + agent endpoint in a new read-only config-FS file, flashed separately.
@@ -52,7 +52,7 @@ host_link is transport-agnostic, so WiFi = feed/drain it over a TCP socket inste
 - **ENV (one-time, Pi SDK):** wireless submodules were uninitialized → `cd ~/pico/pico-sdk &&
   git submodule update --init --recursive lib/cyw43-driver lib/lwip` + fresh cmake configure.
 - **W2a** (`296f3c5`): `app/wifi_test/` smoke target + `port/rp2040/lwipopts.h`. Pico W joins
-  `WIFI_SSID_REDACTED` from `neti`, DHCP `192.168.1.205`. (Also HW-confirms W1: `neti rc=0`.)
+  the AP from `neti`, DHCP `192.168.1.205`. (Also HW-confirms W1: `neti rc=0`.)
 - **W2b** (`de5b9dd`): lwIP TCP client echo round-trip over WiFi.
 - **W2c** (`90fc2b9`): **`bus_controller_wifi`** target (CMake `BC_SRCS` + `define_bus_controller()`
   builds USB + WiFi images; proven `bus_controller` unchanged). `main.c` `#ifdef UPLINK_WIFI`

@@ -57,6 +57,9 @@
 #define TCPIP_THREAD_STACKSIZE      1024
 #define DEFAULT_THREAD_STACKSIZE    1024
 #define DEFAULT_RAW_RECVMBOX_SIZE   8
+#define DEFAULT_UDP_RECVMBOX_SIZE   8    // REQUIRED for UDP sockets: lwIP defaults this to 0,
+                                         // and sys_mbox_new(0) panics ("size > 0") the instant a
+                                         // SOCK_DGRAM netconn is created. (TCP worked via _TCP_.)
 #define TCPIP_MBOX_SIZE             8
 #define DEFAULT_TCP_RECVMBOX_SIZE   8
 #define DEFAULT_ACCEPTMBOX_SIZE     8
