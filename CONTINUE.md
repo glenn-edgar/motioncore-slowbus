@@ -3,9 +3,10 @@
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
 Last updated **2026-06-26**. Branch: **`samd21-namespace-db`** (clean + pushed).
-**★RESUME HERE:** WiFi→zenoh — OBJECTIVE ACHIEVED: the BC talks WiFi to a zenoh container,
-HW-verified end-to-end (W1/W2/W3a/W3b + WiFi hardening). Remaining = **W3b.2** (containerize
-the agent). See the WiFi section.★
+**★RESUME HERE:** WiFi→zenoh — OBJECTIVE ACHIEVED + DEPLOYED: the BC talks WiFi to a zenoh
+container, HW-verified end-to-end (W1/W2/W3a/W3b.1/W3b.2 + WiFi hardening); router+agent run as
+managed containers on the Pi (`host/zenoh_agent/commission.sh`). WiFi ~66-100ms RTT, ~5-11
+msg/s serial. Next = follow-ons (disassoc field test, keep-alive, multi-net, pipelining). See WiFi section.★
 
 ---
 
@@ -90,11 +91,23 @@ slow_bus agent → WiFi → bus_controller_wifi → host_link/engine → reply`.
 - **GOTCHA (today):** the un-hardened W2c firmware can hard-wedge (USB enumeration gone) →
   needs physical BOOTSEL (unplug → hold BOOTSEL → replug). The hardened build self-heals.
 
-### W3b.2 — NEXT: containerize the agent
-Currently the agent runs in tmux via luajit. Port the xiao_blocks Dockerfile + commission.sh
-to `host/zenoh_agent/` so router + agent come up as managed `--restart unless-stopped`
-containers on the Pi (debian+luajit+tini; copy vendor/zenoh + tools/commission/lua/picolink).
-Then: WiFi-recovery field test (force a real disassoc), host-side keep-alive, multi-net neti.
+### W3b.2 — DONE + HW-VERIFIED (2026-06-26): containerized
+`host/zenoh_agent/{Dockerfile,commission.sh}` (`b251c48`) — router (eclipse/zenoh :46170) +
+agent (`slow_bus/zenoh-agent:dev`) run as `--restart unless-stopped` containers. Build on the
+Pi: `commission.sh build`; run: `commission.sh up` (also down/status/logs). HW: BC connects to
+the containerized agent over WiFi; ping/app_echo/app_echo_to all status=0; stress 100/100 ok.
+
+### WiFi stress (2026-06-26, `host/zenoh_agent/zstress.lua`, full zenoh path, serial)
+Latency **WiFi-RTT-dominated**: ~66 ms floor, ~90–100 ms typical (engine/bus/zenoh add little
+— app_echo ≈ app_echo_to). **~5–11 msg/s serial** (= 1/latency); occasional ~0–2% timeouts the
+hardening recovers from (no hangs over ~750 msgs). For more throughput: pipeline (multiple
+in-flight) — host_link is currently serial (one req_id at a time).
+
+### W3 follow-ons (NEXT)
+- **Real-disassoc recovery field test** (force a WiFi drop, confirm auto-rejoin, no reset).
+- **Host-side keep-alive** (agent pings the BC ~12s — SAMD51 lesson).
+- **Multi-network `neti`** (ordered ssid/pass list).
+- **Pipelining** for throughput (multiple in-flight req_ids).
 
 ### (W3 original plan, now done) host zenoh-agent + container
 Port `~/xiao_blocks/host/zenoh_agent/` (agent.lua + vendor/zenoh + Dockerfile) →
