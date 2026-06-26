@@ -66,6 +66,48 @@ us. Reuse it for the Pico 2 W build:
 - CAVEAT: XIAO RP2350 has **no CYW43/WiFi**. So this gives the RP2350 SMP FreeRTOS base only;
   Pico 2 W WiFi = that base + our Pico W CYW43/lwIP work + `PICO_BOARD=pico2_w`.
 
+## Recovery ladder — no physical reset (W3) + SAMD51 prior-art
+Why the Pico beats a bare ESP32: the **CYW43439 is a separate chip** (SPI/PIO), so a wedged
+radio is reset in SOFTWARE (`cyw43_arch_deinit()` + `cyw43_arch_init()` reloads the CYW43
+firmware) without an MCU reboot or human power-cycle. Build the WiFi supervisor as a ladder:
+
+1. **Rejoin (software):** poll `cyw43_tcpip_link_status`; on link-down, async rejoin. Rejoin
+   on **link-down even if the IP lingers** (CYW43 never auto-reconnects). Handles common drops.
+2. **Radio chip-reset:** after N failed rejoins (grace window), `cyw43_arch_deinit()` +
+   `cyw43_arch_init()` — resets just the radio, MCU keeps running. (Direct analog of the
+   SAMD51 RTL `CHIP_PU` power-cycle: "RTL doesn't reliably re-associate after a clean drop →
+   power-cycle the radio" — confirms this layer is necessary, not optional.)
+3. **HW watchdog (we have it, 4s):** a true MCU wedge self-resets → boot → rejoin. **This is
+   what removes the human-with-a-power-switch the ESP32 needed.**
+
+**Gap:** the watchdog only fires if a heartbeat task stalls. The nasty case is "WiFi dead but
+all tasks still heartbeating" → watchdog won't trip → layers 1–2 (the supervisor) must catch
+it. So the supervisor + chip-reset are mandatory, not just nice-to-have.
+
+**W3 acceptance test:** with the agent connected, kill WiFi at the AP (or `cyw43_arch_deinit`
+it); verify it re-joins + re-dials the agent on its own — no power-cycle.
+
+### SAMD51 RTL8720 port hardening that transfers (xiao_blocks, ~6mo field-tuned)
+Same shape (separate radio + dial-agent + libcomm/TCP). Files:
+`xiao_blocks/firmware/samd51/{app/bringup/main.c (rtl_task supervisor), app/bringup/gateway.c
+(serve loop), port/rtl_wifi.c}`. Copy these patterns (adapt RTL/eRPC → CYW43/lwIP):
+- **Grace window before chip-reset:** N transient failures (they used `WIFI_OPEN_FAILS_BEFORE_
+  RECOVER=8`, 1s apart = 8s grace) BEFORE power-cycling the radio — don't power-cycle on every
+  blip. Post-reset burst-retry (8× ~800ms). Distinguish transient vs persistent.
+- **Idle backstop:** count consecutive idle recv timeouts (they used 40 × 3s = ~2min silence)
+  → return + re-dial, to catch silent drops without false-tripping on brief gaps.
+- **Don't retry after mid-frame data loss → re-dial fresh** (their -2000/-2001 lesson). Our
+  analog: on a torn read/desync, close + re-dial; don't reuse the socket. (Our recv≤0 / write-
+  failure handling already re-dials.)
+- **Watchdog gating:** pet the WDT from a MEDIUM-prio task that time-slices with the WiFi task,
+  never a lower-prio task (it starves). We match this (wifi_uplink prio 2, heartbeat-gated WDT).
+- **Trace counters** for every exit path (their `g_serve_exit[]`: started/peer-closed/eRPC-broke/
+  idle/abort/last-err). Add equivalents to our wifi_uplink — essential for field root-cause.
+- **Multi-network fallback + runtime override:** built-in defaults + an SD `wifi.txt` (`ssid;pass`
+  per line). Our analog: extend `neti` to hold an ordered list of {ssid,pass}; try until DHCP.
+- **Host-side keep-alive:** the agent pinged the device every ~12s to keep the tunnel warm
+  (cut their idle-break rate ~3×). **W3 agent TODO:** periodic keep-alive to the BC.
+
 ## Unresolved (research couldn't pin; matches our experience)
 - Exact `recv()` SO_RCVTIMEO return (0 vs −1/EAGAIN/ETIMEDOUT) is version-dependent —
   handle empirically (we do).

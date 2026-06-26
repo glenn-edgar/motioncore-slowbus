@@ -86,7 +86,23 @@ interlock commands.
   core-affinity-review: confirm/pin the lwIP tcpip thread to core0; note CYW43 worker prio
   = interlock prio (4), safe only because different cores. (4) SMP `cyw43_arch_init()`-from
   -task can hang (#1718) — works for us, watch it. Pico2 W: FreeRTOS/RP2350 was
-  submodule-only at sdk 2.1.1; same cyw43 driver/behaviors as Pico W.
+  submodule-only at sdk 2.1.1; same cyw43 driver/behaviors as Pico W — but RP2350 dual-core
+  SMP FreeRTOS ALREADY WORKS in `~/xiao_blocks/firmware/rp2350` (branch pico2): reuse its
+  FreeRTOSConfig (cores=2 + CORE_AFFINITY) + `RP2350_ARM_NTZ` kernel port; XIAO RP2350 has
+  no WiFi, so Pico2 W = that base + our CYW43/lwIP + `PICO_BOARD=pico2_w`.
+- **Recovery ladder — no physical reset (full detail + SAMD51 prior-art in
+  `docs/pico-wifi-research.md`).** Unlike a bare ESP32 (radio on-die), the CYW43 is a separate
+  chip → recover in software: (1) supervisor polls link status + async rejoin (rejoin on
+  link-down even if IP lingers); (2) after N failed rejoins (grace window), `cyw43_arch_deinit()`
+  +`cyw43_arch_init()` resets just the radio (MCU keeps running); (3) the 4s HW watchdog
+  self-resets a true MCU wedge → no human power-switch. Gap: "WiFi dead but tasks still
+  heartbeating" won't trip the watchdog → the supervisor MUST catch it. The SAMD51 RTL8720
+  port (`xiao_blocks/firmware/samd51`, ~6mo field-tuned) proves the same ladder + gives tuned
+  params to copy: grace window before chip-reset (their 8 fails×1s), idle backstop (40×3s),
+  don't-retry-after-data-loss→re-dial, WDT pet from a medium-prio task, per-exit-path trace
+  counters, multi-network fallback, and a **host-side keep-alive** (agent pings the BC ~12s →
+  W3 agent TODO). W3 acceptance test: kill WiFi at the AP, verify auto re-join + re-dial, no
+  power-cycle.
 - **Bench state:** master is flashed **bus_controller_wifi** (on WiFi `192.168.1.205`, dialing
   `192.168.1.66:47447`); config has `neti`. Restore the chain-tree/USB bench by flashing
   `bus_controller` (USB) — full config incl `neti` saved at `/tmp/cfg_full.uf2` on the Pi.
