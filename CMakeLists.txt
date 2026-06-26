@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.13)
 
-# Pico W (RP2040). Matches the motioncore firmware/pico setup.
+# Target board/platform. DEFAULT = Pico W (RP2040), matching the motioncore setup.
+# Build for Pico 2 W (RP2350) from a SEPARATE build dir:
+#   cmake -DPICO_BOARD=pico2_w -DPICO_PLATFORM=rp2350 ...
 set(PICO_BOARD pico_w CACHE STRING "Board type")
 set(PICO_PLATFORM rp2040 CACHE STRING "Platform")
 
@@ -10,7 +12,14 @@ if(NOT DEFINED ENV{FREERTOS_KERNEL_PATH})
     message(FATAL_ERROR "FREERTOS_KERNEL_PATH must point to the Raspberry Pi FreeRTOS-Kernel fork")
 endif()
 set(FREERTOS_KERNEL_PATH $ENV{FREERTOS_KERNEL_PATH})
-include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake)
+# Pick the FreeRTOS kernel port to match the platform: RP2350 = Cortex-M33 (ARM, no-TrustZone).
+if(PICO_PLATFORM MATCHES "rp2350")
+    include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake)
+    message(STATUS "slow_bus: FreeRTOS port = RP2350_ARM_NTZ (board=${PICO_BOARD})")
+else()
+    include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake)
+    message(STATUS "slow_bus: FreeRTOS port = RP2040 (board=${PICO_BOARD})")
+endif()
 
 project(slow_bus C CXX ASM)
 pico_sdk_init()
