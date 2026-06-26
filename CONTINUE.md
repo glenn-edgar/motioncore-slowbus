@@ -51,6 +51,16 @@ ADC-stream conditions can be flashed; THEN fft_bin/cepstrum = ADDITIVE DSL sourc
 interlock_dsl.c (RP2040 unaffected). Also still TODO: build-config SPI device chain (vib-analysis |
 9DOF IMU — compile-time personality) + I2C sensor values (not on the bench).
 
+**★ROLE DECISION (Glenn 2026-06-26): the Pico 2 W stays a SLAVE; ONE Pico W = the WiFi/zenoh MASTER
+that polls the fleet and relays.** WiFi is the bottleneck and identical on both chips (same CYW43439)
+→ master-on-Pico2 buys no uplink speed; keep the RP2350 focused on DSP + the LOCAL interlock; the DSP
+data-reduces so a 400 kbps bus easily carries ≥10 nodes; safety stays LOCAL (each slave's ~2 ms
+veto). Bonus: no need to port the WiFi/zenoh master stack to the Pico 2 W. Keep the master-or-slave
+capability anyway (free; standalone/backup-master). **★MUST PROVE FIRST: 400 kbps RS-485 on the Pico
+W** — `idnt.sp=400000` bus-wide (PIO PHY clkdiv auto-adapts); verify signal integrity on the real
+cabling/transceivers (termination, stub lengths) via a phy/bus2 loopback + a master↔slave round-trip
+at 400 k BEFORE committing the fleet. Also pin the aggregate up-rate (per-node payload × fleet size).
+
 **BENCH (EOD):** Pico 2 W `91D72FE5666105D5` = vib_node + CLEAN idnt config (GP1 interlock only,
 armed=1, veto clear), on a NEW usb port (the old one wedged). Spare Pico 2 W `8DC20D34BFAD4581`.
 master Pico W `E6616408437D6628` (bus_controller_wifi) — got bounced into BOOTSEL by a stray
