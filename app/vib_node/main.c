@@ -71,6 +71,9 @@ static void measure_task(void *arg) {
                        pipeline_tap(g_pipe[ch], 3, TAP_RMS), hi_hz, (int)hi->peak_mag,
                        (unsigned)adc_capture_overrun(ch));
             }
+            printf("[vib_node] interlock: armed=%u summary=0x%02x  veto(gp0)=%d  gp1_in=%d\n",
+                   interlock_armed_count(), interlock_summary_flags(),
+                   gpio_get(INTERLOCK_VETO_PIN), gpio_get(INTERLOCK_IN_PIN));
             next += pdMS_TO_TICKS(2000);
         }
         vTaskDelay(1);
@@ -84,8 +87,9 @@ static void measure_task(void *arg) {
 // the plain GPIO (GP1..4) + the GP0 veto are bindable; bus/SPI/I2C/encoder/PWM/
 // ADC pins are reserved.
 bool il_plat_pin_reserved(uint8_t gpio) {
-    if (gpio == INTERLOCK_VETO_PIN) return false;                         // GP0 veto
-    if (gpio >= GPIO_BASE && gpio < GPIO_BASE + GPIO_COUNT) return false; // GP1..4
+    if (gpio == INTERLOCK_VETO_PIN) return false;                         // GP0 veto out
+    if (gpio == INTERLOCK_IN_PIN) return false;                           // GP1 interlock in
+    if (gpio >= GPIO_BASE && gpio < GPIO_BASE + GPIO_COUNT) return false; // GP2..4
     if (gpio >= ADC_PIN_CH0 && gpio <= ADC_PIN_CH2) return false;         // GP26..28
     return true;
 }
@@ -93,7 +97,9 @@ bool il_plat_pin_cap(uint8_t gpio, hal_pin_mode_t mode) {
     if (mode == HAL_PIN_MODE_GPIO_OUT)
         return gpio == INTERLOCK_VETO_PIN ||
                (gpio >= GPIO_BASE && gpio < GPIO_BASE + GPIO_COUNT);
-    return gpio >= GPIO_BASE && gpio < GPIO_BASE + GPIO_COUNT;  // input modes: plain GPIO
+    // input modes: the GP1 interlock input (high-Z) + the plain GPIO GP2..4
+    return gpio == INTERLOCK_IN_PIN ||
+           (gpio >= GPIO_BASE && gpio < GPIO_BASE + GPIO_COUNT);
 }
 uint8_t il_plat_adc_channel(uint8_t gpio) {
     if (gpio == ADC_PIN_CH0) return 0;
@@ -135,7 +141,8 @@ void node_thread2_start(void) {
     uint32_t fp = interlock_cfg_fingerprint();
     if (fp != g_interlock_persist.cfg_fingerprint || interlock_armed_count() == 0) {
         for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) interlock_disarm_slot(slot);
-        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
+        // Slot 0 is reserved for the built-in GP1 safety input (below); config = ilc1..ilc9.
+        for (uint8_t slot = 1; slot < INTERLOCK_MAX_SLOTS; slot++) {
             const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
             uint8_t buf[CFG_FILE_MAX]; uint32_t len; uint8_t err[3];
             if (cfg_load(name, buf, sizeof buf, &len) != 0 || len == 0) continue;
@@ -143,7 +150,18 @@ void node_thread2_start(void) {
         }
         g_interlock_persist.cfg_fingerprint = fp;
     }
-    printf("[vib_node] interlock: armed=%u slots (ADC ch -> band0 broadband rms)\n",
+    // Built-in GP1 high-Z interlock input (active-low), slot 0, ALWAYS armed via the
+    // COMMON engine: gp1 high = OK; a device pulling gp1 LOW fails the watch -> trips
+    // -> veto (gp0 high). This is the hardwired safety input (no ilcN needed).
+    {
+        static const char gp1_il[] =
+            "gp1il;cfg[(gp1):in,(gp0):out];watch[gp1:1];out_ok[gp0:0];out_err[gp0:1]";
+        uint8_t err[3];
+        interlock_disarm_slot(0);
+        uint8_t st = interlock_set_slot_dsl(0, gp1_il, (uint16_t)(sizeof gp1_il - 1u), err);
+        printf("[vib_node] GP1 interlock (slot0) arm st=%u err=%u,%u\n", st, err[0], err[1]);
+    }
+    printf("[vib_node] interlock: armed=%u slots (GP1 safety in + ADC ch -> band0 rms)\n",
            interlock_armed_count());
 
     TaskHandle_t tm, ti;

@@ -28,14 +28,19 @@
 // --- interlock hard veto (GPIO, fail-safe) — Thread 2 owns it ---------------
 #define INTERLOCK_VETO_PIN 0u        // GP0 (header pin 1)
 
-// --- plain GPIO block (4 regular digital I/O, GP1..GP4 = header pins 2/4/5/6) -
+// --- interlock INPUT (GP1, high-Z, ACTIVE-LOW) ------------------------------
+// GP1 is the dedicated interlock input: configured high-Z (no internal pull). The
+// SAFE state is HIGH (held by the external circuit); an external device that pulls
+// GP1 LOW trips the interlock -> veto (GP0). DSL: watch[gp1:1] (pass when high).
+#define INTERLOCK_IN_PIN   1u        // GP1 (header pin 2)
+
+// --- plain GPIO block (3 regular digital I/O, GP2..GP4 = header pins 4/5/6) --
 // Plain GPIO — no configurable role/mode system (that was the RP2040 HIL block).
-#define GPIO_BASE          1u
-#define GPIO_COUNT         4u
-#define PIN_GPIO0          1u        // GP1  (pin 2)
-#define PIN_GPIO1          2u        // GP2  (pin 4)
-#define PIN_GPIO2          3u        // GP3  (pin 5)
-#define PIN_GPIO3          4u        // GP4  (pin 6)
+#define GPIO_BASE          2u
+#define GPIO_COUNT         3u
+#define PIN_GPIO0          2u        // GP2  (pin 4)
+#define PIN_GPIO1          3u        // GP3  (pin 5)
+#define PIN_GPIO2          4u        // GP4  (pin 6)
 
 // --- quadrature encoder (PIO; A/B + index Z) --------------------------------
 #define ENC_PIN_A          6u        // GP6  (pin 9)
