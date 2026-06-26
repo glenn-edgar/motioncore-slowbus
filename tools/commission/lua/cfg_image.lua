@@ -19,7 +19,13 @@ local cbor = require("cbor")
 
 -- ---- store-entry + UF2 codec ----------------------------------------------
 local STORE_MAGIC, STORE_DATA_MAX = 0x10C0FFEE, 240
-local UF2_FAMILY_RP2040 = 0xE48BFF56   -- (RP2350 differs; BC target is pico_w)
+-- UF2 family IDs. The config blob must carry the family picotool expects for the
+-- target chip, else `picotool load` rejects it. rp2350 = ARM-S (our pico2_w fw).
+local UF2_FAMILY = {
+    rp2040 = 0xE48BFF56,
+    rp2350 = 0xE48BFF59,   -- rp2350-arm-s
+    data   = 0xE48BFF58,   -- platform-agnostic data
+}
 
 local function le32(n)
     return string.char(bit.band(n, 0xff), bit.band(bit.rshift(n, 8), 0xff),
@@ -71,7 +77,7 @@ end
 --                                                   flags default 2=ENABLED)
 -- --poll "period_ms:max_misses:tcp_retries[:window_us]"   (default 200:3:2:0)
 local opt = { out = "cfg.uf2", chip = 0, variant = 1, addr = 0, flash_size = 2 * 1024 * 1024,
-              poll = "200:3:2", il = {} }
+              family = "rp2040", poll = "200:3:2", il = {} }
 local i = 1
 while i <= #arg do
     local a = arg[i]
@@ -93,6 +99,7 @@ while i <= #arg do
         s = tonumber(s); assert(s >= 0 and s <= 9, "--il slot out of range 0..9: " .. s)
         opt.il[#opt.il + 1] = { slot = s, dsl = dsl }
     elseif a == "--flash-size" then opt.flash_size = tonumber(nextval())
+    elseif a == "--family"     then opt.family = nextval()   -- rp2040(default)|rp2350|data
     elseif a == "--port"       then opt.port = nextval()
     elseif a == "--ssid"       then opt.ssid = nextval()        -- neti: WiFi AP SSID (-> 'neti' file)
     elseif a == "--pass"       then opt.pass = nextval()        -- neti: WiFi AP passphrase ("" = open)
@@ -240,10 +247,12 @@ end
 
 -- ---- entries -> rows -> multi-block UF2 ------------------------------------
 local base = 0x10000000 + opt.flash_size - 0x10000   -- top 64 KB of flash
+local family = UF2_FAMILY[opt.family]
+assert(family, "unknown --family '" .. tostring(opt.family) .. "' (rp2040|rp2350|data)")
 local blocks = {}
 for n, e in ipairs(entries) do
     local row = build_entry(e.name, n, e.data)        -- seq = row index (all distinct names anyway)
-    blocks[#blocks + 1] = uf2_block(base + (n - 1) * 256, row, n - 1, #entries, UF2_FAMILY_RP2040)
+    blocks[#blocks + 1] = uf2_block(base + (n - 1) * 256, row, n - 1, #entries, family)
 end
 local uf2 = table.concat(blocks)
 
