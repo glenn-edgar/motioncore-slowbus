@@ -28,6 +28,8 @@
 #include "cfg_file.h"        // cfg_layout_ok
 #include "variants.h"        // variant_is_master
 #include "node_role.h"       // node_role_run + the four hooks below + CMD_NOT_MINE
+#include <math.h>
+#include "spectral.h"        // CMSIS-DSP rfft + cepstrum (vendored, M33 DSP ext)
 
 // SHELL_* status (mirrors app/bus_controller/main.c; only the ones we use here).
 #define SHELL_OK         0u
@@ -54,6 +56,32 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         memcpy(out, args, k); *outlen = k; return SHELL_OK;
     }
     return CMD_NOT_MINE;                              // GPIO/interlock come later
+}
+
+// ---- DSP self-test (4a): prove the vendored CMSIS-DSP FFT+cepstrum on RP2350 -
+// Feed a synthetic 2 kHz sine at 20 kHz through spectral.c; the peak bin AND the
+// cepstrum quefrency should both report ~2 kHz. (spectral_t is ~14 KB at N=1024
+// -> static, not on the stack.)
+static spectral_t g_dsp_test;
+static void dsp_selftest(void) {
+    // Harmonic test: fundamental 1 kHz + 2nd/3rd. The FFT peak should land on the
+    // (strongest) 1 kHz line; the cepstrum quefrency should report the 1 kHz
+    // harmonic spacing -> both ~1000 Hz. Verifies rfft AND cepstrum.
+    const float fs = 20000.0f, f0 = 1000.0f, w = 6.28318530718f / fs;
+    spectral_init(&g_dsp_test, fs);
+    for (uint32_t n = 0; n < SPEC_N * (SPEC_AVG + 1u); n++) {
+        float t = (float)n;
+        float v = 2048.0f + 1000.0f * sinf(w * f0 * t)
+                          +  500.0f * sinf(w * 2.0f * f0 * t)
+                          +  250.0f * sinf(w * 3.0f * f0 * t);
+        spectral_feed(&g_dsp_test, (uint16_t)(v + 0.5f));
+    }
+    const spec_result_t *r = spectral_get(&g_dsp_test);
+    int peak_hz = (int)((float)r->peak_bin * fs / (float)SPEC_N + 0.5f);
+    int q_hz    = r->q_bin ? (int)(fs / (float)r->q_bin + 0.5f) : 0;
+    printf("[vib_node] DSP selftest: N=%u fs=20k  f0=1000Hz+harmonics -> "
+           "peak_bin=%d peak_hz=%d  q_bin=%d q_hz=%d  gen=%u  (both ~1000 expected)\n",
+           (unsigned)SPEC_N, r->peak_bin, peak_hz, r->q_bin, q_hz, (unsigned)r->gen);
 }
 
 // ---- liveness beacon (3b.1: confirm the node stays up on RP2350) -----------
@@ -108,6 +136,8 @@ int main(void) {
         printf("[vib_node] UNCOMMISSIONED (idnt_rc=%d) -- running responder for bring-up\n", rc);
     else if (variant_is_master(ident.variant))
         printf("[vib_node] master variant -- master path TBD; running node responder for now\n");
+
+    dsp_selftest();   // 4a: prove the vendored CMSIS-DSP FFT/cepstrum on RP2350
 
     // 3b.1: run the shared node responder (PHY + bus_node + scheduler). The
     // heartbeat task is created first so it runs once node_role_run starts the

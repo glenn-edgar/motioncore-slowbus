@@ -245,11 +245,26 @@ pico_add_extra_outputs(phy_test)
 
 # ---------------------------------------------------------------------------
 # vib_node — Pico 2 W (RP2350) vibration/condition-monitoring node. NEW app that
-# reuses the shared bus core + node_role responder (bus_controller is untouched).
-# Build for Pico 2 W only:  cmake -DPICO_BOARD=pico2_w -DPICO_PLATFORM=rp2350
-# Step 3b.1 skeleton: echo responder + stub interlock/engine (measurement DSP +
-# common interlock engine land in later steps).
+# reuses the shared bus core + node_role responder (bus_controller is untouched)
+# AND the vendored CMSIS-DSP measurement toolkit (FFT/cepstrum + FIR decimation).
+# RP2350-ONLY (CMSIS-DSP targets the M33 DSP ext) -> guarded so the RP2040 build
+# never compiles it. Build:  cmake -DPICO_BOARD=pico2_w -DPICO_PLATFORM=rp2350
 # ---------------------------------------------------------------------------
+if(PICO_PLATFORM MATCHES "rp2350")
+# CMSIS-DSP subset (f32 FIR decimate + arm_rfft_fast_f32), vendored from xiao_blocks.
+set(CMSIS_DSP_DIR ${CMAKE_CURRENT_LIST_DIR}/vendor/cmsis_dsp)
+set(CMSIS_DSP_SRCS
+    ${CMSIS_DSP_DIR}/Source/FilteringFunctions/arm_fir_decimate_f32.c
+    ${CMSIS_DSP_DIR}/Source/FilteringFunctions/arm_fir_decimate_init_f32.c
+    ${CMSIS_DSP_DIR}/Source/TransformFunctions/arm_rfft_fast_f32.c
+    ${CMSIS_DSP_DIR}/Source/TransformFunctions/arm_rfft_fast_init_f32.c
+    ${CMSIS_DSP_DIR}/Source/TransformFunctions/arm_cfft_f32.c
+    ${CMSIS_DSP_DIR}/Source/TransformFunctions/arm_cfft_init_f32.c
+    ${CMSIS_DSP_DIR}/Source/TransformFunctions/arm_cfft_radix8_f32.c
+    ${CMSIS_DSP_DIR}/Source/TransformFunctions/arm_bitreversal2.c
+    ${CMSIS_DSP_DIR}/Source/CommonTables/arm_common_tables.c
+    ${CMSIS_DSP_DIR}/Source/CommonTables/arm_const_structs.c)
+set(DSP_DIR ${CMAKE_CURRENT_LIST_DIR}/port/rp2350/dsp)
 add_executable(vib_node
     ${CMAKE_CURRENT_LIST_DIR}/app/vib_node/main.c
     ${NODE_DIR}/node_role.c
@@ -258,17 +273,20 @@ add_executable(vib_node
     ${CORE_DIR}/bus_node.c
     ${CORE_DIR}/bus_frame.c
     ${CORE_DIR}/bus_crc8.c
+    ${DSP_DIR}/spectral.c
+    ${CMSIS_DSP_SRCS}
     ${PORT_SRCS})
 pico_generate_pio_header(vib_node ${PORT_DIR}/rs485.pio)
-target_include_directories(vib_node PRIVATE ${COMMON_INC} ${NODE_DIR})
+target_include_directories(vib_node PRIVATE ${COMMON_INC} ${NODE_DIR} ${DSP_DIR} ${CMSIS_DSP_DIR}/Include)
 target_compile_definitions(vib_node PRIVATE PICO_PRINTF_SUPPORT_FLOAT=0)
 target_compile_options(vib_node PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(vib_node
     pico_stdlib pico_multicore hardware_pio hardware_watchdog hardware_flash
-    FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
+    cmsis_core FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
 pico_enable_stdio_usb(vib_node 1)
 pico_enable_stdio_uart(vib_node 0)
 pico_add_extra_outputs(vib_node)
+endif()
 
 # ---------------------------------------------------------------------------
 # 2-node bring-up: BC polls the SAMD21 slave (addr 3) on the real wire (RX=GP21).
