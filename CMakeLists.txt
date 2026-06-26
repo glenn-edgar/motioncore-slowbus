@@ -274,6 +274,7 @@ add_executable(vib_node
     ${CORE_DIR}/bus_frame.c
     ${CORE_DIR}/bus_crc8.c
     ${DSP_DIR}/spectral.c
+    ${CMAKE_CURRENT_LIST_DIR}/port/rp2350/adc_capture.c
     ${CMSIS_DSP_SRCS}
     ${PORT_SRCS})
 pico_generate_pio_header(vib_node ${PORT_DIR}/rs485.pio)
@@ -281,7 +282,8 @@ target_include_directories(vib_node PRIVATE ${COMMON_INC} ${NODE_DIR} ${DSP_DIR}
 target_compile_definitions(vib_node PRIVATE PICO_PRINTF_SUPPORT_FLOAT=0)
 target_compile_options(vib_node PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(vib_node
-    pico_stdlib pico_multicore hardware_pio hardware_watchdog hardware_flash
+    pico_stdlib pico_multicore hardware_pio hardware_adc hardware_pwm
+    hardware_watchdog hardware_flash
     cmsis_core FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
 pico_enable_stdio_usb(vib_node 1)
 pico_enable_stdio_uart(vib_node 0)

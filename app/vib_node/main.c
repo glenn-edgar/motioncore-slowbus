@@ -30,15 +30,52 @@
 #include "node_role.h"       // node_role_run + the four hooks below + CMD_NOT_MINE
 #include <math.h>
 #include "spectral.h"        // CMSIS-DSP rfft + cepstrum (vendored, M33 DSP ext)
+#include "adc_capture.h"     // 20kHz x3ch PWM-locked ADC front end
 
 // SHELL_* status (mirrors app/bus_controller/main.c; only the ones we use here).
 #define SHELL_OK         0u
 #define NODE_CMD_ECHO    0x0001u
 
 // ---- role hooks node_role.c calls (STUBS for 3b.1) -------------------------
+// 4b: the measurement core-1 task. Owns the 20 kHz PWM-locked 3-channel ADC
+// capture (the wrap ISR enables on THIS core) and, for now, reports the capture
+// rate + per-channel sample range so we can verify the front end on HW. The DSP
+// (decimation pipeline + FFT/cepstrum -> interlock scalars) wires in here next.
+static void measure_task(void *arg) {
+    (void)arg;
+    adc_capture_init();                 // PWM-wrap ISR enables on core1 (this task)
+    uint32_t last[ADC_CAP_CH] = {0};
+    uint16_t mn[ADC_CAP_CH] = {4095, 4095, 4095}, mx[ADC_CAP_CH] = {0, 0, 0};
+    TickType_t next = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+    for (;;) {
+        // Drain continuously so the ring never overflows (256 deep = ~13 ms @ 20 kHz);
+        // a 1 ms wake leaves wide margin. Track per-channel range between reports.
+        for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) {
+            uint16_t s;
+            while (adc_capture_pop(ch, &s)) { if (s < mn[ch]) mn[ch] = s; if (s > mx[ch]) mx[ch] = s; }
+        }
+        if (xTaskGetTickCount() >= next) {
+            for (int ch = 0; ch < (int)ADC_CAP_CH; ch++) {
+                uint32_t c = adc_capture_count(ch);
+                printf("[vib_node] adc ch%d: %u/s  min=%u max=%u  ovr=%u\n",
+                       ch, (unsigned)((c - last[ch]) / 2u),
+                       (unsigned)mn[ch], (unsigned)mx[ch], (unsigned)adc_capture_overrun(ch));
+                last[ch] = c; mn[ch] = 4095; mx[ch] = 0;
+            }
+            next += pdMS_TO_TICKS(2000);
+        }
+        vTaskDelay(1);
+    }
+}
+
 void node_thread2_start(void) {
-    // TODO(step 5): start the measurement chains (ADC FFT/cepstrum, SPI device,
-    // I2C) + the COMMON interlock engine on those scalars. No-op for now.
+    // 4b: start the measurement task pinned to core1 (the DSP core). It calls
+    // adc_capture_init() itself so the PWM-wrap ISR + ADC reads run on core1,
+    // off the core0 bus responder. (The COMMON interlock engine wires in here in
+    // step 5, reading the DSP measurement scalars.)
+    TaskHandle_t t;
+    xTaskCreate(measure_task, "meas", configMINIMAL_STACK_SIZE * 4, NULL, 2, &t);
+    vTaskCoreAffinitySet(t, 1u << 1);   // core1
 }
 void node_engine_start(void) {
     // TODO(step 3b/later): bring up the chain-tree engine (kbapp). No-op for now.
