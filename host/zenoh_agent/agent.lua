@@ -2,12 +2,13 @@
 --
 -- Bridges the bus controller's libcomm/host_link command surface onto a zenoh key,
 -- so the SAME commands that work over USB (picolink) work through the fleet's zenohd
--- router. The BC dials in over WiFi (UPLINK=wifi); we accept it (picolink.listen_tcp)
--- and speak host_link over that socket. zenoh-pico stays here on Linux — never on the MCU.
+-- router. The BC sends to us over WiFi/UDP (UPLINK=wifi); we recv its datagrams
+-- (picolink.recv_udp) and speak host_link over that socket. zenoh-pico stays here on
+-- Linux — never on the MCU. (UDP-only; TCP mode dropped.)
 --
 -- Requests arrive as JSON {op=...} on the key; binary payloads/results are hex.
 -- Env: ZENOH_LOCATOR (tcp/127.0.0.1:46169), ZENOH_MODE (client),
---      TCP_PORT (47447, the port the BC dials), RPC_KEY (slow_bus/bc/cmd), POLL_MS (5).
+--      BC_PORT (47447, the UDP port the BC sends to), RPC_KEY (slow_bus/bc/cmd), POLL_MS (5).
 -- Run on the Pi with LD_LIBRARY_PATH=<repo>/vendor/zenoh/lib (the zenoh-pico .so).
 
 local _dir = (debug.getinfo(1, "S").source:sub(2)):match("(.*/)") or "./"
@@ -23,8 +24,7 @@ local function env(k, d) local v = os.getenv(k); if v == nil or v == "" then ret
 local LOCATORS = {}
 for s in (env("ZENOH_LOCATOR", "tcp/127.0.0.1:46169")):gmatch("[^,]+") do LOCATORS[#LOCATORS+1] = s end
 local MODE     = env("ZENOH_MODE", "client")
-local TCP_PORT  = tonumber(env("TCP_PORT", "47447"))   -- port the BC connects to (TCP or UDP)
-local TRANSPORT = env("TRANSPORT", "udp")              -- must match the BC's neti.tp (udp default)
+local BC_PORT  = tonumber(env("BC_PORT", env("TCP_PORT", "47447")))  -- UDP port the BC sends to (TCP_PORT kept as a legacy alias)
 local KEY      = env("RPC_KEY", "slow_bus/bc/cmd")
 local POLL_S   = (tonumber(env("POLL_MS", "5")) or 5) / 1000
 local EXEC_TO  = (tonumber(env("EXEC_MS", "2500")) or 2500) / 1000
@@ -42,9 +42,8 @@ local function from_hex(h) h = h or ""; return (h:gsub("%x%x", function(b) retur
 local lk
 local function bc_accept()
     if lk then pcall(function() lk:close() end); lk = nil end
-    log(("waiting for the BC (%s) on port %d ..."):format(TRANSPORT, TCP_PORT))
-    if TRANSPORT == "tcp" then lk = pl.listen_tcp(TCP_PORT, EXEC_TO, 86400)
-    else                       lk = pl.recv_udp(TCP_PORT, EXEC_TO, 86400) end  -- udp = default
+    log(("waiting for the BC (udp) on port %d ..."):format(BC_PORT))
+    lk = pl.recv_udp(BC_PORT, EXEC_TO, 86400)   -- UDP-only (TCP mode dropped)
     log("BC connected.")
 end
 -- exec with one re-accept on transport failure (BC re-dial after a WiFi blip).

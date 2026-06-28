@@ -9,15 +9,14 @@
 # Config (env overrides):
 #   ZENOH_PORT=46170     this repo's router port (xiao_blocks owns :46169)
 #   ROUTER_BIND=0.0.0.0  0.0.0.0 = reachable off-box; 127.0.0.1 = Pi-only
-#   TCP_PORT=47447       the port the BC dials over WiFi (matches 'neti')
+#   BC_PORT=47447        the UDP port the BC sends to over WiFi (matches 'neti')
 #   RPC_KEY=slow_bus/bc/cmd
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"   # repo root = build context
 ZENOH_PORT="${ZENOH_PORT:-46170}"
 ROUTER_BIND="${ROUTER_BIND:-0.0.0.0}"
-TCP_PORT="${TCP_PORT:-47447}"
-TRANSPORT="${TRANSPORT:-udp}"            # must match the BC's neti.tp (udp default)
+BC_PORT="${BC_PORT:-${TCP_PORT:-47447}}"   # UDP port the BC sends to (TCP_PORT = legacy alias)
 RPC_KEY="${RPC_KEY:-slow_bus/bc/cmd}"
 ROUTER_IMAGE="${ROUTER_IMAGE:-eclipse/zenoh:latest}"
 AGENT_IMAGE="${AGENT_IMAGE:-slow_bus/zenoh-agent:dev}"
@@ -39,10 +38,10 @@ up() {
     echo ">> router '$ROUTER_NAME' on tcp/$ROUTER_BIND:$ZENOH_PORT (restart=$RESTART)"
     docker run -d --name "$ROUTER_NAME" --network=host --restart "$RESTART" \
         "$ROUTER_IMAGE" -l "tcp/$ROUTER_BIND:$ZENOH_PORT" --no-multicast-scouting >/dev/null
-    echo ">> agent '$AGENT_NAME' (BC $TRANSPORT:$TCP_PORT -> router :$ZENOH_PORT, key $RPC_KEY)"
+    echo ">> agent '$AGENT_NAME' (BC udp:$BC_PORT -> router :$ZENOH_PORT, key $RPC_KEY)"
     docker run -d --name "$AGENT_NAME" --network=host --restart "$RESTART" \
-        -e "ZENOH_LOCATOR=tcp/127.0.0.1:$ZENOH_PORT" -e "TCP_PORT=$TCP_PORT" \
-        -e "TRANSPORT=$TRANSPORT" -e "RPC_KEY=$RPC_KEY" \
+        -e "ZENOH_LOCATOR=tcp/127.0.0.1:$ZENOH_PORT" -e "BC_PORT=$BC_PORT" \
+        -e "RPC_KEY=$RPC_KEY" \
         "$AGENT_IMAGE" >/dev/null
     sleep 3
     echo "=== status ==="; docker ps --filter "name=$ROUTER_NAME" --filter "name=$AGENT_NAME" --format "$ps_fmt"

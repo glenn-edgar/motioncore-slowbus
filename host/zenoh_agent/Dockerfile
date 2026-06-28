@@ -24,5 +24,5 @@ COPY vendor/zenoh/*.lua                 /app/vendor/zenoh/
 COPY tools/commission/lua/picolink.lua  /app/tools/commission/lua/
 COPY host/zenoh_agent/agent.lua         /app/host/zenoh_agent/agent.lua
 
-# Env (override at `docker run -e`): ZENOH_LOCATOR, TCP_PORT (BC dial port), RPC_KEY.
+# Env (override at `docker run -e`): ZENOH_LOCATOR, BC_PORT (BC UDP port), RPC_KEY.
 ENTRYPOINT ["/usr/bin/tini", "--", "luajit", "/app/host/zenoh_agent/agent.lua"]
