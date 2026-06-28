@@ -119,6 +119,9 @@
 #define CMD_APP_ECHO_TO          0x0301u // Thread 3 (kbapp): [addr u8][payload] — engine originates a
                                          // bus echo to node <addr>, master correlates the reply
 #define CMD_APP_IL_CLEAR         0x0302u // Thread 3 (kbapp): engine-driven interlock global clear (Thread 2)
+#define CMD_APP_PP_START         0x0303u // ping-pong bench: [addr] start free-running master<->slave chain-flow loop
+#define CMD_APP_PP_STOP          0x0304u // ping-pong bench: stop the loop
+#define CMD_APP_PP_READ          0x0305u // ping-pong bench: -> [master_cnt u32][slave_cnt u32] (read out-of-band)
 #define KBAPP_VER                1u
 
 // ---- GPIO + pulse-count HIL (KB1 api; pin map per board.h) ------------------
@@ -264,6 +267,27 @@ static volatile bool   g_host_connected;
 typedef struct { uint8_t addr; uint16_t host_req_id; uint8_t len; uint8_t bytes[ORIG_PAY_MAX]; } orig_req_t;
 static QueueHandle_t   g_orig_q;   // core1 (engine) -> core0 (bus thread)
 
+// Ping-pong bench: a free-running chain-flow loop, master kbapp <-> slave kbapp over
+// RS-485. Each end's ENGINE sets a counter (g_pp_master in kbapp_on_echo_to on the
+// originating master; g_pp_slave in kbapp_on_echo on the answering slave). The slave
+// piggybacks its count on every bus echo reply; the master's COLLECT captures it into
+// g_pp_slave_seen, so ONE local CMD_APP_PP_READ returns both. The loop self-sustains:
+// each collected reply re-injects CMD_APP_ECHO_TO (pp_kick) so the master originates
+// the next round. The host/USB/WiFi is used ONLY to start/stop/read — NEVER in the loop,
+// so the measured rate is the true bus chain-flow rate (no uplink latency).
+static volatile uint32_t g_pp_master;      // master kbapp originations (kbapp_on_echo_to)
+static volatile uint32_t g_pp_slave;       // this node's slave-side handles (kbapp_on_echo, bus route)
+static volatile uint32_t g_pp_slave_seen;  // master's view of the slave count, piggybacked on each reply
+static volatile uint8_t  g_pp_run;         // loop enabled
+static volatile uint8_t  g_pp_addr = 9;    // slave addr to ping
+static void pp_kick(void) {                // re-arm one round (master kbapp originates)
+    if (!g_down_q) return;
+    appcore_cmd_t c; memset(&c, 0, sizeof c);
+    c.cmd = CMD_APP_ECHO_TO; c.route = ROUTE_USB;
+    c.args[0] = g_pp_addr; c.args[1] = 'p'; c.args[2] = 'p'; c.alen = 3;
+    (void)xQueueSend(g_down_q, &c, 0);
+}
+
 // ---- PHY-owned-by-bus-thread helpers (NO lock; PHY has a single owner) ------
 static bus_asm_t g_bc; static uint8_t g_bus_seq;
 
@@ -398,6 +422,21 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
     case CMD_BUS_POLL_ENABLE:
         if (alen >= 1) g_poll_enabled = args[0];
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    case CMD_APP_PP_START:   // [addr] -> start the free-running chain-flow ping-pong loop
+        if (alen >= 1) g_pp_addr = args[0];
+        g_pp_master = 0; g_pp_slave_seen = 0;
+        g_pp_run = 1;
+        pp_kick();           // fire the first round; COLLECT re-arms each subsequent round
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    case CMD_APP_PP_STOP:
+        g_pp_run = 0;
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    case CMD_APP_PP_READ: {  // -> [master_cnt u32][slave_cnt u32] (both as the master sees them)
+        uint32_t mc = g_pp_master, sc = g_pp_slave_seen;
+        uint8_t r[8] = { (uint8_t)mc, (uint8_t)(mc>>8), (uint8_t)(mc>>16), (uint8_t)(mc>>24),
+                         (uint8_t)sc, (uint8_t)(sc>>8), (uint8_t)(sc>>16), (uint8_t)(sc>>24) };
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 8); break;
+    }
     default:
         host_link_shell_reply(&g_hl, req_id, SHELL_UNKNOWN_CMD, NULL, 0); break;
     }
@@ -479,6 +518,7 @@ static void bus_control_task(void *arg) {
             collect_slave = cslave; collect_tries = CMD_COLLECT_TRIES; state = BS_CMD_COLLECT;
             collect_is_orig = c_is_orig; collect_host = c_host;
         } else if (state == BS_CMD_COLLECT) {
+            bool pp_round = (collect_is_orig && g_pp_run);   // ping-pong: re-arm when this round ends
             bus_send(collect_slave, BUS_FT_POLL, NULL, 0);
             int got = bus_recv(&rf, CMD_COLLECT_TIMEOUT_MS);
             if (got && rf.src == collect_slave) {
@@ -488,12 +528,21 @@ static void bus_control_task(void *arg) {
                     rf.payload[0] == (uint8_t)(OP_SHELL_REPLY & 0xFF) &&
                     rf.payload[1] == (uint8_t)(OP_SHELL_REPLY >> 8)) {
                     if (collect_is_orig) {
-                        // C2 correlation: the slave's reply [wire_req][status][echo] is
-                        // re-tagged to the host's req_id and surfaced as from the appcore.
+                        // C2 correlation: re-tag the slave's reply [wire_req][status][echo]
+                        // to the host's req_id. Ping-pong piggybacks a u32 slave count as the
+                        // last 4 bytes -> capture+strip it; during a pp bench (g_pp_run) the
+                        // round is consumed here, not surfaced to the host.
                         uint8_t rb[BUS_PAYLOAD_MAX]; uint8_t rn = (uint8_t)(rf.len - 2);
                         memcpy(rb, &rf.payload[2], rn);
-                        if (rn >= 2) { rb[0] = (uint8_t)collect_host; rb[1] = (uint8_t)(collect_host >> 8); }
-                        (void)host_link_s2m(&g_hl, BUS_ADDR_APPCORE, OP_SHELL_REPLY, rb, rn);
+                        if (rn >= 7) {   // [req2][status1][..echo..][cnt4]
+                            g_pp_slave_seen = (uint32_t)rb[rn-4] | ((uint32_t)rb[rn-3] << 8) |
+                                              ((uint32_t)rb[rn-2] << 16) | ((uint32_t)rb[rn-1] << 24);
+                            rn -= 4;
+                        }
+                        if (!g_pp_run) {
+                            if (rn >= 2) { rb[0] = (uint8_t)collect_host; rb[1] = (uint8_t)(collect_host >> 8); }
+                            (void)host_link_s2m(&g_hl, BUS_ADDR_APPCORE, OP_SHELL_REPLY, rb, rn);
+                        }
                     } else {
                         (void)host_link_s2m(&g_hl, collect_slave, OP_SHELL_REPLY, &rf.payload[2], (uint8_t)(rf.len - 2));
                     }
@@ -508,6 +557,7 @@ static void bus_control_task(void *arg) {
             } else if (--collect_tries == 0) {
                 state = BS_SWEEP;
             }
+            if (pp_round && state == BS_SWEEP) pp_kick();   // free-running: originate the next round
         } else {  // BS_SWEEP
             if (g_poll_enabled && (int32_t)(now - sweep_next_ms) >= 0) {
                 sweep_next_ms = now + g_poll_period_ms;
@@ -597,29 +647,13 @@ static void uplink_task(void *arg) {
 #endif // !UPLINK_WIFI
 
 #ifdef UPLINK_WIFI
-// ---- WiFi uplink (UPLINK=wifi): same host_link frame stream over TCP to the -----
+// ---- WiFi uplink (UPLINK=wifi): same host_link frame stream over UDP to the -----
 // Linux zenoh-agent instead of USB-CDC. host_link is transport-agnostic, so this is
 // the USB uplink_task with getchar/putchar swapped for lwip recv/send. EVERYTHING is
 // non-blocking/polled: the HW watchdog (4 s) gates on HB_UPLINK going stale >500 ms,
 // so the WiFi join (async + poll) and the agent connect (non-blocking + select) must
 // never block this task. USB-CDC stays enabled for flashing + the BOOTSEL reset path.
 #define WIFI_HB() do { g_hb[HB_UPLINK]++; g_hb_us[HB_UPLINK] = time_us_32(); } while (0)
-
-// Blocking TCP connect to the agent (fd>=0 connected, else -1). Same path wifi_test
-// proved; on this LAN it completes fast when the agent is up and fails fast (RST /
-// no-route) when it isn't, so it stays well inside the watchdog window. (A future
-// non-blocking+select variant can bound a silently-dropped SYN; not needed here.)
-static int wifi_dial(const netcfg_t *nc) {
-    int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in a; memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET; a.sin_port = lwip_htons(nc->port);
-    a.sin_addr.s_addr = (uint32_t)nc->ip[0] | ((uint32_t)nc->ip[1] << 8) |
-                        ((uint32_t)nc->ip[2] << 16) | ((uint32_t)nc->ip[3] << 24);
-    WIFI_HB();
-    if (lwip_connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { lwip_close(fd); return -1; }
-    return fd;
-}
 
 // Link is healthy only if associated AND we hold an IP. Checking the IP alone misses
 // the "silently disassociated but the netif IP lingers" case (the power-save drop), so
@@ -632,7 +666,7 @@ static bool wifi_link_up(struct netif *nif) {
 // reads "connected" (pico-sdk #2153). NO_POWERSAVE (CYW43_DEFAULT_PM & ~0xf) stops it.
 static void wifi_no_powersave(void) { cyw43_wifi_pm(&cyw43_state, CYW43_DEFAULT_PM & ~0xfu); }
 
-// UDP transport (neti default): connectionless. connect() just sets the default peer on
+// UDP transport (the only uplink transport): connectionless. connect() just sets the default peer on
 // lwIP (no handshake), so the shared serve loop's send/recv work unchanged AND there's no
 // dial/re-dial to fail or wedge. fd>=0, or -1. SLIP framing tolerates datagram boundaries.
 static int wifi_udp_open(const netcfg_t *nc) {
@@ -646,8 +680,7 @@ static int wifi_udp_open(const netcfg_t *nc) {
     return fd;
 }
 
-// Run host_link over a connected socket (TCP or UDP — identical once connected) until the
-// link drops, then close. Shared by both transports; only the socket-open differs.
+// Run host_link over the connected UDP socket until the link drops, then close.
 static void wifi_serve(int fd, struct netif *nif) {
     struct timeval rtv = { 0, 50000 };         // 50 ms recv timeout (bounds the loop block)
     lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
@@ -724,9 +757,8 @@ static void wifi_uplink_task(void *arg) {
             wifi_no_powersave();   // re-assert after a (re)join
         }
 
-        // ---- connect to the agent + serve host_link (UDP default; TCP if neti.tp=TCP) ----
-        int fd = (g_netcfg.transport == NETI_TP_TCP) ? wifi_dial(&g_netcfg)
-                                                     : wifi_udp_open(&g_netcfg);
+        // ---- open the UDP socket to the agent + serve host_link (UDP-only) ----
+        int fd = wifi_udp_open(&g_netcfg);
         if (fd < 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
         wifi_serve(fd, nif);   // runs until the link drops, then closes fd
         vTaskDelay(pdMS_TO_TICKS(500));   // brief pause before reconnecting
@@ -1070,8 +1102,16 @@ void kbapp_on_echo(void *handle, unsigned node_index) {
     p[n++] = SHELL_OK;
     if (!to_bus) p[n++] = KBAPP_VER;          // ver only on the local (USB) echo
     uint8_t m = q->len;
-    if (m > (uint8_t)(APPCORE_PAY_MAX - n)) m = (uint8_t)(APPCORE_PAY_MAX - n);
+    uint8_t cap = to_bus ? (uint8_t)(APPCORE_PAY_MAX - 4) : APPCORE_PAY_MAX; // leave room for the pp count
+    if (m > (uint8_t)(cap - n)) m = (uint8_t)(cap - n);
     for (uint8_t i = 0; i < m; i++) p[n++] = q->bytes[i];
+    if (to_bus) {
+        // Ping-pong: this node is the answering SLAVE — its kbapp engine counts the
+        // round and piggybacks the count (u32 LE) so the master captures it in COLLECT.
+        uint32_t c = ++g_pp_slave;
+        p[n++] = (uint8_t)c; p[n++] = (uint8_t)(c >> 8);
+        p[n++] = (uint8_t)(c >> 16); p[n++] = (uint8_t)(c >> 24);
+    }
     kbapp_reply(q, p, n);
 }
 
@@ -1098,6 +1138,7 @@ void kbapp_on_echo_to(void *handle, unsigned node_index) {
     cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
     const app_req_t *q = (const app_req_t *)rt->event_data_ptr->data.ptr;
     if (!q) return;
+    g_pp_master++;   // ping-pong: master kbapp engine counts each round it originates
     orig_req_t o; o.addr = q->addr; o.host_req_id = q->req_id;
     uint8_t m = q->len; if (m > ORIG_PAY_MAX) m = ORIG_PAY_MAX;
     o.len = m;
