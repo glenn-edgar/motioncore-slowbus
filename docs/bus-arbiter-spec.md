@@ -348,3 +348,118 @@ real** (TX/SM/assembler in ISR) → physical BOOTSEL recovery if it wedges; veri
 8. **Master full-ISR rotation** (§16) — CPU/determinism. HW: core0 freed, liveness needs no task,
    watchdog-safe, no rotation stalls.
 (§14's findings supersede the earlier guess that `T_GAP`/the master context switch were levers.)
+
+---
+
+## 17. Cyclic ping-pong message engine — the real-time data bus (SUPERSEDES §15–16 for the master)
+
+Status: **DESIGN** (2026-06-28, Glenn). The per-slot rotation (§1–16) is fine for liveness but its
+core0 cost is ∝ poll rate (HW: ~80% busy-spin at 1000/s; ~34% even after the alarm-block; rate-paced
+gets ~3–6% but caps per-node rate). The fleet needs **feedback loops: ~200 msg/s per node × ~6 nodes
+(~1200 grants/s, a design goal not hard)** at **low core0** and **bounded real-time**. This section is
+the master arbiter redesign that meets that; it replaces the per-slot rotation on the master.
+
+### 17.1 Principles
+- **Fire-and-forget, UDP-style.** No bus-level reply/ack. A command is sent and the buffer recovered;
+  **feedback is separate node-originated datagrams** delivered to the app (zenoh / chain-tree), which
+  does correlation, the control loop, and loss handling — like UDP.
+- **One producer path for both sources** (zenoh uplink + internal chain-tree): grab a TX buffer →
+  fill → attach to the target node's list.
+- **Ping-pong the per-node list HEADERS** (not individual buffers): the bus controller drains the
+  active header set with **zero contention** while producers fill the other set.
+- **Low core0**: the cycle is a task that **blocks** (idle-gap alarm, §16 mechanism) during each
+  feedback wait; the only busy work is tiny per-buffer/per-node bookkeeping.
+- **Real-time is measured**: full-cycle time (all nodes) is the watchdog metric.
+
+### 17.2 Data structures
+- **Node table, ordered by bus address** (fixed; one entry per node):
+  `{ uint8_t addr; uint8_t flags; /*enabled/dead*/ uint8_t miss_count; /* + per-set list heads */ }`.
+  This is the sweep index, the NO_MSG order, and the home of dead-flags.
+- **Two header sets (ping-pong)**: `g_active`, `g_fill`, each = `array[node] of tx_buf_t*` (per-node
+  singly-linked TX list head). Producers attach to `g_fill`; the BC drains `g_active`; the cycle swaps
+  the two pointers.
+- **Buffer pool** = N fixed `tx_buf_t` **carved from cfl_perm ONCE at init** (cfl_perm is a bump
+  allocator — same place the engine event queue is carved; it has **no free**). Runtime grab/recover
+  is a **free-list** (LIFO), NOT a cfl_perm free. cfl_perm is never touched after init.
+  `tx_buf_t { tx_buf_t *next; uint8_t dest_node; uint8_t len; uint8_t payload[BUS_PAYLOAD_MAX];
+             uint32_t origin_tag; /* zenoh req_id / chain-tree event id, for app correlation */ }`.
+
+### 17.3 Concurrency — hw spinlock, never a FreeRTOS mutex
+Producers run on **core0 (zenoh uplink)** and **core1 (chain-tree)**; the BC drains on core0; the free
+path runs in the BC task. A FreeRTOS mutex can't serve ISRs/cross-core, so guard the three tiny
+critical regions with a **pico hardware spinlock** (`spin_lock` / `critical_section_t`, ISR- and
+SMP-safe, held ~tens of ns):
+- **free-list** push/pop (producers grab; BC recovers),
+- **header swap** (`g_active`↔`g_fill`),
+- **producer→`g_fill[node]` attach** (producer-vs-producer).
+
+The **drain of `g_active` is lock-free by construction** (after the swap, no producer touches it).
+cfl_perm is init-only (no runtime lock). No mutex in the data path.
+
+### 17.4 Producers (zenoh uplink, chain-tree engine)
+```
+buf = pool_grab();                 // free-list pop under spinlock
+if (!buf) { exhaustion_exception(); zenoh_notify(POOL_EXHAUSTED); return; }
+buf->dest_node = N; buf->len = ...; memcpy(buf->payload, ...); buf->origin_tag = req_id_or_event;
+attach(g_fill[N], buf);            // push onto node N's fill list under spinlock
+```
+Pool exhaustion is an **exception + zenoh notification + error counter** (never a silent drop); a
+**high-water-mark** stat tracks peak in-flight to warn before exhaustion.
+
+### 17.5 The cycle (BC task)
+```
+cycle:
+  spinlock { swap(g_active, g_fill); }              // active = last cycle's fills
+  t0 = now
+  // (1) MESSAGE pass — fire-and-forget, marks nodes that got a command
+  for node in node_table (by address):
+    for buf in g_active[node]:                      // lock-free (we own g_active)
+      bus_tx(node, buf->payload, buf->len)          // no wait, no ack
+      mark[node] = true
+      pool_recover(buf)                             // free-list push under spinlock
+  // (2) NO_MSG sweep — feedback + liveness for the rest
+  for node in node_table (by address):
+    if node.dead or mark[node]: continue
+    bus_tx(node, NO_MSG)                            // grant the node its turn
+    arm idle-gap alarm; BLOCK                       // core0 free during the wait (§16)
+    fb = collect()                                  // node's feedback datagram, or NO_MESSAGE, or silence
+    if fb: app_deliver(node, fb)                    // -> zenoh publish / chain-tree event
+    else { node.miss_count++; if >= MAX_MISS: node.dead = true }
+  cycle_stats(now - t0)                             // §17.7
+  pace_to_period()                                  // optional fixed-rate (deterministic feedback)
+```
+Notes: command turns don't wait (fire-and-forget); only NO_MSG turns block for feedback. A node
+commanded this cycle is polled next cycle. Dead nodes are skipped; the **task re-enables** them
+(clears `dead`, an atomic byte — no lock vs the BC since both are core0, or spinlock if paranoid).
+
+### 17.6 Fixed-rate option (control loops)
+For jitter-free feedback, `pace_to_period()` blocks until `t0 + CYCLE_PERIOD` (e.g. 5 ms = 200 Hz).
+Free-running (no pace) maximizes rate but jitters. Control loops want fixed-rate; make it config.
+
+### 17.7 Real-time statistics (the watchdog)
+Per cycle, measure **full-cycle time** and keep:
+- `last / min / max / avg`,
+- **overrun count** vs a configurable **deadline**,
+- **slack** = deadline − cycle_time (early-warning as it trends to 0),
+- **slowest node** this cycle (which node inflated it — finds a slow/babbling culprit).
+Exposed via a stats command **and a zenoh notification pushed on each overrun** (lost-real-time is an
+event, not just a polled value). Plus pool high-water + exhaustion count + per-node miss/dead.
+**This is how we know if we've lost real time.**
+
+### 17.8 Uplink (pub/sub, not RPC) — for multi-client + streaming feedback
+- **Feedback**: BC batches a cycle's feedback → agent → **zenoh publish** to a key → any number of
+  clients **subscribe** (fan-out is free). Batched-per-cycle publish, not per-message RPC, so the
+  uplink isn't the bottleneck.
+- **Commands**: clients **publish** to a command key → agent drains into the producer path (grab/fill/
+  attach). Two clients → same node = two buffers on that node's list, sent in order (last-writer-wins
+  on a setpoint is an app policy); each carries its `origin_tag`.
+
+### 17.9 Build order
+1. Buffer pool (cfl_perm carve + free-list + spinlock) + the node-table-by-address.
+2. Ping-pong header sets + producer attach (one producer first: host/zenoh).
+3. The cycle (message pass + NO_MSG sweep with alarm-blocked feedback wait), single node, then N.
+4. Cycle-time stats + overrun/slack/slowest-node + zenoh notify.
+5. Pool-exhaustion exception + zenoh notify + high-water.
+6. Second producer (chain-tree engine) into the same path.
+7. Dead-node skip/re-enable; fixed-rate pacing option.
+8. Pub/sub uplink: batched feedback publish + command-key subscribe (agent side).
