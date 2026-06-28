@@ -224,6 +224,10 @@ void bus_phy_rx_isr_hook(void) {
         portYIELD_FROM_ISR(hpw);
     }
 }
+// Register the task the RX ISR wakes. The master's bus_control_task sets itself;
+// the slave's node_task registers via this setter (node_role.c) so the slave also
+// answers a POLL on the us-latency notify instead of the 1 ms node_task tick.
+void bus_rx_notify_set(TaskHandle_t t) { g_bus_task = t; }
 
 // Boot banner as an OP_DBG_LOG frame. Emitted once at boot AND re-emitted on every
 // host-attach edge (uplink_task): the cold-boot emit happens before any host can

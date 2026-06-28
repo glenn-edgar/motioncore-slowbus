@@ -60,17 +60,18 @@ void bus_node_on_data(uint8_t src, const uint8_t *payload, uint8_t len) {
     bus_node_queue(src, BUS_FT_DATA, r, n);
 }
 
+// Arbiter step 3 (slave side): wake on the RX-ISR notify, not the 1 ms tick. The PHY
+// RX ISR calls bus_phy_rx_isr_hook -> notifies this task, so a POLL is answered at us
+// latency (cuts the ~244 us slave-task turnaround) instead of up to 1 ms. ulTaskNotifyTake
+// blocks (yields to the USB worker / idle, like the old vTaskDelay -- so reflash still
+// works) and the 2 ms timeout is a safety so a missed notify still ships queued replies.
+extern void bus_rx_notify_set(TaskHandle_t t);   // app/bus_controller/main.c
 static void node_task(void *arg) {
     (void)arg;
+    bus_rx_notify_set(xTaskGetCurrentTaskHandle());
     for (;;) {
         bus_node_task();        // drain the IRQ-fed RX ring; ship queued replies
-        // Sleep one tick (1 ms) rather than taskYIELD(): taskYIELD only yields to
-        // EQUAL-or-higher priority, which starved the lower-priority USB worker so
-        // the picotool reset interface went dead (a slave couldn't be reflashed
-        // without the BOOTSEL button). A real sleep lets the USB worker (and idle)
-        // run. RX is IRQ-buffered so nothing is missed in the gap, and the 1 ms wake
-        // latency sits well inside the ~2 ms per-node POLL window (window_us=2000).
-        vTaskDelay(1);
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));   // woken by the RX ISR (us) or 2 ms safety
     }
 }
 
