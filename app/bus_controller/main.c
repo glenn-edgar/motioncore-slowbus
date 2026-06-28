@@ -263,8 +263,11 @@ void bus_rx_notify_set(TaskHandle_t t) { g_bus_task = t; g_rx_hook = slave_notif
 // §17 step 1: result scalars used by the banner; full pool/table defs are below
 // (after ROSTER_MAX / g_perm). Tentative defs here, completed in that block.
 static uint16_t g_pool_n, g_pool_selftest;
-static uint8_t  g_nodes_n;
+static volatile uint16_t g_pool_avail;     // current free count (banner/POLL_STATS read it)
+static volatile bool g_pool_ready;         // set by bus_pool_init (core1); bus task waits on it
+static uint8_t  g_nodes_n, g_pp_selftest;
 static void bus_nodetable_build(void);
+static void bus_pp_selftest(void);
 
 static void bc_emit_boot_banner(void) {
     char b[200];
@@ -480,12 +483,14 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_BUS_POLL_STATS: {   // step 2 + §17 step1: poll counters + turnaround + pool/table
         uint32_t t = g_poll_total, a = g_poll_alive, m = g_poll_miss; uint16_t ta = g_meas_ta_us;
-        uint8_t r[17] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint8_t r[20] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
-                          (uint8_t)g_pool_selftest, (uint8_t)g_pool_n, g_nodes_n };  // §17 step1
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 17); break;
+                          (uint8_t)g_pool_selftest, (uint8_t)g_pool_n, g_nodes_n,  // §17 step1 [b15,16,17]
+                          (uint8_t)g_pool_avail, (uint8_t)(g_pool_avail>>8),       // free count now [b18,19]
+                          g_pp_selftest };                                         // §17 step2 [b20]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 20); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -570,7 +575,9 @@ static void bus_control_task(void *arg) {
     g_gap_alarm = (uint)hardware_alarm_claim_unused(true);
     hardware_alarm_set_callback(g_gap_alarm, rot_alarm_cb);
     g_rx_hook = master_rx_hook;                 // RX ISR defers the idle-gap alarm (no busy-wait)
+    while (!g_pool_ready) vTaskDelay(1);         // wait for the pool carve (engine task, core1)
     bus_nodetable_build();                      // §17 step 1: node table ordered by bus address
+    bus_pp_selftest();                          // §17 step 2: exercise attach->swap->drain
     uint8_t  state = BS_SWEEP, collect_slave = 0, collect_tries = 0;
     bool     collect_is_orig = false; uint16_t collect_host = 0;
     for (;;) {
@@ -905,7 +912,7 @@ typedef struct tx_buf { struct tx_buf *next; uint8_t dest_node; uint8_t len;
                         uint8_t payload[BUS_PAYLOAD_MAX]; uint32_t origin_tag; } tx_buf_t;
 static critical_section_t g_pool_cs;
 static tx_buf_t          *g_pool_free;                 // free-list head
-static volatile uint16_t  g_pool_avail, g_pool_low;    // current / low-water
+static volatile uint16_t  g_pool_low;                  // low-water (g_pool_avail declared earlier)
 // g_pool_n, g_pool_selftest declared earlier (banner uses them)
 
 static tx_buf_t *pool_grab(void) {
@@ -937,11 +944,12 @@ static void bus_pool_init(void) {            // call once, after cfl_runtime_cre
     bool empty_ok = (pool_grab() == NULL);
     for (uint16_t i = 0; i < k; i++) pool_recover(got[i]);
     g_pool_selftest = (k == g_pool_n && empty_ok && g_pool_avail == g_pool_n) ? g_pool_n : 0;
+    g_pool_ready = true;   // pool fully carved + self-tested -> safe for the bus task to use
 }
 
-// Node table, ordered by bus address: the cycle sweep index + per-node dead-flags.
-// (Per-node ping-pong list heads land in step 2.)
-typedef struct { uint8_t addr; uint8_t enabled; uint8_t dead; uint8_t miss; } bus_node_t;
+// Node table, ordered by bus address: the cycle sweep index + per-node dead-flags +
+// the per-node ping-pong TX list heads (list[fill] for producers, list[active] for the cycle).
+typedef struct { uint8_t addr; uint8_t enabled; uint8_t dead; uint8_t miss; tx_buf_t *list[2]; } bus_node_t;
 static bus_node_t g_nodes[ROSTER_MAX];        // g_nodes_n declared earlier (banner uses it)
 static void bus_nodetable_build(void) {       // from the commissioned roster, sorted by addr
     g_nodes_n = 0;
@@ -952,6 +960,57 @@ static void bus_nodetable_build(void) {       // from the commissioned roster, s
         while (j > 0 && g_nodes[j - 1].addr > e.addr) { g_nodes[j] = g_nodes[j - 1]; j--; }
         g_nodes[j] = e; g_nodes_n++;
     }
+}
+
+// --- §17 step 2: ping-pong list heads + producer attach + swap ----------------
+// Producers attach to list[fill]; the cycle (step 3) drains list[active]; the cycle
+// swaps the index. Head ops + swap use the pool hw spinlock (brief); the active-set
+// drain is lock-free (no producer touches it after the swap).
+static volatile uint8_t g_active_idx;   // 0/1; fill = active ^ 1
+
+static int node_index_of(uint8_t addr) {
+    for (uint8_t i = 0; i < g_nodes_n; i++) if (g_nodes[i].addr == addr) return (int)i;
+    return -1;
+}
+// Producer API (host/zenoh, chain-tree): grab a buffer, fill it, attach to dest's fill list.
+// false = unknown node or pool exhausted (the exhaustion exception/notify lands in step 5).
+static bool bus_msg_send(uint8_t dest_addr, const uint8_t *payload, uint8_t len, uint32_t tag) {
+    int idx = node_index_of(dest_addr);
+    if (idx < 0) return false;
+    if (len > BUS_PAYLOAD_MAX) len = BUS_PAYLOAD_MAX;
+    tx_buf_t *b = pool_grab();
+    if (!b) return false;
+    b->dest_node = (uint8_t)idx; b->len = len; b->origin_tag = tag;
+    for (uint8_t i = 0; i < len; i++) b->payload[i] = payload[i];
+    critical_section_enter_blocking(&g_pool_cs);
+    uint8_t f = g_active_idx ^ 1u;
+    b->next = g_nodes[idx].list[f]; g_nodes[idx].list[f] = b;   // push onto the fill list
+    critical_section_exit(&g_pool_cs);
+    return true;
+}
+static void bus_pingpong_swap(void) {    // cycle boundary: flip active/fill
+    critical_section_enter_blocking(&g_pool_cs);
+    g_active_idx ^= 1u;
+    critical_section_exit(&g_pool_cs);
+}
+// Step-2 self-test: attach K msgs/node to the fill set, swap, drain the active set,
+// verify counts + that the pool round-trips (exercises grab->fill->attach->swap->drain).
+static void bus_pp_selftest(void) {
+    uint16_t before = g_pool_avail;
+    const uint8_t K = 2;
+    uint16_t attached = 0, drained = 0;
+    for (uint8_t i = 0; i < g_nodes_n; i++)
+        for (uint8_t k = 0; k < K; k++) {
+            uint8_t pl[2] = { i, k };
+            if (bus_msg_send(g_nodes[i].addr, pl, 2, 0xABCD0000u | ((uint32_t)i << 8) | k)) attached++;
+        }
+    bus_pingpong_swap();
+    uint8_t a = g_active_idx;
+    for (uint8_t i = 0; i < g_nodes_n; i++) {
+        tx_buf_t *b = g_nodes[i].list[a]; g_nodes[i].list[a] = NULL;
+        while (b) { tx_buf_t *nx = b->next; pool_recover(b); drained++; b = nx; }
+    }
+    g_pp_selftest = (attached == (uint16_t)(g_nodes_n * K) && drained == attached && g_pool_avail == before) ? 1u : 0u;
 }
 static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
 static uint16_t              g_kb1_node;   // KB1 (api) start node
