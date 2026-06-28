@@ -96,6 +96,8 @@
 #define CMD_BUS_SET_POLL         0x0163u
 #define CMD_BUS_POLL_ENABLE      0x0164u
 #define CMD_BUS_CLEAR_ROSTER     0x0165u
+#define CMD_BUS_POLL_STATS       0x0166u // arbiter step 2: -> [total u32][alive u32][miss u32][meas_ta_us u16]
+#define CMD_BUS_MEASURE_TA       0x0167u // arbiter step 2: busy-spin the next slots to probe true POLL->reply turnaround
 #define BUS_REG_OK               0u
 #define SHELL_OK                 0u
 #define SHELL_UNKNOWN_CMD        1u
@@ -205,6 +207,11 @@ static uint32_t g_bus_baud;   // resolved RS-485 baud (config 'sp', else BUS_DEF
 static uint8_t g_cfg_roster_n;   // slaves loaded from the 'slvr' config file at boot (0 if none)
 static uint16_t g_poll_period_ms = 500;
 static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
+// Arbiter step 2 instrumentation: back-to-back poll counters + turnaround probe.
+static volatile uint32_t g_poll_total, g_poll_alive, g_poll_miss;
+static volatile uint16_t g_last_ta_us;    // bus_poll_slot writes the slot's POLL->first-word turnaround
+static volatile uint16_t g_meas_ta_us;    // last turnaround captured during a busy-spin probe
+static volatile uint8_t  g_ta_measure;    // >0 = busy-spin (no yield) the next slots to probe turnaround
 
 // Boot banner as an OP_DBG_LOG frame. Emitted once at boot AND re-emitted on every
 // host-attach edge (uplink_task): the cold-boot emit happens before any host can
@@ -422,6 +429,17 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
     case CMD_BUS_POLL_ENABLE:
         if (alen >= 1) g_poll_enabled = args[0];
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    case CMD_BUS_POLL_STATS: {   // step 2: back-to-back poll counters + measured turnaround
+        uint32_t t = g_poll_total, a = g_poll_alive, m = g_poll_miss; uint16_t ta = g_meas_ta_us;
+        uint8_t r[14] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+                          (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
+                          (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
+                          (uint8_t)ta,(uint8_t)(ta>>8) };
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 14); break;
+    }
+    case CMD_BUS_MEASURE_TA:     // busy-spin the next ~16 slots to probe true POLL->reply turnaround
+        g_ta_measure = 16;
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_APP_PP_START:   // [addr] -> start the free-running chain-flow ping-pong loop
         if (alen >= 1) g_pp_addr = args[0];
         g_pp_master = 0; g_pp_slave_seen = 0;
@@ -451,7 +469,7 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
 // busy-spins only during the short burst for us-precision idle detection. The ISR
 // migration (steps 2-3) removes the spin entirely. Values are for 460800; make them
 // bit-time-relative later (TODO in the spec).
-#define T_RESP_US        8000u   // first-word deadline -> dead-node (task-latency safe)
+#define T_RESP_US        3000u   // first-word deadline -> dead-node (HW-measured turnaround ~482us; 6x margin)
 #define T_GAP_US          300u   // inter-frame idle -> end of the node's burst
 #define T_WINDOW_MAX_US 12000u   // per-node burst ceiling (anti-babble)
 
@@ -472,7 +490,9 @@ static void handle_slot_frame(uint8_t addr, const bus_frame_t *rf) {
 }
 
 // Poll `addr` and collect its burst with idle-gap delimiting. `rf` = scratch frame.
-static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf) {
+// `busy` = true: don't yield while awaiting the first word (us-precision turnaround
+// probe); false (normal): yield in 1 ms chunks so core0/USB keeps running.
+static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf, bool busy) {
     bus_send(addr, BUS_FT_POLL, NULL, 0);
     uint32_t t_poll = time_us_32(), t_last = t_poll, slot_start = 0;
     bool seen = false, from_addr = false;
@@ -480,7 +500,10 @@ static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf) {
         uint16_t w;
         while (bus_phy_rx_pop(&w)) {
             uint32_t tw = time_us_32();
-            if (!seen) { seen = true; slot_start = tw; }
+            if (!seen) {
+                seen = true; slot_start = tw;
+                uint32_t ta = tw - t_poll; g_last_ta_us = (ta > 0xFFFFu) ? 0xFFFFu : (uint16_t)ta;
+            }
             t_last = tw;
             if (bus_asm_feed(&g_bc, w, rf) && rf->src == addr) {
                 from_addr = true; handle_slot_frame(addr, rf);
@@ -489,7 +512,7 @@ static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf) {
         uint32_t now = time_us_32();
         if (!seen) {
             if (now - t_poll >= T_RESP_US) return SLOT_NO_RESPONSE;   // dead node
-            vTaskDelay(1);                                            // pre-response: yield (RX is IRQ-buffered)
+            if (!busy) vTaskDelay(1);                                 // pre-response: yield (RX is IRQ-buffered)
         } else {
             if (now - t_last >= T_GAP_US)  return from_addr ? SLOT_OK : SLOT_NO_RESPONSE;
             if (now - slot_start >= T_WINDOW_MAX_US) return from_addr ? SLOT_BABBLE : SLOT_NO_RESPONSE;
@@ -505,7 +528,6 @@ static void bus_control_task(void *arg) {
     (void)arg;
     uint8_t  state = BS_SWEEP, collect_slave = 0, collect_tries = 0;
     bool     collect_is_orig = false; uint16_t collect_host = 0;
-    uint32_t sweep_next_ms = 0;
     for (;;) {
         g_hb[HB_BUS]++; g_hb_us[HB_BUS] = time_us_32();
         // Identity refused -> quarantine: never drive the bus. Heartbeat keeps
@@ -615,24 +637,28 @@ static void bus_control_task(void *arg) {
             }
             if (pp_round && state == BS_SWEEP) pp_kick();   // free-running: originate the next round
         } else {  // BS_SWEEP
-            if (g_poll_enabled && (int32_t)(now - sweep_next_ms) >= 0) {
-                sweep_next_ms = now + g_poll_period_ms;
+            // Step 2: back-to-back rotation — no g_poll_period_ms gate; poll the next
+            // enabled node every pass. The slot itself yields (bus_poll_slot / the
+            // loop-end delay) so core0/USB still runs. Counters feed CMD_BUS_POLL_STATS.
+            if (g_poll_enabled) {
                 LOCK(); uint8_t addr = next_enabled_addr(); UNLOCK();
                 if (addr != 0xFF) {
-                    // Step 1: idle-gap delimited slot (replaces the blocking bus_recv).
-                    // Frames are delivered inside bus_poll_slot; here we only set liveness.
-                    slot_result_t sr = bus_poll_slot(addr, &rf);
+                    bool measure = (g_ta_measure != 0);
+                    slot_result_t sr = bus_poll_slot(addr, &rf, measure);
                     uint32_t seen_ms = to_ms_since_boot(get_absolute_time());
                     LOCK();
-                    if (sr == SLOT_NO_RESPONSE) mark_miss(addr);
-                    else                        mark_alive(addr, seen_ms);  // SLOT_OK or SLOT_BABBLE
+                    g_poll_total++;
+                    if (sr == SLOT_NO_RESPONSE) { g_poll_miss++; mark_miss(addr); }
+                    else { g_poll_alive++; mark_alive(addr, seen_ms);           // SLOT_OK or SLOT_BABBLE
+                           if (measure) g_meas_ta_us = g_last_ta_us; }
+                    if (g_ta_measure) g_ta_measure--;
                     UNLOCK();
                 }
             }
         }
 
         LOCK(); emit_liveness_edges(); UNLOCK();
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(1));   // step 2: minimal inter-slot yield (USB/core0); ISR removes it (step 3)
     }
 }
 
