@@ -212,6 +212,18 @@ static volatile uint32_t g_poll_total, g_poll_alive, g_poll_miss;
 static volatile uint16_t g_last_ta_us;    // bus_poll_slot writes the slot's POLL->first-word turnaround
 static volatile uint16_t g_meas_ta_us;    // last turnaround captured during a busy-spin probe
 static volatile uint8_t  g_ta_measure;    // >0 = busy-spin (no yield) the next slots to probe turnaround
+static TaskHandle_t      g_bus_task;      // arbiter task handle (woken by the RX ISR hook)
+
+// Arbiter step 3: wake the bus task the instant the bus goes active. Overrides the
+// weak PHY hook (port/rp2040/phy_pio_rs485.c) — called in the RX-FIFO ISR. Replaces
+// the 1 ms FreeRTOS-tick poll wait with a us-latency notify. FromISR-safe.
+void bus_phy_rx_isr_hook(void) {
+    if (g_bus_task) {
+        BaseType_t hpw = pdFALSE;
+        vTaskNotifyGiveFromISR(g_bus_task, &hpw);
+        portYIELD_FROM_ISR(hpw);
+    }
+}
 
 // Boot banner as an OP_DBG_LOG frame. Emitted once at boot AND re-emitted on every
 // host-attach edge (uplink_task): the cold-boot emit happens before any host can
@@ -494,6 +506,7 @@ static void handle_slot_frame(uint8_t addr, const bus_frame_t *rf) {
 // probe); false (normal): yield in 1 ms chunks so core0/USB keeps running.
 static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf, bool busy) {
     bus_send(addr, BUS_FT_POLL, NULL, 0);
+    (void)ulTaskNotifyTake(pdTRUE, 0);   // clear any stale RX notification before this slot
     uint32_t t_poll = time_us_32(), t_last = t_poll, slot_start = 0;
     bool seen = false, from_addr = false;
     for (;;) {
@@ -512,7 +525,10 @@ static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf, bool busy) {
         uint32_t now = time_us_32();
         if (!seen) {
             if (now - t_poll >= T_RESP_US) return SLOT_NO_RESPONSE;   // dead node
-            if (!busy) vTaskDelay(1);                                 // pre-response: yield (RX is IRQ-buffered)
+            // Block until the RX ISR signals a word (us latency) or a 2 ms safety
+            // timeout (re-checks the T_RESP deadline). Measure mode busy-spins for
+            // us-precision turnaround. This is what removes the 1 ms tick quantization.
+            if (!busy) (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
         } else {
             if (now - t_last >= T_GAP_US)  return from_addr ? SLOT_OK : SLOT_NO_RESPONSE;
             if (now - slot_start >= T_WINDOW_MAX_US) return from_addr ? SLOT_BABBLE : SLOT_NO_RESPONSE;
@@ -526,6 +542,7 @@ enum { BS_SWEEP = 0, BS_CMD_INJECT, BS_CMD_COLLECT };
 
 static void bus_control_task(void *arg) {
     (void)arg;
+    g_bus_task = xTaskGetCurrentTaskHandle();   // step 3: RX ISR notifies this task
     uint8_t  state = BS_SWEEP, collect_slave = 0, collect_tries = 0;
     bool     collect_is_orig = false; uint16_t collect_host = 0;
     for (;;) {
@@ -637,28 +654,31 @@ static void bus_control_task(void *arg) {
             }
             if (pp_round && state == BS_SWEEP) pp_kick();   // free-running: originate the next round
         } else {  // BS_SWEEP
-            // Step 2: back-to-back rotation — no g_poll_period_ms gate; poll the next
-            // enabled node every pass. The slot itself yields (bus_poll_slot / the
-            // loop-end delay) so core0/USB still runs. Counters feed CMD_BUS_POLL_STATS.
-            if (g_poll_enabled) {
-                LOCK(); uint8_t addr = next_enabled_addr(); UNLOCK();
-                if (addr != 0xFF) {
-                    bool measure = (g_ta_measure != 0);
-                    slot_result_t sr = bus_poll_slot(addr, &rf, measure);
-                    uint32_t seen_ms = to_ms_since_boot(get_absolute_time());
-                    LOCK();
-                    g_poll_total++;
-                    if (sr == SLOT_NO_RESPONSE) { g_poll_miss++; mark_miss(addr); }
-                    else { g_poll_alive++; mark_alive(addr, seen_ms);           // SLOT_OK or SLOT_BABBLE
-                           if (measure) g_meas_ta_us = g_last_ta_us; }
-                    if (g_ta_measure) g_ta_measure--;
-                    UNLOCK();
-                }
+            // Step 2/3: back-to-back rotation — no g_poll_period_ms gate; poll the next
+            // enabled node every pass. bus_poll_slot blocks on the RX-ISR notify while
+            // awaiting the reply (us latency, yields core0/USB), so no 1 ms tick wait.
+            uint8_t addr = 0xFF;
+            if (g_poll_enabled) { LOCK(); addr = next_enabled_addr(); UNLOCK(); }
+            if (addr != 0xFF) {
+                bool measure = (g_ta_measure != 0);
+                slot_result_t sr = bus_poll_slot(addr, &rf, measure);
+                uint32_t seen_ms = to_ms_since_boot(get_absolute_time());
+                LOCK();
+                g_poll_total++;
+                if (sr == SLOT_NO_RESPONSE) { g_poll_miss++; mark_miss(addr); }
+                else { g_poll_alive++; mark_alive(addr, seen_ms);           // SLOT_OK or SLOT_BABBLE
+                       if (measure) g_meas_ta_us = g_last_ta_us; }
+                if (g_ta_measure) g_ta_measure--;
+                UNLOCK();
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(1));   // nothing enabled to poll -> idle
             }
         }
 
         LOCK(); emit_liveness_edges(); UNLOCK();
-        vTaskDelay(pdMS_TO_TICKS(1));   // step 2: minimal inter-slot yield (USB/core0); ISR removes it (step 3)
+        // Step 3: no unconditional inter-slot delay — each path already yields
+        // (bus_poll_slot blocks on the RX-ISR notify; bus_recv yields; idle SWEEP
+        // vTaskDelay(1)). This is what lets the rotation run at the bus/turnaround limit.
     }
 }
 

@@ -42,6 +42,12 @@ static volatile uint16_t s_ring[RX_RING_SIZE];
 static volatile uint32_t s_ring_head, s_ring_tail;   // free-running counters
 static bool     s_irq_installed;
 
+// Weak hook called at the end of the RX ISR (the ISR runs only on RX-FIFO-not-empty,
+// so bus activity just arrived). The app overrides this to notify its bus arbiter
+// task FromISR, so the rotation wakes immediately on a reply instead of waiting on
+// the FreeRTOS tick. Default no-op keeps the PHY FreeRTOS-agnostic.
+__attribute__((weak)) void bus_phy_rx_isr_hook(void) {}
+
 static void phy_rx_isr(void) {
     while (!pio_sm_is_rx_fifo_empty(PHY_PIO, s_sm_rx)) {
         uint32_t w = pio_sm_get(PHY_PIO, s_sm_rx);    // also clears the IRQ source
@@ -54,6 +60,7 @@ static void phy_rx_isr(void) {
             s_rx_overrun++;                           // ring full -> drop
         }
     }
+    bus_phy_rx_isr_hook();
 }
 
 static void apply_clkdiv(uint32_t baud) {
