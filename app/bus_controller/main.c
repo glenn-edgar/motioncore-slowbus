@@ -37,6 +37,7 @@
 #include "hardware/pio.h"           // servo bank PIO
 #include "hardware/clocks.h"        // clock_get_hz (servo 1 us/tick)
 #include "hardware/i2c.h"           // HIL I2C manager on GP10/11
+#include "hardware/timer.h"         // hardware_alarm_* (liveness-slot idle-gap alarm)
 #ifdef I2C_SELFTEST
 #include "pico/i2c_slave.h"         // i2c0 loopback self-test fixture (opt-in)
 #endif
@@ -97,7 +98,7 @@
 #define CMD_BUS_POLL_ENABLE      0x0164u
 #define CMD_BUS_CLEAR_ROSTER     0x0165u
 #define CMD_BUS_POLL_STATS       0x0166u // arbiter step 2: -> [total u32][alive u32][miss u32][meas_ta_us u16]
-#define CMD_BUS_MEASURE_TA       0x0167u // arbiter step 2: busy-spin the next slots to probe true POLL->reply turnaround
+#define CMD_BUS_MEASURE_TA       0x0167u // arbiter step 2: latch the measured POLL->reply turnaround
 #define BUS_REG_OK               0u
 #define SHELL_OK                 0u
 #define SHELL_UNKNOWN_CMD        1u
@@ -210,24 +211,48 @@ static uint8_t  g_poll_max_misses = 3, g_poll_tcp_retries = 2, g_poll_enabled;
 // Arbiter step 2 instrumentation: back-to-back poll counters + turnaround probe.
 static volatile uint32_t g_poll_total, g_poll_alive, g_poll_miss;
 static volatile uint16_t g_last_ta_us;    // bus_poll_slot writes the slot's POLL->first-word turnaround
-static volatile uint16_t g_meas_ta_us;    // last turnaround captured during a busy-spin probe
-static volatile uint8_t  g_ta_measure;    // >0 = busy-spin (no yield) the next slots to probe turnaround
+static volatile uint16_t g_meas_ta_us;    // latched turnaround (now measured every slot by the RX ISR)
 static TaskHandle_t      g_bus_task;      // arbiter task handle (woken by the RX ISR hook)
 
-// Arbiter step 3: wake the bus task the instant the bus goes active. Overrides the
-// weak PHY hook (port/rp2040/phy_pio_rs485.c) — called in the RX-FIFO ISR. Replaces
-// the 1 ms FreeRTOS-tick poll wait with a us-latency notify. FromISR-safe.
-void bus_phy_rx_isr_hook(void) {
-    if (g_bus_task) {
-        BaseType_t hpw = pdFALSE;
-        vTaskNotifyGiveFromISR(g_bus_task, &hpw);
-        portYIELD_FROM_ISR(hpw);
-    }
+// Slot timing (460800; make bit-time-relative later). Defined here because the RX
+// ISR hook below uses T_GAP_US.
+#define T_RESP_US        3000u   // first-word deadline -> dead-node (HW turnaround ~210-480us)
+#define T_GAP_US          300u   // inter-frame idle -> end of the node's burst
+#define T_WINDOW_MAX_US 12000u   // per-node burst ceiling (anti-babble)
+
+// --- RX-ISR dispatch (per role) + the master's liveness-slot idle-gap alarm ----
+// The PHY RX ISR calls bus_phy_rx_isr_hook after draining words; behaviour is set
+// per role at task start. SLAVE: notify node_task to respond (us latency). MASTER:
+// during a liveness slot it just pushes the idle-gap alarm out by T_GAP -- the bus
+// task stays BLOCKED for the whole slot and wakes ONCE (alarm at last-word+T_GAP, or
+// at T_RESP if no reply), so core0 isn't burned busy-waiting. The slot SM + roster
+// stay in the task (nothing mutex-guarded is touched from an ISR).
+static void          (*g_rx_hook)(void);     // per-role RX-ISR action
+static uint            g_gap_alarm;          // master: claimed hardware alarm
+static volatile bool   g_slot_active;        // master: a liveness slot awaits the bus
+static volatile uint32_t g_slot_poll_us;     // master: time the POLL went out
+static volatile bool   g_slot_first;         // master: first reply word seen this slot
+
+static void rot_alarm_cb(uint n) {           // idle-gap / T_RESP fired -> wake the bus task once
+    (void)n;
+    if (g_bus_task) { BaseType_t h = pdFALSE; vTaskNotifyGiveFromISR(g_bus_task, &h); portYIELD_FROM_ISR(h); }
 }
-// Register the task the RX ISR wakes. The master's bus_control_task sets itself;
-// the slave's node_task registers via this setter (node_role.c) so the slave also
-// answers a POLL on the us-latency notify instead of the 1 ms node_task tick.
-void bus_rx_notify_set(TaskHandle_t t) { g_bus_task = t; }
+static void master_rx_hook(void) {           // RX words arrived during a slot: defer the idle deadline
+    if (!g_slot_active) return;
+    if (!g_slot_first) {
+        g_slot_first = true;
+        uint32_t ta = time_us_32() - g_slot_poll_us;
+        g_last_ta_us = (ta > 0xFFFFu) ? 0xFFFFu : (uint16_t)ta;
+    }
+    hardware_alarm_set_target(g_gap_alarm, make_timeout_time_us(T_GAP_US));
+}
+static void slave_notify_hook(void) {        // slave: wake node_task to answer the POLL
+    if (g_bus_task) { BaseType_t h = pdFALSE; vTaskNotifyGiveFromISR(g_bus_task, &h); portYIELD_FROM_ISR(h); }
+}
+void bus_phy_rx_isr_hook(void) { if (g_rx_hook) g_rx_hook(); }
+
+// Slave registers here (node_role.c): node_task is woken per RX so it answers at us latency.
+void bus_rx_notify_set(TaskHandle_t t) { g_bus_task = t; g_rx_hook = slave_notify_hook; }
 
 // Boot banner as an OP_DBG_LOG frame. Emitted once at boot AND re-emitted on every
 // host-attach edge (uplink_task): the cold-boot emit happens before any host can
@@ -453,8 +478,8 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           (uint8_t)ta,(uint8_t)(ta>>8) };
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 14); break;
     }
-    case CMD_BUS_MEASURE_TA:     // busy-spin the next ~16 slots to probe true POLL->reply turnaround
-        g_ta_measure = 16;
+    case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
+        g_meas_ta_us = g_last_ta_us;
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_APP_PP_START:   // [addr] -> start the free-running chain-flow ping-pong loop
         if (alen >= 1) g_pp_addr = args[0];
@@ -485,10 +510,6 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
 // busy-spins only during the short burst for us-precision idle detection. The ISR
 // migration (steps 2-3) removes the spin entirely. Values are for 460800; make them
 // bit-time-relative later (TODO in the spec).
-#define T_RESP_US        3000u   // first-word deadline -> dead-node (HW-measured turnaround ~482us; 6x margin)
-#define T_GAP_US          300u   // inter-frame idle -> end of the node's burst
-#define T_WINDOW_MAX_US 12000u   // per-node burst ceiling (anti-babble)
-
 typedef enum { SLOT_NO_RESPONSE = 0, SLOT_OK, SLOT_BABBLE } slot_result_t;
 
 // Deliver one assembled frame from the granted node (relay reply / record summary).
@@ -505,40 +526,30 @@ static void handle_slot_frame(uint8_t addr, const bus_frame_t *rf) {
     UNLOCK();
 }
 
-// Poll `addr` and collect its burst with idle-gap delimiting. `rf` = scratch frame.
-// `busy` = true: don't yield while awaiting the first word (us-precision turnaround
-// probe); false (normal): yield in 1 ms chunks so core0/USB keeps running.
-static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf, bool busy) {
-    bus_send(addr, BUS_FT_POLL, NULL, 0);
-    (void)ulTaskNotifyTake(pdTRUE, 0);   // clear any stale RX notification before this slot
-    uint32_t t_poll = time_us_32(), t_last = t_poll, slot_start = 0;
-    bool seen = false, from_addr = false;
-    for (;;) {
-        uint16_t w;
-        while (bus_phy_rx_pop(&w)) {
-            uint32_t tw = time_us_32();
-            if (!seen) {
-                seen = true; slot_start = tw;
-                uint32_t ta = tw - t_poll; g_last_ta_us = (ta > 0xFFFFu) ? 0xFFFFu : (uint16_t)ta;
-            }
-            t_last = tw;
-            if (bus_asm_feed(&g_bc, w, rf) && rf->src == addr) {
-                from_addr = true; handle_slot_frame(addr, rf);
-            }
-        }
-        uint32_t now = time_us_32();
-        if (!seen) {
-            if (now - t_poll >= T_RESP_US) return SLOT_NO_RESPONSE;   // dead node
-            // Block until the RX ISR signals a word (us latency) or a 2 ms safety
-            // timeout (re-checks the T_RESP deadline). Measure mode busy-spins for
-            // us-precision turnaround. This is what removes the 1 ms tick quantization.
-            if (!busy) (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
-        } else {
-            if (now - t_last >= T_GAP_US)  return from_addr ? SLOT_OK : SLOT_NO_RESPONSE;
-            if (now - slot_start >= T_WINDOW_MAX_US) return from_addr ? SLOT_BABBLE : SLOT_NO_RESPONSE;
-            // in-burst: busy-spin for us-precision idle detection (burst is short)
-        }
+// Poll `addr` and collect its whole reply burst. The bus task BLOCKS for the entire
+// slot: arm the idle-gap alarm to the T_RESP first-word deadline, then sleep. The RX
+// ISR (master_rx_hook) pushes the alarm out by T_GAP on each word, so the alarm fires
+// ONCE -- at last-word+T_GAP (burst complete) or at T_RESP (no reply). core0 is free
+// the entire wait (no busy-spin); one wake per slot. The burst is drained + assembled
+// here afterwards (idle has elapsed, so it is complete).
+static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf) {
+    g_slot_first = false;
+    (void)ulTaskNotifyTake(pdTRUE, 0);                 // clear stale notify
+    bus_send(addr, BUS_FT_POLL, NULL, 0);              // flushes the RX ring, then TX
+    g_slot_poll_us = time_us_32();
+    hardware_alarm_set_target(g_gap_alarm, make_timeout_time_us(T_RESP_US));
+    g_slot_active = true;                               // RX ISR now defers the alarm per word
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(T_WINDOW_MAX_US / 1000u + 4u));  // wake on alarm (or safety)
+    g_slot_active = false;
+    hardware_alarm_cancel(g_gap_alarm);
+    bool babble = (uint32_t)(time_us_32() - g_slot_poll_us) >= T_WINDOW_MAX_US;
+    bool from_addr = false;
+    uint16_t w;
+    while (bus_phy_rx_pop(&w)) {
+        if (bus_asm_feed(&g_bc, w, rf) && rf->src == addr) { from_addr = true; handle_slot_frame(addr, rf); }
     }
+    if (!from_addr) return SLOT_NO_RESPONSE;
+    return babble ? SLOT_BABBLE : SLOT_OK;
 }
 
 // ---- bus thread: per-iteration state machine, one bus transaction per pass --
@@ -546,7 +557,10 @@ enum { BS_SWEEP = 0, BS_CMD_INJECT, BS_CMD_COLLECT };
 
 static void bus_control_task(void *arg) {
     (void)arg;
-    g_bus_task = xTaskGetCurrentTaskHandle();   // step 3: RX ISR notifies this task
+    g_bus_task = xTaskGetCurrentTaskHandle();   // step 3: RX ISR / alarm wake this task
+    g_gap_alarm = (uint)hardware_alarm_claim_unused(true);
+    hardware_alarm_set_callback(g_gap_alarm, rot_alarm_cb);
+    g_rx_hook = master_rx_hook;                 // RX ISR defers the idle-gap alarm (no busy-wait)
     uint8_t  state = BS_SWEEP, collect_slave = 0, collect_tries = 0;
     bool     collect_is_orig = false; uint16_t collect_host = 0;
     for (;;) {
@@ -664,15 +678,12 @@ static void bus_control_task(void *arg) {
             uint8_t addr = 0xFF;
             if (g_poll_enabled) { LOCK(); addr = next_enabled_addr(); UNLOCK(); }
             if (addr != 0xFF) {
-                bool measure = (g_ta_measure != 0);
-                slot_result_t sr = bus_poll_slot(addr, &rf, measure);
+                slot_result_t sr = bus_poll_slot(addr, &rf);   // blocks the whole slot (core0 free)
                 uint32_t seen_ms = to_ms_since_boot(get_absolute_time());
                 LOCK();
                 g_poll_total++;
                 if (sr == SLOT_NO_RESPONSE) { g_poll_miss++; mark_miss(addr); }
-                else { g_poll_alive++; mark_alive(addr, seen_ms);           // SLOT_OK or SLOT_BABBLE
-                       if (measure) g_meas_ta_us = g_last_ta_us; }
-                if (g_ta_measure) g_ta_measure--;
+                else { g_poll_alive++; mark_alive(addr, seen_ms); g_meas_ta_us = g_last_ta_us; }  // SLOT_OK or SLOT_BABBLE
                 UNLOCK();
             } else {
                 vTaskDelay(pdMS_TO_TICKS(1));   // nothing enabled to poll -> idle
