@@ -52,6 +52,11 @@ set(LIBCOMM_DIR ${PORT_DIR}/vendor/libcomm)
 # BOARD_DIR first so #include "board.h" resolves to the active board's pin map.
 set(COMMON_INC ${CORE_DIR} ${BOARD_DIR} ${PORT_DIR} ${CMAKE_CURRENT_LIST_DIR})
 
+# bus_controller is the "Pico W equivalent" image: Pico W and Pico 2 W share the
+# SAME physical pinout, so it always uses the RP2040 board.h (in PORT_DIR) and
+# builds unchanged on RP2350 — no BOARD_DIR (that's the vib_node-only pin map).
+set(BC_INC ${CORE_DIR} ${PORT_DIR} ${CMAKE_CURRENT_LIST_DIR})
+
 # Helper: define a firmware image for a role with its own uplink + extra srcs.
 # WIFI=1 links the CYW43 stack (BC + UPLINK=wifi); slaves never set it.
 function(slow_bus_image name)
@@ -126,7 +131,7 @@ function(define_bus_controller name)
     pico_generate_pio_header(${name} ${PORT_DIR}/rs485.pio)
     pico_generate_pio_header(${name} ${PORT_DIR}/servo_bank.pio)              # 8-servo bank
     target_include_directories(${name} PRIVATE
-        ${COMMON_INC} ${NODE_DIR} ${NODE_DIR}/interlock ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
+        ${BC_INC} ${NODE_DIR} ${NODE_DIR}/interlock ${LIBCOMM_DIR} ${CMAKE_CURRENT_LIST_DIR}/app/chassis
         ${BC_DIR}/engine/include ${BC_DIR}/kb0/incr)
     target_compile_definitions(${name} PRIVATE
         PICO_PRINTF_SUPPORT_FLOAT=0 PICO_STDIO_ENABLE_CRLF_SUPPORT=0 CFL_32BIT=1)
