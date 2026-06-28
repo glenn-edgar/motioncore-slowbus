@@ -260,3 +260,91 @@ slot. No wire-format change (same `bus_frame` codec, same 9-bit MPCM).
 6. **Dead-node slow-poll + anti-babble** — demotion/recovery + `T_WINDOW_MAX`; fault-inject a
    babbling node.
 ```
+
+---
+
+## 14. Measured slot budget (HW, 2026-06-28) — what's actually expensive
+
+After step 3 (ISR-notify rotation), at 950 polls/s the ~1.05 ms slot breaks down as:
+
+| Phase | ~µs | Nature |
+|---|---|---|
+| POLL frame wire (7 words @460800) | ~167 | bus active (floor) |
+| **slave turnaround (RX-complete → first reply word)** | **~244** | **bus idle — slave *task* wakes to run `node_emit_window`** |
+| reply burst wire (NO_MESSAGE, 7 words) | ~167 | bus active |
+| `T_GAP` idle-confirm | ~300→ | bus idle (tunable) |
+| 2× context switch (block/wake) | ~2 | master CPU |
+
+**Findings that redirect the optimization:**
+- The **master context switch is ~0.2%** of the slot — moving the master fully into the ISR does *not* help throughput (it helps *CPU*, see §16).
+- **`T_GAP` is not the lever** either: HW-tested 300→100 µs gained only ~3% (950→981) and caused a rare false-miss (too tight for inter-word jitter). Keep `T_GAP` ≈ 300 µs.
+- The dominant removable cost is the **~244 µs slave-task turnaround** → answer from the slave ISR (§15). That is the real throughput win.
+
+---
+
+## 15. Slave ISR responder + ping-pong staging (the throughput win)
+
+Cut the slave's RX-complete → TX-first-word latency from ~244 µs (task wake) to ~ISR latency by
+**pre-staging the outgoing window and firing it from the slave's RX ISR**.
+
+**Mechanism — decouple PREPARE (task) from TRANSMIT (ISR):**
+```
+Slave task (responder/engine)             Slave RX ISR (frame complete = grant for my_addr)
+  encode the outgoing window into the       push ACTIVE buffer words -> PIO TX FIFO   (instant TX)
+  STAGING buffer (pre-encoded 9-bit         swap ACTIVE <-> STAGING (atomic index flip)
+  words: reply + s2s frames + NO_MESSAGE)   notify task: "refill staging"
+        ▲──────────────── refill ──────────────┘
+```
+- **Two pre-encoded word buffers** (ping-pong). The ISR always holds a ready buffer → no task wakeup in the response path.
+- **Default = `NO_MESSAGE` staged** → an idle slave answers immediately from the ISR (stays ALIVE) with zero task involvement.
+- **Atomic swap** in the ISR (index flip); ping-pong guarantees the task never writes the buffer the ISR is reading.
+
+**Nuances:**
+1. **TX-FIFO depth = 8 words.** A single reply / `NO_MESSAGE` (≤8 words) → the ISR pushes it whole.
+   A **multi-frame** window (reply + slave-to-slave burst, >8 words) → needs a **TX-FIFO-not-full
+   IRQ** to feed the remainder. So: simple = pure RX-ISR; burst = RX-ISR + TX-refill IRQ.
+2. **Freshness / correlation.** A *data* reply is still *produced* by the task (engine-tick latency
+   unchanged) and staged; TX is then instant. The master correlates by `req_id`, so the task stages
+   the right reply. `NO_MESSAGE` is always safe to (re)fire.
+3. **Same `bus_controller` image** — this is the slave-role path (`bus_node`/`node_emit_window`)
+   moving to RX-ISR + ping-pong. The master arbiter is untouched.
+4. **Risk:** TX-from-ISR (brick-needs-physical-recovery category) — justified here (buys ~244 µs
+   vs the 2 µs the master context switch was worth).
+
+**Expected:** turnaround ~411 → ~175 µs → slot ~0.8 ms → ~1250 polls/s (1 slave); with the master
+full-ISR (§16) freeing CPU, both ends run lean. Next floor = the POLL wire time (~167 µs); a lean
+2-word grant frame (preamble+addr) ≈ 48 µs is a later wire-format optimization.
+
+---
+
+## 16. Master full-ISR rotation (CPU + determinism, not throughput)
+
+Step 3 left the slot state machine in the task (RX-ISR *wakes* it). Moving it fully into the ISRs:
+
+- **RX-word IRQ + hardware alarm drive the slot SM.** A **liveness** slot (POLL → `NO_MESSAGE` →
+  mark-alive → advance → TX next POLL) runs **100% in ISR — no task wake at all.** Only a **DATA**
+  frame is enqueued to a deferred task (host relay / engine routing).
+- **Removes the ~45% core0 busy-spin** (the burst/`T_GAP` wait becomes RX-word/alarm driven, core0
+  idle between words) **and the per-slot context switch** for liveness.
+- **It does NOT raise throughput** (the slot is turnaround-bound, §14) — its value is freeing core0
+  for a contended production master (WiFi + engine + relay) and rotation determinism. Pair it with
+  §15 (slave ISR), which is the actual throughput win.
+
+**Components:** claim a hardware alarm; on POLL TX arm `T_RESP`; RX-word ISR feeds the assembler,
+rearms the alarm to `T_GAP`, and on a complete frame either advances (liveness) or enqueues (data);
+alarm ISR ends the slot (`T_RESP`/`T_GAP`/`T_WINDOW_MAX`) → mark roster → TX next POLL.
+
+**Concurrency:** the PIO RX IRQ and the timer alarm IRQ both touch the slot state → give them the
+**same NVIC priority** so they serialize (no nesting races). Roster counters: single-writer (the
+arbiter ISRs); the task reads under a short critical section. **Deferred-data context switch
+reappears only for data frames**, off the timing path — liveness never switches.
+
+**Safety:** an **arbiter liveness counter** the watchdog task checks (a stuck rotation must reboot);
+bounded ISR work (no blocking, no heavy parsing in ISR); keep the heartbeat fed. **Brick risk is
+real** (TX/SM/assembler in ISR) → physical BOOTSEL recovery if it wedges; verify incrementally.
+
+### Build order (continued)
+7. **Slave ISR responder + ping-pong** (§15) — the throughput win. HW: turnaround drops, poll rate up.
+8. **Master full-ISR rotation** (§16) — CPU/determinism. HW: core0 freed, liveness needs no task,
+   watchdog-safe, no rotation stalls.
+(§14's findings supersede the earlier guess that `T_GAP`/the master context switch were levers.)
