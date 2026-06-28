@@ -38,6 +38,7 @@
 #include "hardware/clocks.h"        // clock_get_hz (servo 1 us/tick)
 #include "hardware/i2c.h"           // HIL I2C manager on GP10/11
 #include "hardware/timer.h"         // hardware_alarm_* (liveness-slot idle-gap alarm)
+#include "pico/critical_section.h"   // hw spinlock + IRQ-save (TX buffer pool, §17)
 #ifdef I2C_SELFTEST
 #include "pico/i2c_slave.h"         // i2c0 loopback self-test fixture (opt-in)
 #endif
@@ -259,12 +260,19 @@ void bus_rx_notify_set(TaskHandle_t t) { g_bus_task = t; g_rx_hook = slave_notif
 // attach, and the SDK drops CDC output while disconnected, so the attach-time
 // re-emit is what actually makes `ident` observable over USB. Caller serializes
 // host_link access (boot path is pre-scheduler; uplink holds g_lock).
+// §17 step 1: result scalars used by the banner; full pool/table defs are below
+// (after ROSTER_MAX / g_perm). Tentative defs here, completed in that block.
+static uint16_t g_pool_n, g_pool_selftest;
+static uint8_t  g_nodes_n;
+static void bus_nodetable_build(void);
+
 static void bc_emit_boot_banner(void) {
     char b[200];
-    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d il=%d ilfail=0x%08X slvr=%u baud=%u neti=%d",
+    int n = snprintf(b, sizeof b, "[boot] bus_controller boot#%u rst=%s ident=%d%s hwio=%d il=%d ilfail=0x%08X slvr=%u baud=%u neti=%d pool=%u/%u nodes=%u",
                      (unsigned)g_crash.boot_count, RST_NAME[g_crash.last_cause], g_id_rc,
                      g_identity_refused ? " REFUSED" : "", g_hwio_rc, g_ilcf_rc, (unsigned)g_il_armfail,
-                     (unsigned)g_cfg_roster_n, (unsigned)g_bus_baud, g_neti_rc);
+                     (unsigned)g_cfg_roster_n, (unsigned)g_bus_baud, g_neti_rc,
+                     (unsigned)g_pool_selftest, (unsigned)g_pool_n, (unsigned)g_nodes_n);
     // WiFi config: log the SSID + agent endpoint; the passphrase is redacted to its length.
     if (g_neti_rc == NETI_OK && n > 0 && n < (int)sizeof b)
         n += snprintf(b + n, (size_t)((int)sizeof b - n), " ssid=%s %u.%u.%u.%u:%u pwlen=%u",
@@ -470,13 +478,14 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
     case CMD_BUS_POLL_ENABLE:
         if (alen >= 1) g_poll_enabled = args[0];
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
-    case CMD_BUS_POLL_STATS: {   // step 2: back-to-back poll counters + measured turnaround
+    case CMD_BUS_POLL_STATS: {   // step 2 + §17 step1: poll counters + turnaround + pool/table
         uint32_t t = g_poll_total, a = g_poll_alive, m = g_poll_miss; uint16_t ta = g_meas_ta_us;
-        uint8_t r[14] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint8_t r[17] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
-                          (uint8_t)ta,(uint8_t)(ta>>8) };
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 14); break;
+                          (uint8_t)ta,(uint8_t)(ta>>8),
+                          (uint8_t)g_pool_selftest, (uint8_t)g_pool_n, g_nodes_n };  // §17 step1
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 17); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -561,6 +570,7 @@ static void bus_control_task(void *arg) {
     g_gap_alarm = (uint)hardware_alarm_claim_unused(true);
     hardware_alarm_set_callback(g_gap_alarm, rot_alarm_cb);
     g_rx_hook = master_rx_hook;                 // RX ISR defers the idle-gap alarm (no busy-wait)
+    bus_nodetable_build();                      // §17 step 1: node table ordered by bus address
     uint8_t  state = BS_SWEEP, collect_slave = 0, collect_tries = 0;
     bool     collect_is_orig = false; uint16_t collect_host = 0;
     for (;;) {
@@ -885,6 +895,64 @@ static void wifi_uplink_task(void *arg) {
 static cfl_runtime_handle_t *g_rt;
 static cfl_perm_t            g_perm;
 static char                  g_perm_buf[16 * 1024] __attribute__((aligned(8)));
+
+// ==== Bus arbiter rewrite (spec §17) step 1: TX buffer pool + node table ======
+// Buffers are carved ONCE from cfl_perm (a bump allocator -- no free) at init, then
+// grabbed/recovered via a free-list guarded by a HW spinlock (critical_section_t:
+// ISR + cross-core safe, unlike a FreeRTOS mutex). cfl_perm is untouched after init.
+#define BUS_POOL_N   24u
+typedef struct tx_buf { struct tx_buf *next; uint8_t dest_node; uint8_t len;
+                        uint8_t payload[BUS_PAYLOAD_MAX]; uint32_t origin_tag; } tx_buf_t;
+static critical_section_t g_pool_cs;
+static tx_buf_t          *g_pool_free;                 // free-list head
+static volatile uint16_t  g_pool_avail, g_pool_low;    // current / low-water
+// g_pool_n, g_pool_selftest declared earlier (banner uses them)
+
+static tx_buf_t *pool_grab(void) {
+    critical_section_enter_blocking(&g_pool_cs);
+    tx_buf_t *b = g_pool_free;
+    if (b) { g_pool_free = b->next; if (--g_pool_avail < g_pool_low) g_pool_low = g_pool_avail; }
+    critical_section_exit(&g_pool_cs);
+    return b;   // NULL = exhausted (caller raises the exception + zenoh notify -- later step)
+}
+static void pool_recover(tx_buf_t *b) {
+    if (!b) return;
+    critical_section_enter_blocking(&g_pool_cs);
+    b->next = g_pool_free; g_pool_free = b; g_pool_avail++;
+    critical_section_exit(&g_pool_cs);
+}
+static void bus_pool_init(void) {            // call once, after cfl_runtime_create (g_perm ready)
+    if (g_pool_n) return;
+    critical_section_init(&g_pool_cs);
+    g_pool_free = NULL; g_pool_avail = 0;
+    for (uint16_t i = 0; i < BUS_POOL_N; i++) {
+        tx_buf_t *b = (tx_buf_t *)cfl_perm_alloc_pointer_aligned(&g_perm, (uint16_t)sizeof(tx_buf_t), 4);
+        if (!b) break;                       // cfl_perm exhausted
+        pool_recover(b);
+    }
+    g_pool_n = g_pool_avail; g_pool_low = g_pool_avail;
+    // self-test: grab all (pool then empty -> NULL), recover all; avail must round-trip.
+    tx_buf_t *got[BUS_POOL_N]; uint16_t k = 0; tx_buf_t *b;
+    while (k < g_pool_n && (b = pool_grab()) != NULL) got[k++] = b;
+    bool empty_ok = (pool_grab() == NULL);
+    for (uint16_t i = 0; i < k; i++) pool_recover(got[i]);
+    g_pool_selftest = (k == g_pool_n && empty_ok && g_pool_avail == g_pool_n) ? g_pool_n : 0;
+}
+
+// Node table, ordered by bus address: the cycle sweep index + per-node dead-flags.
+// (Per-node ping-pong list heads land in step 2.)
+typedef struct { uint8_t addr; uint8_t enabled; uint8_t dead; uint8_t miss; } bus_node_t;
+static bus_node_t g_nodes[ROSTER_MAX];        // g_nodes_n declared earlier (banner uses it)
+static void bus_nodetable_build(void) {       // from the commissioned roster, sorted by addr
+    g_nodes_n = 0;
+    for (uint8_t i = 0; i < g_roster_n && g_nodes_n < ROSTER_MAX; i++) {
+        bus_node_t e = { .addr = g_roster[i].addr,
+                         .enabled = (g_roster[i].flags & FLAG_ENABLED) ? 1u : 0u, .dead = 0, .miss = 0 };
+        uint8_t j = g_nodes_n;               // insertion-sort by address
+        while (j > 0 && g_nodes[j - 1].addr > e.addr) { g_nodes[j] = g_nodes[j - 1]; j--; }
+        g_nodes[j] = e; g_nodes_n++;
+    }
+}
 static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
 static uint16_t              g_kb1_node;   // KB1 (api) start node
 static uint16_t              g_kbapp_node; // kbapp (Thread 3 application) start node
@@ -1948,6 +2016,7 @@ static void engine_runtime_bringup(void) {
     g_rt = cfl_runtime_create(&g_perm, &p, h);
     if (!g_rt) chassis_panic(RST_PANIC, 3);
     cfl_runtime_reset(g_rt);
+    bus_pool_init();   // §17 step 1: carve the TX buffer pool from cfl_perm (g_perm now ready)
     // Activate every real KB and record its start node. The image also carries a per-KB
     // "<kb>_functions" metadata KB (names ending in "_functions") — skip those. Arenas are
     // created in activation order, so arena_id == g_appkb_n at the time of the add.
