@@ -442,6 +442,62 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
     }
 }
 
+// ---- bus arbiter step 1: idle-gap slot collector (see docs/bus-arbiter-spec.md) -
+// Replaces the blocking single-frame bus_recv on the SWEEP liveness path with an
+// idle-gap delimited burst collect: poll <addr>, gather every frame it sends until
+// the bus is idle for T_GAP_US (end of burst), T_RESP_US elapses with no reply
+// (dead node), or T_WINDOW_MAX_US (anti-babble). Still task-driven (step 1): it
+// YIELDS while waiting for the first word (ms-scale T_RESP, no core0 starvation) and
+// busy-spins only during the short burst for us-precision idle detection. The ISR
+// migration (steps 2-3) removes the spin entirely. Values are for 460800; make them
+// bit-time-relative later (TODO in the spec).
+#define T_RESP_US        8000u   // first-word deadline -> dead-node (task-latency safe)
+#define T_GAP_US          300u   // inter-frame idle -> end of the node's burst
+#define T_WINDOW_MAX_US 12000u   // per-node burst ceiling (anti-babble)
+
+typedef enum { SLOT_NO_RESPONSE = 0, SLOT_OK, SLOT_BABBLE } slot_result_t;
+
+// Deliver one assembled frame from the granted node (relay reply / record summary).
+static void handle_slot_frame(uint8_t addr, const bus_frame_t *rf) {
+    uint8_t cls = (uint8_t)(rf->type & BUS_FT_MASK);
+    LOCK();
+    if (cls == BUS_FT_DATA && rf->len >= 2 &&
+        rf->payload[0] == (uint8_t)(OP_SHELL_REPLY & 0xFF) &&
+        rf->payload[1] == (uint8_t)(OP_SHELL_REPLY >> 8)) {
+        (void)host_link_s2m(&g_hl, addr, OP_SHELL_REPLY, &rf->payload[2], (uint8_t)(rf->len - 2));
+    } else if (cls == BUS_FT_NO_MESSAGE) {
+        slave_t *s = roster_find(addr); if (s && rf->len >= 1) s->summary = rf->payload[0];
+    }
+    UNLOCK();
+}
+
+// Poll `addr` and collect its burst with idle-gap delimiting. `rf` = scratch frame.
+static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf) {
+    bus_send(addr, BUS_FT_POLL, NULL, 0);
+    uint32_t t_poll = time_us_32(), t_last = t_poll, slot_start = 0;
+    bool seen = false, from_addr = false;
+    for (;;) {
+        uint16_t w;
+        while (bus_phy_rx_pop(&w)) {
+            uint32_t tw = time_us_32();
+            if (!seen) { seen = true; slot_start = tw; }
+            t_last = tw;
+            if (bus_asm_feed(&g_bc, w, rf) && rf->src == addr) {
+                from_addr = true; handle_slot_frame(addr, rf);
+            }
+        }
+        uint32_t now = time_us_32();
+        if (!seen) {
+            if (now - t_poll >= T_RESP_US) return SLOT_NO_RESPONSE;   // dead node
+            vTaskDelay(1);                                            // pre-response: yield (RX is IRQ-buffered)
+        } else {
+            if (now - t_last >= T_GAP_US)  return from_addr ? SLOT_OK : SLOT_NO_RESPONSE;
+            if (now - slot_start >= T_WINDOW_MAX_US) return from_addr ? SLOT_BABBLE : SLOT_NO_RESPONSE;
+            // in-burst: busy-spin for us-precision idle detection (burst is short)
+        }
+    }
+}
+
 // ---- bus thread: per-iteration state machine, one bus transaction per pass --
 enum { BS_SWEEP = 0, BS_CMD_INJECT, BS_CMD_COLLECT };
 
@@ -563,20 +619,13 @@ static void bus_control_task(void *arg) {
                 sweep_next_ms = now + g_poll_period_ms;
                 LOCK(); uint8_t addr = next_enabled_addr(); UNLOCK();
                 if (addr != 0xFF) {
-                    bus_send(addr, BUS_FT_POLL, NULL, 0);
-                    int got = bus_recv(&rf, POLL_SLOT_TIMEOUT_MS);
+                    // Step 1: idle-gap delimited slot (replaces the blocking bus_recv).
+                    // Frames are delivered inside bus_poll_slot; here we only set liveness.
+                    slot_result_t sr = bus_poll_slot(addr, &rf);
+                    uint32_t seen_ms = to_ms_since_boot(get_absolute_time());
                     LOCK();
-                    if (got && rf.src == addr) {
-                        mark_alive(addr, now);
-                        uint8_t cls = (uint8_t)(rf.type & BUS_FT_MASK);
-                        if (cls == BUS_FT_DATA && rf.len >= 2 &&
-                            rf.payload[0] == (uint8_t)(OP_SHELL_REPLY & 0xFF) &&
-                            rf.payload[1] == (uint8_t)(OP_SHELL_REPLY >> 8)) {
-                            (void)host_link_s2m(&g_hl, addr, OP_SHELL_REPLY, &rf.payload[2], (uint8_t)(rf.len - 2));
-                        } else if (cls == BUS_FT_NO_MESSAGE) {
-                            slave_t *s = roster_find(addr); if (s && rf.len >= 1) s->summary = rf.payload[0];
-                        }
-                    } else { mark_miss(addr); }
+                    if (sr == SLOT_NO_RESPONSE) mark_miss(addr);
+                    else                        mark_alive(addr, seen_ms);  // SLOT_OK or SLOT_BABBLE
                     UNLOCK();
                 }
             }
