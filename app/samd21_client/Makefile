@@ -16,7 +16,7 @@ SDK          := $(TUSB)/hw/mcu/microchip/samd21
 BSP_FAMILY   := $(TUSB)/hw/bsp/samd21
 BSP_BOARD    := $(BSP_FAMILY)/boards/seeeduino_xiao
 CMSIS        := $(TUSB)/lib/CMSIS_5/CMSIS/Core/Include
-UF2CONV      := $(TUSB)/tools/uf2/utils/uf2conv.py
+UF2CONV      := $(TOP)/tools/uf2conv.lua   # LuaJIT bin->UF2 (drop-in for tinyusb's python uf2conv.py; build is python-free)
 
 BUILD        := $(HERE)/build
 TARGET       := register_dongle
@@ -193,7 +193,7 @@ $(BUILD)/$(TARGET).bin: $(BUILD)/$(TARGET).elf
 	$(OBJCOPY) -O binary $< $@
 
 $(BUILD)/$(TARGET).uf2: $(BUILD)/$(TARGET).bin
-	python3 $(UF2CONV) -c -b 0x2000 -f 0x68ed2b88 -o $@ $<
+	luajit $(UF2CONV) -c -b 0x2000 -f 0x68ed2b88 -o $@ $<
 
 size: $(BUILD)/$(TARGET).elf
 	@$(SIZE) $<
