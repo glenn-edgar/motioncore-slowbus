@@ -45,6 +45,8 @@ local function from_hex(h) h = h or ""; return (h:gsub("%x%x", function(b) retur
 
 -- ---- device (the BC over WiFi) ---------------------------------------------
 local lk
+local on_bc_frame   -- §17 step8: forwards OP_BUS_FEEDBACK (assigned below); passed to every exec so
+                    -- feedback is never dropped while exec waits for its reply (the 8b drain fix).
 local function bc_accept()
     if lk then pcall(function() lk:close() end); lk = nil end
     if BC_SERIAL ~= "" then
@@ -59,10 +61,10 @@ end
 -- exec with one re-accept on transport failure (BC re-dial after a WiFi blip).
 local function dev_exec(addr, cmd, args)
     if not lk then bc_accept() end
-    local ok, st, r = pcall(lk.exec, lk, addr, cmd, args or "", EXEC_TO)
+    local ok, st, r = pcall(lk.exec, lk, addr, cmd, args or "", EXEC_TO, on_bc_frame)
     if ok then return st, r end
     bc_accept()
-    return lk:exec(addr, cmd, args or "", EXEC_TO)
+    return lk:exec(addr, cmd, args or "", EXEC_TO, on_bc_frame)
 end
 
 -- ---- ops: JSON {op=...} -> reply table -------------------------------------
@@ -108,7 +110,7 @@ local CMD_BUS_MSG_INJECT = 0x0169
 local ps, ctl_sub, FEEDBACK_TOK
 local fb_pub_n, ctl_inj_n = 0, 0
 
-local function on_bc_frame(f)
+on_bc_frame = function(f)   -- assigns the forward-declared upvalue (so dev_exec forwards feedback too)
     if f.cmd ~= OP_BUS_FEEDBACK or not ps then return end
     local p = f.payload                       -- [n_rec][addr][len][bytes]* (1-indexed byte array)
     local nrec = p[1] or 0

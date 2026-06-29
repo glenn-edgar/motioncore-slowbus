@@ -252,8 +252,11 @@ function Link:close() if self.fd and self.fd >= 0 then C.close(self.fd); self.fd
 local _rbuf = ffi.new("uint8_t[?]", 1024)
 
 -- Passively decode every s2m frame for `duration` seconds. on_frame(frame).
+-- Uses a PERSISTENT per-link decoder (self.dec) shared with exec(): a frame whose bytes
+-- span two reads (across listen/exec calls or the gap between them) is preserved instead of
+-- dropped on a fresh decoder. SLIP framing self-syncs, so a stale partial is harmless.
 function Link:listen(duration, on_frame)
-    local dec = make_decoder()
+    local dec = self.dec; if not dec then dec = make_decoder(); self.dec = dec end
     local deadline = now_ms() + duration * 1000
     local pfd = ffi.new("struct pollfd[1]"); pfd[0].fd = self.fd; pfd[0].events = POLLIN
     while now_ms() < deadline do
@@ -270,7 +273,10 @@ end
 -- Request/reply round-trip. Sends OP_SHELL_EXEC to `addr` with body
 -- [req_id u16][cmd u16][args], waits for the OP_SHELL_REPLY whose req_id matches.
 -- Returns (status:int, result:string). Errors on timeout.
-function Link:exec(addr, cmd, args, timeout)
+-- `on_other` (optional): called for every decoded frame that is NOT the awaited reply
+-- (e.g. OP_BUS_FEEDBACK / OP_DBG_LOG). Without it those frames are dropped while exec
+-- waits -- a continuous-feedback consumer (the agent) passes it so nothing is lost mid-exec.
+function Link:exec(addr, cmd, args, timeout, on_other)
     args = args or ""
     timeout = timeout or self.timeout
     self.req = bit.band(self.req + 1, 0xFFFF)
@@ -280,7 +286,7 @@ function Link:exec(addr, cmd, args, timeout)
     local wire = encode_m2s(addr, M.OP_SHELL_EXEC, self.seq, body)
     if tonumber(C.write(self.fd, wire, #wire)) ~= #wire then error("short write") end
 
-    local dec = make_decoder()
+    local dec = self.dec; if not dec then dec = make_decoder(); self.dec = dec end  -- persistent (shared with listen)
     local deadline = now_ms() + timeout * 1000
     local st, res
     local pfd = ffi.new("struct pollfd[1]"); pfd[0].fd = self.fd; pfd[0].events = POLLIN
@@ -296,6 +302,8 @@ function Link:exec(addr, cmd, args, timeout)
                         local r = {}
                         for j = 4, #f.payload do r[#r + 1] = string.char(f.payload[j]) end
                         res = table.concat(r)
+                    elseif on_other then
+                        on_other(f)                 -- forward non-reply frames (feedback) instead of dropping
                     end
                 end)
                 if st ~= nil then break end
