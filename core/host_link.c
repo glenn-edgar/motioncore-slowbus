@@ -29,6 +29,7 @@ static int emit_s2m(host_link_t *h, uint8_t addr, uint16_t opcode,
     };
     if (frame_encode_s2m(&m, payload, &h->tx) != 0) return -1;  // ring rolls back
     h->seq++;
+    h->tx_msgs++;                                                // perf stat: uplink TX message
     return 0;
 }
 
@@ -123,8 +124,10 @@ static void on_frame(host_link_t *h, const frame_meta_t *m, const uint8_t *paylo
 void host_link_feed(host_link_t *h, uint8_t byte) {
     frame_meta_t meta;
     uint8_t payload[COMM_PAYLOAD_MAX];
-    if (frame_decoder_feed(&h->rx, byte, &meta, payload) == FRAME_DECODE_FRAME_READY)
+    if (frame_decoder_feed(&h->rx, byte, &meta, payload) == FRAME_DECODE_FRAME_READY) {
+        h->rx_msgs++;                                            // perf stat: uplink RX message
         on_frame(h, &meta, payload);
+    }
 }
 
 void host_link_tick(host_link_t *h, uint32_t now_ms, bool connected) {

@@ -89,6 +89,9 @@ struct host_link {
     host_link_bus_cb   on_bus_msg;
     host_link_shell_cb on_local_shell;
     void              *user;
+
+    uint32_t          tx_msgs;         // s2m frames staged (perf stat; all uplink TX funnels here)
+    uint32_t          rx_msgs;         // m2s frames decoded (perf stat; all uplink RX funnels here)
 };
 
 // Initialise with identity config. Sets state = HL_BOOT and schedules the first
