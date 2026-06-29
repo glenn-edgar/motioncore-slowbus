@@ -354,12 +354,13 @@ static volatile uint32_t g_pp_slave;       // this node's slave-side handles (kb
 static volatile uint32_t g_pp_slave_seen;  // master's view of the slave count, piggybacked on each reply
 static volatile uint8_t  g_pp_run;         // loop enabled
 static volatile uint8_t  g_pp_addr = 9;    // slave addr to ping
+static volatile uint32_t g_pp_kicks;       // §17 step6: originations ARMED (vs g_pp_master = consumed by core1)
 static void pp_kick(void) {                // re-arm one round (master kbapp originates)
     if (!g_down_q) return;
     appcore_cmd_t c; memset(&c, 0, sizeof c);
     c.cmd = CMD_APP_ECHO_TO; c.route = ROUTE_USB;
     c.args[0] = g_pp_addr; c.args[1] = 'p'; c.args[2] = 'p'; c.alen = 3;
-    (void)xQueueSend(g_down_q, &c, 0);
+    if (xQueueSend(g_down_q, &c, 0) == pdTRUE) g_pp_kicks++;   // count only if queued (self-correcting on drops)
 }
 
 // ---- PHY-owned-by-bus-thread helpers (NO lock; PHY has a single owner) ------
@@ -539,18 +540,22 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_APP_PP_START:   // [addr] -> start the free-running chain-flow ping-pong loop
         if (alen >= 1) g_pp_addr = args[0];
-        g_pp_master = 0; g_pp_slave_seen = 0;
+        g_pp_master = 0; g_pp_slave_seen = 0; g_pp_kicks = 0;
         g_pp_run = 1;
-        pp_kick();           // fire the first round; COLLECT re-arms each subsequent round
+        pp_kick();           // fire the first round; per-slot COLLECT (or §17 cycle) re-arms each subsequent round
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_APP_PP_STOP:
         g_pp_run = 0;
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
-    case CMD_APP_PP_READ: {  // -> [master_cnt u32][slave_cnt u32] (both as the master sees them)
-        uint32_t mc = g_pp_master, sc = g_pp_slave_seen;
-        uint8_t r[8] = { (uint8_t)mc, (uint8_t)(mc>>8), (uint8_t)(mc>>16), (uint8_t)(mc>>24),
-                         (uint8_t)sc, (uint8_t)(sc>>8), (uint8_t)(sc>>16), (uint8_t)(sc>>24) };
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 8); break;
+    case CMD_APP_PP_READ: {  // -> [master_cnt u32][slave_seen u32][this_node_slave_handles u32]
+        // master_cnt/slave_seen are the MASTER's view (slave_seen via per-slot COLLECT, 0 in cycle
+        // mode). this_node_slave_handles = g_pp_slave (§17 step6: query THIS node over USB to prove
+        // engine-produced echoes were delivered to+handled by the slave's own engine, fire-and-forget).
+        uint32_t mc = g_pp_master, sc = g_pp_slave_seen, ps = g_pp_slave;
+        uint8_t r[12] = { (uint8_t)mc, (uint8_t)(mc>>8), (uint8_t)(mc>>16), (uint8_t)(mc>>24),
+                          (uint8_t)sc, (uint8_t)(sc>>8), (uint8_t)(sc>>16), (uint8_t)(sc>>24),
+                          (uint8_t)ps, (uint8_t)(ps>>8), (uint8_t)(ps>>16), (uint8_t)(ps>>24) };
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 12); break;
     }
     default:
         host_link_shell_reply(&g_hl, req_id, SHELL_UNKNOWN_CMD, NULL, 0); break;
@@ -1146,6 +1151,12 @@ static void bus_run_cycle(void) {
             }
         }
     }
+    // (4) §17 step6: drive the chain-tree ENGINE producer in cycle mode. The per-slot
+    // COLLECT re-arm doesn't run here, so re-arm pp from the cycle -- but keep exactly
+    // ONE origination outstanding (g_pp_kicks==g_pp_master => core1 has consumed the
+    // last) so the rate is engine-tick paced (~100/s) and the slave's reply queue can't
+    // pile up. Self-correcting if a kick is dropped (g_pp_kicks only counts queued ones).
+    if (g_pp_run && g_pp_kicks == g_pp_master) pp_kick();
 }
 
 static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
@@ -1512,8 +1523,28 @@ void kbapp_on_echo_to(void *handle, unsigned node_index) {
     const app_req_t *q = (const app_req_t *)rt->event_data_ptr->data.ptr;
     if (!q) return;
     g_pp_master++;   // ping-pong: master kbapp engine counts each round it originates
-    orig_req_t o; o.addr = q->addr; o.host_req_id = q->req_id;
     uint8_t m = q->len; if (m > ORIG_PAY_MAX) m = ORIG_PAY_MAX;
+
+    // §17 step6: in CYCLE MODE the engine (core1) is a DIRECT producer into the
+    // ping-pong lists -- build the full OP_SHELL_EXEC frame and bus_msg_send() it
+    // (grab->fill->attach under the hw spinlock, the SAME path the host/uplink
+    // producer on core0 uses). This is the genuine cross-core concurrent attach the
+    // hw spinlock exists for (a FreeRTOS mutex couldn't guard a core1 producer vs the
+    // core0 cycle drain). Fire-and-forget: no orig_q, no COLLECT correlation (feedback
+    // rides a later NO_MSG poll, §17). Falls back to the per-slot g_orig_q path otherwise.
+    if (g_cycle_mode) {
+        uint16_t sr = (uint16_t)(++g_orig_seq); if (sr == 0) sr = (uint16_t)(++g_orig_seq);
+        uint8_t pb[BUS_PAYLOAD_MAX]; uint8_t pn = 0;
+        pb[pn++] = (uint8_t)(OP_SHELL_EXEC & 0xFF); pb[pn++] = (uint8_t)(OP_SHELL_EXEC >> 8);
+        pb[pn++] = (uint8_t)sr;                     pb[pn++] = (uint8_t)(sr >> 8);
+        pb[pn++] = (uint8_t)(CMD_APP_ECHO & 0xFF);  pb[pn++] = (uint8_t)(CMD_APP_ECHO >> 8);
+        if (m > (uint8_t)(BUS_PAYLOAD_MAX - pn)) m = (uint8_t)(BUS_PAYLOAD_MAX - pn);
+        for (uint8_t i = 0; i < m; i++) pb[pn++] = q->bytes[i];
+        (void)bus_msg_send(q->addr, pb, pn, 0xC2000000u | sr);   // core1 producer
+        return;
+    }
+
+    orig_req_t o; o.addr = q->addr; o.host_req_id = q->req_id;
     o.len = m;
     for (uint8_t i = 0; i < m; i++) o.bytes[i] = q->bytes[i];
     (void)xQueueSend(g_orig_q, &o, 0);   // non-blocking; drop if the bus is backed up
