@@ -286,6 +286,15 @@ static volatile uint32_t g_dead_slowpoll_div = 200;    // probe one dead node ev
 static volatile uint32_t g_dead_revives;               // dead->alive resurrections (stat)
 static volatile uint8_t  g_nodes_dead;                  // current dead-node count (cycle-maintained; POLL_STATS reads it)
 static uint8_t  g_dead_cursor;                          // round-robin index over dead nodes
+// §17 step8: per-cycle feedback batch -- handle_slot_frame appends here while a cycle
+// collects (instead of a per-frame host_link_s2m); bus_run_cycle emits ONE OP_BUS_FEEDBACK.
+// Touched only by the bus task (core0) under g_lock -> no cross-core concern.
+static volatile bool g_cycle_collecting;               // true while bus_run_cycle gathers feedback
+static uint8_t  g_fb_buf[BUS_PAYLOAD_MAX];             // [n_rec] then [addr][len][bytes...]*
+static uint8_t  g_fb_n;                                 // bytes used (incl the leading count slot)
+static uint8_t  g_fb_rec;                               // record count this cycle
+static volatile uint32_t g_fb_frames;                  // OP_BUS_FEEDBACK frames emitted (stat)
+static volatile uint32_t g_fb_drops;                   // feedback records dropped (batch full)
 static uint32_t g_dead_tick;                            // cycles since the last dead-node probe
 static void bus_nodetable_build(void);
 static void bus_pp_selftest(void);
@@ -511,8 +520,9 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint32_t ov = g_cycle_overruns; int32_t sk = g_cycle_minslack; uint32_t su = g_cycle_slow_us;
         uint32_t ex = g_pool_exhausted; uint16_t lw = g_pool_low;
         uint32_t dv = g_dead_revives, pc = g_cycle_pace_us;
+        uint32_t fbf = g_fb_frames, fbd = g_fb_drops;
         uint8_t ndead = g_nodes_dead;  // §17 step7 (cycle-maintained; g_nodes is defined later)
-        uint8_t r[58] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint8_t r[66] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -529,8 +539,10 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           (uint8_t)ex,(uint8_t)(ex>>8),(uint8_t)(ex>>16),(uint8_t)(ex>>24),    // pool exhausted count [b46-49]
                           (uint8_t)dv,(uint8_t)(dv>>8),(uint8_t)(dv>>16),(uint8_t)(dv>>24),    // §17 step7 dead revives [b50-53]
                           ndead,                                                               // current dead-node count [b54]
-                          (uint8_t)pc,(uint8_t)(pc>>8),(uint8_t)(pc>>16),(uint8_t)(pc>>24) };  // cycle pace us [b55-58]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 58); break;
+                          (uint8_t)pc,(uint8_t)(pc>>8),(uint8_t)(pc>>16),(uint8_t)(pc>>24),    // cycle pace us [b55-58]
+                          (uint8_t)fbf,(uint8_t)(fbf>>8),(uint8_t)(fbf>>16),(uint8_t)(fbf>>24),// §17 step8 feedback frames [b59-62]
+                          (uint8_t)fbd,(uint8_t)(fbd>>8),(uint8_t)(fbd>>16),(uint8_t)(fbd>>24) };// feedback drops [b63-66]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 66); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -597,7 +609,16 @@ static void handle_slot_frame(uint8_t addr, const bus_frame_t *rf) {
     if (cls == BUS_FT_DATA && rf->len >= 2 &&
         rf->payload[0] == (uint8_t)(OP_SHELL_REPLY & 0xFF) &&
         rf->payload[1] == (uint8_t)(OP_SHELL_REPLY >> 8)) {
-        (void)host_link_s2m(&g_hl, addr, OP_SHELL_REPLY, &rf->payload[2], (uint8_t)(rf->len - 2));
+        uint8_t plen = (uint8_t)(rf->len - 2);
+        if (g_cycle_collecting) {   // §17 step8: batch this node's feedback (one frame/cycle)
+            if ((int)g_fb_n + 2 + (int)plen <= (int)sizeof g_fb_buf) {
+                g_fb_buf[g_fb_n++] = addr; g_fb_buf[g_fb_n++] = plen;
+                for (uint8_t i = 0; i < plen; i++) g_fb_buf[g_fb_n++] = rf->payload[2 + i];
+                g_fb_rec++;
+            } else { g_fb_drops++; }
+        } else {
+            (void)host_link_s2m(&g_hl, addr, OP_SHELL_REPLY, &rf->payload[2], plen);
+        }
     } else if (cls == BUS_FT_NO_MESSAGE) {
         slave_t *s = roster_find(addr); if (s && rf->len >= 1) s->summary = rf->payload[0];
     }
@@ -1095,6 +1116,7 @@ static void bus_run_cycle(void) {
     bool marked[ROSTER_MAX];
     for (uint8_t i = 0; i < g_nodes_n; i++) marked[i] = false;
     bus_frame_t rf;
+    g_fb_n = 1; g_fb_rec = 0; g_cycle_collecting = true;   // §17 step8: gather this cycle's feedback
     // (1) message pass -- fire-and-forget the queued buffers to their nodes.
     // Grab each node's list head UNDER THE SPINLOCK (a producer can still be attaching
     // to this set in the swap window -- both run time-sliced on core0); once grabbed +
@@ -1198,6 +1220,17 @@ static void bus_run_cycle(void) {
     // last) so the rate is engine-tick paced (~100/s) and the slave's reply queue can't
     // pile up. Self-correcting if a kick is dropped (g_pp_kicks only counts queued ones).
     if (g_pp_run && g_pp_kicks == g_pp_master) pp_kick();
+
+    // (4b) §17 step8: emit this cycle's BATCHED feedback as ONE OP_BUS_FEEDBACK frame
+    // (the agent PUBLISHes it to the feedback key). Only when there is feedback -> no
+    // empty-frame spam; rate is naturally cycle-paced. handle_slot_frame appended the
+    // records while g_cycle_collecting was set; close the window before emitting.
+    g_cycle_collecting = false;
+    if (g_fb_rec > 0) {
+        g_fb_buf[0] = g_fb_rec;
+        LOCK(); (void)host_link_s2m(&g_hl, 1, OP_BUS_FEEDBACK, g_fb_buf, g_fb_n); UNLOCK();
+        g_fb_frames++;
+    }
 
     // (5) §17 step7: FIXED-RATE PACING. Hold each cycle to g_cycle_pace_us (0=free-run)
     // measured from this cycle's start (t0) so the control loop sees a steady period with
