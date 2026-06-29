@@ -267,6 +267,8 @@ void bus_rx_notify_set(TaskHandle_t t) { g_bus_task = t; g_rx_hook = slave_notif
 // (after ROSTER_MAX / g_perm). Tentative defs here, completed in that block.
 static uint16_t g_pool_n, g_pool_selftest;
 static volatile uint16_t g_pool_avail;     // current free count (banner/POLL_STATS read it)
+static volatile uint16_t g_pool_low;       // low-water (min avail = peak in-flight)
+static volatile uint32_t g_pool_exhausted; // §17 step5: grab-NULL events (producer out-ran the bus)
 static volatile bool g_pool_ready;         // set by bus_pool_init (core1); bus task waits on it
 static uint8_t  g_nodes_n, g_pp_selftest;
 static volatile uint8_t  g_cycle_mode;            // §17 step3: 0=per-slot rotation, 1=cyclic engine
@@ -498,7 +500,8 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint32_t t = g_poll_total, a = g_poll_alive, m = g_poll_miss; uint16_t ta = g_meas_ta_us;
         uint32_t cl = g_cycle_last, cmn = g_cycle_min, cmx = g_cycle_max;
         uint32_t ov = g_cycle_overruns; int32_t sk = g_cycle_minslack; uint32_t su = g_cycle_slow_us;
-        uint8_t r[43] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint32_t ex = g_pool_exhausted; uint16_t lw = g_pool_low;
+        uint8_t r[49] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -510,8 +513,10 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           (uint8_t)cmx,(uint8_t)(cmx>>8),(uint8_t)(cmx>>16),(uint8_t)(cmx>>24), // cycle_max [b29-32]
                           (uint8_t)ov,(uint8_t)(ov>>8),(uint8_t)(ov>>16),(uint8_t)(ov>>24),     // overruns [b33-36]
                           (uint8_t)sk,(uint8_t)(sk>>8),(uint8_t)(sk>>16),(uint8_t)(sk>>24),     // min slack (signed) [b37-40]
-                          g_cycle_slow_addr, (uint8_t)su,(uint8_t)(su>>8) };                    // slowest node addr + us [b41-43]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 43); break;
+                          g_cycle_slow_addr, (uint8_t)su,(uint8_t)(su>>8),                      // slowest node addr + us [b41-43]
+                          (uint8_t)lw,(uint8_t)(lw>>8),                                          // §17 step5 pool low-water [b44-45]
+                          (uint8_t)ex,(uint8_t)(ex>>8),(uint8_t)(ex>>16),(uint8_t)(ex>>24) };    // pool exhausted count [b46-49]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 49); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -519,11 +524,14 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
     case CMD_BUS_CYCLE_MODE:     // §17 step3: [0|1] select per-slot rotation vs the cyclic engine
         if (alen >= 1) { g_cycle_mode = args[0] ? 1u : 0u; g_cycle_min = 0; g_cycle_max = 0; }
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
-    case CMD_BUS_MSG_INJECT: {   // §17 step3 test: [addr][payload...] -> producer attach
-        bool ok = (alen >= 1) && bus_msg_send(args[0], (alen > 1) ? &args[1] : NULL,
-                                              (uint8_t)(alen - 1), 0xDEAD0000u);
-        uint8_t rr = ok ? 1u : 0u;
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, &rr, 1); break;
+    case CMD_BUS_MSG_INJECT: {   // [addr][count][payload...] -> inject `count` copies (tests exhaustion)
+        uint8_t inj = 0;
+        if (alen >= 2) {
+            uint8_t addr = args[0], cnt = args[1];
+            const uint8_t *pl = (alen > 2) ? &args[2] : NULL; uint8_t pn = (alen > 2) ? (uint8_t)(alen - 2) : 0;
+            for (uint8_t i = 0; i < cnt; i++) { if (bus_msg_send(addr, pl, pn, 0xDEAD0000u | i)) inj++; else break; }
+        }
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, &inj, 1); break;
     }
     case CMD_BUS_SET_DEADLINE:   // §17 step4: set the real-time cycle deadline + reset watchdog stats
         if (alen >= 4) g_cycle_deadline_us = (uint32_t)args[0]|((uint32_t)args[1]<<8)|((uint32_t)args[2]<<16)|((uint32_t)args[3]<<24);
@@ -948,8 +956,7 @@ typedef struct tx_buf { struct tx_buf *next; uint8_t dest_node; uint8_t len;
                         uint8_t payload[BUS_PAYLOAD_MAX]; uint32_t origin_tag; } tx_buf_t;
 static critical_section_t g_pool_cs;
 static tx_buf_t          *g_pool_free;                 // free-list head
-static volatile uint16_t  g_pool_low;                  // low-water (g_pool_avail declared earlier)
-// g_pool_n, g_pool_selftest declared earlier (banner uses them)
+// g_pool_avail, g_pool_low, g_pool_n, g_pool_selftest declared earlier (banner/POLL_STATS use them)
 
 static tx_buf_t *pool_grab(void) {
     critical_section_enter_blocking(&g_pool_cs);
@@ -1015,7 +1022,13 @@ static bool bus_msg_send(uint8_t dest_addr, const uint8_t *payload, uint8_t len,
     if (idx < 0) return false;
     if (len > BUS_PAYLOAD_MAX) len = BUS_PAYLOAD_MAX;
     tx_buf_t *b = pool_grab();
-    if (!b) return false;
+    if (!b) {   // §17 step5: exhaustion is an exception -> COUNT ONLY (no silent drop).
+        // The zenoh notify is DEFERRED to bus_run_cycle: a producer can be inside the
+        // uplink thread's g_lock (on_local_shell -> MSG_INJECT), so taking g_lock here
+        // would re-enter a non-recursive mutex and deadlock -> watchdog reboot.
+        g_pool_exhausted++;
+        return false;
+    }
     b->dest_node = (uint8_t)idx; b->len = len; b->origin_tag = tag;
     for (uint8_t i = 0; i < len; i++) b->payload[i] = payload[i];
     critical_section_enter_blocking(&g_pool_cs);
@@ -1060,9 +1073,14 @@ static void bus_run_cycle(void) {
     bool marked[ROSTER_MAX];
     for (uint8_t i = 0; i < g_nodes_n; i++) marked[i] = false;
     bus_frame_t rf;
-    // (1) message pass -- fire-and-forget the queued buffers to their nodes
+    // (1) message pass -- fire-and-forget the queued buffers to their nodes.
+    // Grab each node's list head UNDER THE SPINLOCK (a producer can still be attaching
+    // to this set in the swap window -- both run time-sliced on core0); once grabbed +
+    // NULLed, the chain is private and processed lock-free.
     for (uint8_t i = 0; i < g_nodes_n; i++) {
+        critical_section_enter_blocking(&g_pool_cs);
         tx_buf_t *b = g_nodes[i].list[a]; g_nodes[i].list[a] = NULL;
+        critical_section_exit(&g_pool_cs);
         while (b) {
             tx_buf_t *nx = b->next;
             if (!g_nodes[i].dead) { bus_send(g_nodes[i].addr, BUS_FT_DATA, b->payload, b->len); marked[i] = true; }
@@ -1087,6 +1105,23 @@ static void bus_run_cycle(void) {
             g_poll_alive++; mark_alive(g_nodes[i].addr, now); g_nodes[i].miss = 0; g_meas_ta_us = g_last_ta_us;
         }
         UNLOCK();
+    }
+    // (2b) deferred pool-exhaustion notify (§17 step5): producers only bump the
+    // counter -- emit the rate-limited zenoh notify HERE, where no outer g_lock is
+    // held, so we never re-enter the uplink thread's mutex (see bus_msg_send).
+    {
+        static uint32_t s_seen_ex, s_last_ex_ms;
+        uint32_t ex = g_pool_exhausted;
+        if (ex != s_seen_ex) {
+            uint32_t nms = to_ms_since_boot(get_absolute_time());
+            if ((uint32_t)(nms - s_last_ex_ms) >= 100u) {
+                s_last_ex_ms = nms; s_seen_ex = ex;
+                char m[48];
+                int mn = snprintf(m, sizeof m, "[pool-exhausted] n=%u low=%u", (unsigned)ex, (unsigned)g_pool_low);
+                if (mn > 0) { if (mn >= (int)sizeof m) mn = (int)sizeof m - 1;
+                              LOCK(); (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)m, (uint8_t)mn); UNLOCK(); }
+            }
+        }
     }
     // (3) cycle-time stat + real-time watchdog (overrun / slack / slowest node)
     uint32_t ct = time_us_32() - t0;
