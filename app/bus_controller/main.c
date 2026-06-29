@@ -100,6 +100,8 @@
 #define CMD_BUS_CLEAR_ROSTER     0x0165u
 #define CMD_BUS_POLL_STATS       0x0166u // arbiter step 2: -> [total u32][alive u32][miss u32][meas_ta_us u16]
 #define CMD_BUS_MEASURE_TA       0x0167u // arbiter step 2: latch the measured POLL->reply turnaround
+#define CMD_BUS_CYCLE_MODE       0x0168u // §17 step3: [0|1] per-slot rotation vs the cyclic engine
+#define CMD_BUS_MSG_INJECT       0x0169u // §17 step3 test: [addr][payload...] -> bus_msg_send (producer)
 #define BUS_REG_OK               0u
 #define SHELL_OK                 0u
 #define SHELL_UNKNOWN_CMD        1u
@@ -266,8 +268,12 @@ static uint16_t g_pool_n, g_pool_selftest;
 static volatile uint16_t g_pool_avail;     // current free count (banner/POLL_STATS read it)
 static volatile bool g_pool_ready;         // set by bus_pool_init (core1); bus task waits on it
 static uint8_t  g_nodes_n, g_pp_selftest;
+static volatile uint8_t  g_cycle_mode;            // §17 step3: 0=per-slot rotation, 1=cyclic engine
+static volatile uint32_t g_cycle_last, g_cycle_min, g_cycle_max;  // full-cycle time (us)
 static void bus_nodetable_build(void);
 static void bus_pp_selftest(void);
+static void bus_run_cycle(void);
+static bool bus_msg_send(uint8_t dest_addr, const uint8_t *payload, uint8_t len, uint32_t tag);
 
 static void bc_emit_boot_banner(void) {
     char b[200];
@@ -483,18 +489,31 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_BUS_POLL_STATS: {   // step 2 + §17 step1: poll counters + turnaround + pool/table
         uint32_t t = g_poll_total, a = g_poll_alive, m = g_poll_miss; uint16_t ta = g_meas_ta_us;
-        uint8_t r[20] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint32_t cl = g_cycle_last, cmn = g_cycle_min, cmx = g_cycle_max;
+        uint8_t r[32] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
                           (uint8_t)g_pool_selftest, (uint8_t)g_pool_n, g_nodes_n,  // §17 step1 [b15,16,17]
-                          (uint8_t)g_pool_avail, (uint8_t)(g_pool_avail>>8),       // free count now [b18,19]
-                          g_pp_selftest };                                         // §17 step2 [b20]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 20); break;
+                          (uint8_t)g_pool_avail, (uint8_t)(g_pool_avail>>8),       // free count [b18,19]
+                          g_pp_selftest,                                           // §17 step2 [b20]
+                          (uint8_t)cl,(uint8_t)(cl>>8),(uint8_t)(cl>>16),(uint8_t)(cl>>24),    // cycle_last us [b21-24]
+                          (uint8_t)cmn,(uint8_t)(cmn>>8),(uint8_t)(cmn>>16),(uint8_t)(cmn>>24),// cycle_min  [b25-28]
+                          (uint8_t)cmx,(uint8_t)(cmx>>8),(uint8_t)(cmx>>16),(uint8_t)(cmx>>24)};// cycle_max [b29-32]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 32); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    case CMD_BUS_CYCLE_MODE:     // §17 step3: [0|1] select per-slot rotation vs the cyclic engine
+        if (alen >= 1) { g_cycle_mode = args[0] ? 1u : 0u; g_cycle_min = 0; g_cycle_max = 0; }
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    case CMD_BUS_MSG_INJECT: {   // §17 step3 test: [addr][payload...] -> producer attach
+        bool ok = (alen >= 1) && bus_msg_send(args[0], (alen > 1) ? &args[1] : NULL,
+                                              (uint8_t)(alen - 1), 0xDEAD0000u);
+        uint8_t rr = ok ? 1u : 0u;
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, &rr, 1); break;
+    }
     case CMD_APP_PP_START:   // [addr] -> start the free-running chain-flow ping-pong loop
         if (alen >= 1) g_pp_addr = args[0];
         g_pp_master = 0; g_pp_slave_seen = 0;
@@ -586,6 +605,8 @@ static void bus_control_task(void *arg) {
         // ticking (above) so the watchdog is satisfied; the monitor/uplink stay
         // alive so the host can attach and read the refusal. (No bus_send here.)
         if (g_identity_refused) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+        // §17 step3: the cyclic engine runs in place of the per-slot rotation when enabled.
+        if (g_cycle_mode) { bus_run_cycle(); LOCK(); emit_liveness_edges(); UNLOCK(); continue; }
         uint32_t now = to_ms_since_boot(get_absolute_time());
         bus_frame_t rf;
 
@@ -1012,6 +1033,49 @@ static void bus_pp_selftest(void) {
     }
     g_pp_selftest = (attached == (uint16_t)(g_nodes_n * K) && drained == attached && g_pool_avail == before) ? 1u : 0u;
 }
+
+// --- §17 step 3: the cyclic engine -------------------------------------------
+// One cycle: swap; MESSAGE pass (fire-and-forget the queued buffers, mark+recover);
+// NO_MSG sweep (poll every unmarked live node, alarm-blocked feedback wait, §16);
+// cycle-time stat. Runs in place of the per-slot rotation when g_cycle_mode is set.
+static void bus_run_cycle(void) {
+    bus_pingpong_swap();
+    uint32_t t0 = time_us_32();
+    uint8_t a = g_active_idx;
+    bool marked[ROSTER_MAX];
+    for (uint8_t i = 0; i < g_nodes_n; i++) marked[i] = false;
+    bus_frame_t rf;
+    // (1) message pass -- fire-and-forget the queued buffers to their nodes
+    for (uint8_t i = 0; i < g_nodes_n; i++) {
+        tx_buf_t *b = g_nodes[i].list[a]; g_nodes[i].list[a] = NULL;
+        while (b) {
+            tx_buf_t *nx = b->next;
+            if (!g_nodes[i].dead) { bus_send(g_nodes[i].addr, BUS_FT_DATA, b->payload, b->len); marked[i] = true; }
+            pool_recover(b); b = nx;          // recover regardless (no reply -- §17 fire-and-forget)
+        }
+    }
+    // (2) NO_MSG sweep -- poll each unmarked live node for feedback + liveness
+    for (uint8_t i = 0; i < g_nodes_n; i++) {
+        if (g_nodes[i].dead || marked[i]) continue;
+        slot_result_t sr = bus_poll_slot(g_nodes[i].addr, &rf);   // alarm-blocked feedback wait
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        LOCK();
+        g_poll_total++;
+        if (sr == SLOT_NO_RESPONSE) {
+            g_poll_miss++; mark_miss(g_nodes[i].addr);
+            if (g_nodes[i].miss < 0xFFu && ++g_nodes[i].miss >= g_poll_max_misses) g_nodes[i].dead = 1;
+        } else {
+            g_poll_alive++; mark_alive(g_nodes[i].addr, now); g_nodes[i].miss = 0; g_meas_ta_us = g_last_ta_us;
+        }
+        UNLOCK();
+    }
+    // (3) cycle-time stat (full sweep)
+    uint32_t ct = time_us_32() - t0;
+    g_cycle_last = ct;
+    if (ct > g_cycle_max) g_cycle_max = ct;
+    if (g_cycle_min == 0 || ct < g_cycle_min) g_cycle_min = ct;
+}
+
 static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
 static uint16_t              g_kb1_node;   // KB1 (api) start node
 static uint16_t              g_kbapp_node; // kbapp (Thread 3 application) start node
