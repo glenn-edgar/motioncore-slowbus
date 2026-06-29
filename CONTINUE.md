@@ -29,10 +29,11 @@ sections (2026-06-28, PICO 2 W PORT) are history/reference.★
 - **RP2040-vs-RP2350-as-controller benchmark** (HW, roles swapped via re-commission): **intra-bus ~1000
   frames/s on BOTH** (wire/turnaround-bound, not MCU); **uplink round-trip MCU-bound — RP2350 ~1.6× RP2040**
   (USB inject 107 vs 66/s); USB>WiFi. See memory [[rp2040-vs-rp2350-bus-bench]].
-- **30-min UDP soak (RP2040) — PASSED.** WiFi/UDP, free-run cycle + pp + 600 injects: NO reboots (uptime
-  monotonic 775s→2445s), rpc_err=0, mode stayed WiFi the whole run (no drop/reconnect), pool avail=24/24
-  (no leak), bus sustained ~875 frames/s (poll +1.41M), slave miss=49 (0.003% — negligible jitter),
-  overruns 187 (free-run vs 5ms default — negligible). Stable.
+- **30-min UDP soaks — BOTH chips as controller, BOTH PASSED.** WiFi/UDP, free-run cycle + pp + injects:
+  NO reboots (uptime monotonic), rpc_err=0, mode stayed WiFi the whole run (no drop/reconnect), pool
+  avail=24/24 (no leak), bus sustained ~873-875 frames/s (poll +1.4M each). RP2040: slave miss=49
+  (0.003%), ov=187. RP2350: slave miss=412 (0.029% — ~8× the 2040 but still negligible; the RP2040-slave
+  turnaround under the faster 2350 master), ov=140. Dual-transport WiFi path stable on both for 30 min.
 
 **★KEY OPS FACTS (this session):** Pico has NO over-USB config write — config is a whole-UF2 two-step flash
 (`cfg_image → picotool load` the config region @ top-64KB; firmware untouched, survives a firmware reflash).
