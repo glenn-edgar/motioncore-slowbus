@@ -102,6 +102,7 @@
 #define CMD_BUS_MSG_INJECT       0x0169u // §17 step3 test: [addr][payload...] -> bus_msg_send (producer)
 #define CMD_BUS_SET_DEADLINE     0x016Au // §17 step4: [deadline_us u32] real-time cycle deadline
 #define CMD_BUS_SET_PACE         0x016Bu // §17 step7: [pace_us u32][slowpoll_div u32 opt] fixed-rate + dead-probe rate
+#define CMD_BUS_UPLINK_FORCE     0x016Cu // §dual-transport: [mode u8 (0=standby 1=usb 2=wifi, 0xFF=auto)][dur_ms u32] force-pin the uplink mode
 #define BUS_REG_OK               0u
 #define SHELL_OK                 0u
 #define SHELL_UNKNOWN_CMD        1u
@@ -210,6 +211,10 @@ static netcfg_t g_netcfg; // WiFi creds + zenoh-agent endpoint (present=0 unless
 enum { UPL_STANDALONE = 0, UPL_USB = 1, UPL_WIFI = 2 };
 static volatile uint8_t g_uplink_mode;    // current transport (POLL_STATS / observability)
 static volatile bool    g_uplink_active;  // true in USB/WiFi, false in standalone
+// Force-override the selector for a bounded window (testing/ops): pin a mode (e.g. standalone) so
+// the dynamic selector is overridden, with auto-revert so a forced-standalone can't strand the node.
+static volatile uint8_t  g_uplink_force = 0xFFu;   // 0xFF = auto selector; else force this UPL_* mode
+static volatile uint32_t g_uplink_force_until;     // ms deadline for the forced mode (auto-revert to auto)
 static int g_ilcf_rc = -2; // Thread-2 interlock bring-up for the banner: -2 pending,
                            // else the count of slots armed from ilc0..ilc9 (0..10)
 static uint32_t g_il_armfail = 0; // DIAG: first arm failure [slot:8][status:8][err0:8][err1:8]
@@ -594,6 +599,13 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         if (alen >= 4) g_cycle_pace_us = (uint32_t)args[0]|((uint32_t)args[1]<<8)|((uint32_t)args[2]<<16)|((uint32_t)args[3]<<24);
         if (alen >= 8) g_dead_slowpoll_div = (uint32_t)args[4]|((uint32_t)args[5]<<8)|((uint32_t)args[6]<<16)|((uint32_t)args[7]<<24);
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    case CMD_BUS_UPLINK_FORCE: {   // §dual-transport: [mode u8][dur_ms u32] pin the uplink mode (auto-revert)
+        uint8_t fm = (alen >= 1) ? args[0] : 0xFFu;
+        uint32_t dur = (alen >= 5) ? ((uint32_t)args[1]|((uint32_t)args[2]<<8)|((uint32_t)args[3]<<16)|((uint32_t)args[4]<<24)) : 0u;
+        g_uplink_force_until = to_ms_since_boot(get_absolute_time()) + dur;
+        g_uplink_force = fm;   // 0xFF = release to the auto selector immediately
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    }
     case CMD_APP_PP_START:   // [addr] -> start the free-running chain-flow ping-pong loop
         if (alen >= 1) g_pp_addr = args[0];
         g_pp_master = 0; g_pp_slave_seen = 0; g_pp_kicks = 0;
@@ -1017,6 +1029,11 @@ static void uplink_supervisor_task(void *arg) {
         // ---- desired transport (USB > WiFi > standalone) ----
         uint8_t desired = usb ? UPL_USB
                         : ((wifi_ok && wifi_link_up(nif) && fd >= 0) ? UPL_WIFI : UPL_STANDALONE);
+        // force-override window (testing/ops): pin a mode, auto-revert to the selector when it expires.
+        if (g_uplink_force != 0xFFu) {
+            if ((int32_t)(now - g_uplink_force_until) < 0) desired = g_uplink_force;
+            else g_uplink_force = 0xFFu;   // expired -> back to auto
+        }
 
         // ---- debounce, then commit the switch (USB preempts; a brief DTR/link blip won't thrash) ----
         if (desired != g_uplink_mode) {
@@ -1317,7 +1334,7 @@ static void bus_run_cycle(void) {
     {
         static uint32_t s_seen_ex, s_last_ex_ms;
         uint32_t ex = g_pool_exhausted;
-        if (ex != s_seen_ex) {
+        if (g_uplink_active && ex != s_seen_ex) {   // §dual-transport: no uplink -> don't emit (counter still tracks)
             uint32_t nms = to_ms_since_boot(get_absolute_time());
             if ((uint32_t)(nms - s_last_ex_ms) >= 100u) {
                 s_last_ex_ms = nms; s_seen_ex = ex;
@@ -1337,10 +1354,10 @@ static void bus_run_cycle(void) {
     int32_t slack = (int32_t)g_cycle_deadline_us - (int32_t)ct;
     if (slack < g_cycle_minslack) g_cycle_minslack = slack;
     if (ct > g_cycle_deadline_us) {
-        g_cycle_overruns++;
+        g_cycle_overruns++;                         // stat counts even in standalone; only the notify is gated
         static uint32_t s_last_notify_ms;          // rate-limit the push to <=10/s
         uint32_t nms = to_ms_since_boot(get_absolute_time());
-        if ((uint32_t)(nms - s_last_notify_ms) >= 100u) {
+        if (g_uplink_active && (uint32_t)(nms - s_last_notify_ms) >= 100u) {   // §dual-transport: no uplink -> skip
             s_last_notify_ms = nms;
             char m[64];
             int mn = snprintf(m, sizeof m, "[overrun] cycle=%uus deadline=%uus slow=0x%02X/%uus",
@@ -1363,7 +1380,10 @@ static void bus_run_cycle(void) {
     // empty-frame spam; rate is naturally cycle-paced. handle_slot_frame appended the
     // records while g_cycle_collecting was set; close the window before emitting.
     g_cycle_collecting = false;
-    if (g_fb_rec > 0) {
+    // §dual-transport: emit only when an uplink is active (USB/WiFi). In standalone the batch is
+    // collected (so handle_slot_frame keeps batching, not relaying) but DROPPED here -> no traffic
+    // generated for an absent host. (standalone_pump is the pump-side safety-net sink.)
+    if (g_uplink_active && g_fb_rec > 0) {
         g_fb_buf[0] = g_fb_rec;
         LOCK(); (void)host_link_s2m(&g_hl, 1, OP_BUS_FEEDBACK, g_fb_buf, g_fb_n); UNLOCK();
         g_fb_frames++;
