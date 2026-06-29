@@ -36,6 +36,7 @@
 #define OP_BUS_CMD_NAK       ((uint16_t)0x0019)  // 6b: slave NAK'd a bus command (busy) — [addr:u8][req_id:u16]
 #define OP_BUS_INTERLOCK_MSG ((uint16_t)0x001A)  // 7b-1: slave's async interlock MESSAGE (buffer 2) on a trip edge — relayed s2m: [v2 status: ver,nslots,slots,crash]
 #define OP_BUS_STATUS_REPORT ((uint16_t)0x001B)  // 7b-2: BC's periodic per-slave status snapshot (the reliable INDEX) — [addr:u8][flags:u8]; USB-only, zero RS-485 traffic
+#define OP_BUS_FEEDBACK      ((uint16_t)0x001C)  // §17 step8: BC's batched per-cycle feedback — [n_rec:u8] then n_rec*[addr:u8][len:u8][bytes...]; agent PUBLISHes it
 
 // ----- m2s (host -> dongle) -----
 #define OP_REGISTER_ACK      ((uint16_t)0x0103)  // L1: host acknowledges OP_REGISTER -> BOOT → L1_DONE

@@ -18,14 +18,14 @@
 #define BB_ADC2_MAX_OFFSET                       28
 #define BB_ADC2_RMS_OFFSET                       32
 
-extern cfl_bb_field_t ct_m6s5rj6o_bb_fields[];
-extern cfl_bb_record_t ct_m6s5rj6o_bb_record;
+extern cfl_bb_field_t ct_8fwlhyxg_bb_fields[];
+extern cfl_bb_record_t ct_8fwlhyxg_bb_record;
 
-extern cfl_bb_table_t ct_m6s5rj6o_bb_table;
-void ct_m6s5rj6o_bb_init_hashes(void);
+extern cfl_bb_table_t ct_8fwlhyxg_bb_table;
+void ct_8fwlhyxg_bb_init_hashes(void);
 
 /* ===== Stable aliases (use these from application code) ===== */
-#define chaintree_handle_bb_table       ct_m6s5rj6o_bb_table
-#define chaintree_handle_bb_init_hashes ct_m6s5rj6o_bb_init_hashes
+#define chaintree_handle_bb_table       ct_8fwlhyxg_bb_table
+#define chaintree_handle_bb_init_hashes ct_8fwlhyxg_bb_init_hashes
 
 #endif /* CHAINTREE_HANDLE_BLACKBOARD_H */

@@ -11,6 +11,9 @@ extern unsigned cfl_wait_main_fn(void *handle, unsigned bool_function_index, uns
 
 extern void cfl_null_one_shot_fn(void *handle, unsigned node_index);
 extern void adc_read_one_shot_fn(void *handle, unsigned node_index);
+extern void app_echo_one_shot_fn(void *handle, unsigned node_index);
+extern void app_echo_to_one_shot_fn(void *handle, unsigned node_index);
+extern void app_il_clear_one_shot_fn(void *handle, unsigned node_index);
 extern void cfl_column_init_one_shot_fn(void *handle, unsigned node_index);
 extern void cfl_column_term_one_shot_fn(void *handle, unsigned node_index);
 extern void cfl_gate_node_init_one_shot_fn(void *handle, unsigned node_index);
@@ -26,7 +29,7 @@ extern bool cfl_column_null_boolean_fn(void *handle, unsigned node_index, unsign
 extern bool cfl_gate_node_null_boolean_fn(void *handle, unsigned node_index, unsigned event_type, unsigned event_id, void *event_data);
 extern bool cfl_wait_for_event_boolean_fn(void *handle, unsigned node_index, unsigned event_type, unsigned event_id, void *event_data);
 
-const main_function_t ct_m6s5rj6o_main_functions[] = {
+const main_function_t ct_8fwlhyxg_main_functions[] = {
     cfl_null_main_fn,
     cfl_column_main_main_fn,
     cfl_disable_main_fn,
@@ -35,9 +38,12 @@ const main_function_t ct_m6s5rj6o_main_functions[] = {
     cfl_wait_main_fn,
 };
 
-const one_shot_function_t ct_m6s5rj6o_one_shot_functions[] = {
+const one_shot_function_t ct_8fwlhyxg_one_shot_functions[] = {
     cfl_null_one_shot_fn,
     adc_read_one_shot_fn,
+    app_echo_one_shot_fn,
+    app_echo_to_one_shot_fn,
+    app_il_clear_one_shot_fn,
     cfl_column_init_one_shot_fn,
     cfl_column_term_one_shot_fn,
     cfl_gate_node_init_one_shot_fn,
@@ -49,23 +55,23 @@ const one_shot_function_t ct_m6s5rj6o_one_shot_functions[] = {
     mon_cmd_timeout_one_shot_fn,
 };
 
-const boolean_function_t ct_m6s5rj6o_boolean_functions[] = {
+const boolean_function_t ct_8fwlhyxg_boolean_functions[] = {
     cfl_null_boolean_fn,
     cfl_column_null_boolean_fn,
     cfl_gate_node_null_boolean_fn,
     cfl_wait_for_event_boolean_fn,
 };
 
-const uint16_t ct_m6s5rj6o_main_function_usage_count[6] = {
+const uint16_t ct_8fwlhyxg_main_function_usage_count[6] = {
     0,  /* CFL_NULL */
-    3,  /* CFL_COLUMN_MAIN */
-    3,  /* CFL_DISABLE */
-    2,  /* CFL_GATE_NODE_MAIN */
-    3,  /* CFL_RESET */
-    3,  /* CFL_WAIT */
+    6,  /* CFL_COLUMN_MAIN */
+    6,  /* CFL_DISABLE */
+    3,  /* CFL_GATE_NODE_MAIN */
+    6,  /* CFL_RESET */
+    6,  /* CFL_WAIT */
 };
 
-const char *ct_m6s5rj6o_main_function_names[6] = {
+const char *ct_8fwlhyxg_main_function_names[6] = {
     "CFL_NULL",
     "CFL_COLUMN_MAIN",
     "CFL_DISABLE",
@@ -74,9 +80,12 @@ const char *ct_m6s5rj6o_main_function_names[6] = {
     "CFL_WAIT",
 };
 
-const char *ct_m6s5rj6o_one_shot_function_names[11] = {
+const char *ct_8fwlhyxg_one_shot_function_names[14] = {
     "CFL_NULL",
     "ADC_READ",
+    "APP_ECHO",
+    "APP_ECHO_TO",
+    "APP_IL_CLEAR",
     "CFL_COLUMN_INIT",
     "CFL_COLUMN_TERM",
     "CFL_GATE_NODE_INIT",
@@ -88,7 +97,7 @@ const char *ct_m6s5rj6o_one_shot_function_names[11] = {
     "MON_CMD_TIMEOUT",
 };
 
-const char *ct_m6s5rj6o_boolean_function_names[4] = {
+const char *ct_8fwlhyxg_boolean_function_names[4] = {
     "CFL_NULL",
     "CFL_COLUMN_NULL",
     "CFL_GATE_NODE_NULL",

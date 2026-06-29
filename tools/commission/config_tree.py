@@ -93,6 +93,10 @@ class Builder:
         self.kb_name = kb_name
         self._stack = []   # [(link, name), ...] currently-open nodes
         self.devices = []  # collected device records (for the commissioner)
+        # Accumulated declared namespace for namespace_db.regen_subtree(): every
+        # node this builder constructs, keyed by ltree path. The root node
+        # (kb_name) anchors the subtree the regen is scoped to.
+        self.declared = {self.kb_name: {"kind": "KB", "attrs": {"description": description}}}
 
     # -- current open path (kb.link.name.link.name...) -------------------
     def path(self):
@@ -106,6 +110,7 @@ class Builder:
         with _quiet():
             self.kb.add_header_node(link, name, dict(props), {})
         self._stack.append((link, name))
+        self.declared[self.path()] = {"kind": link, "attrs": dict(props)}
         return self
 
     def end_node(self):
@@ -140,11 +145,17 @@ class Builder:
         data = {"pins": pins or {}, "interlock": interlock}
         with _quiet():
             self.kb.add_info_node(DEV_LINK, name, props, data)  # leaf: push+pop
+        devpath = "%s.%s.%s" % (self.path(), DEV_LINK, name)
         self.devices.append({
-            "path": "%s.%s.%s" % (self.path(), DEV_LINK, name),
+            "path": devpath,
             "name": name, "i2c": i2c, "cls": cls, "sub": sub_u, "mode": mode,
             "files": files, "pins": pins or {}, "interlock": interlock,
         })
+        # namespace_db attrs carry the JSON-able SOURCE (one source of truth); the
+        # commissioner recompiles the raw on-chip files from it via slave_dsl.
+        self.declared[devpath] = {"kind": DEV_LINK, "attrs": {
+            "i2c": i2c, "cls": cls, "sub": sub_u, "mode": mode,
+            "pins": pins or {}, "interlock": interlock}}
         return self
 
     # -- roster: immediate I2C devices under a node ----------------------
@@ -157,6 +168,22 @@ class Builder:
             props = json.loads(r["properties"]) if r["properties"] else {}
             out.append({"path": r["path"], "name": r["name"], **props})
         return out
+
+    # -- drive the namespace DB ------------------------------------------
+    def commit_to(self, ns, root=None):
+        """Subtree-scoped regen of everything this builder declared into a
+        namespace_db.NamespaceDB. `root` defaults to the shallowest declared
+        path (this builder's natural subtree root), so composed subtrees each
+        reconcile only their own branch and never touch a sibling's. Returns the
+        regen summary {added, deleted, kept}. UID bindings + status under the
+        root survive unless their node was dropped from the declaration."""
+        if not self.declared:
+            return {"added": [], "deleted": [], "kept": []}
+        if root is None:
+            root = min(self.declared, key=lambda p: (p.count("."), p))
+        sub = {p: v for p, v in self.declared.items()
+               if p == root or p.startswith(root + ".")}
+        return ns.regen_subtree(root, sub)
 
     def finish(self):
         with _quiet():
@@ -221,3 +248,36 @@ if __name__ == "__main__":
 
     print("\nSame conveyor_io() subtree, two contexts: device idnt is identical,")
     print("only the inherited ltree path differs -> config maps across the enterprise.")
+
+    # (C) Wire the DSL into the namespace DB: commit drives subtree-scoped regen.
+    import namespace_db
+    nsf = "/tmp/cfg_ns.db"
+    if os.path.exists(nsf):
+        os.remove(nsf)
+    ns = namespace_db.NamespaceDB(nsf)
+
+    c1 = Builder("/tmp/cfg_ns_build.db")
+    c1.define_node("SLAVE", "node1", rs485=12)
+    conveyor_io(c1)                       # estop + axis under slow_bus.SLAVE.node1
+    c1.end_node(); c1.finish()
+    print("\n=== C  DSL -> namespace_db ===")
+    print("commit (full build):", c1.commit_to(ns))
+    print("nodes:", ns.list_subtree("slow_bus"))
+
+    # The commission tool would write this; do it inline to show it survives regen.
+    ns.bind_uuid("slow_bus.SLAVE.node1.DEV.estop", "UID-ESTOP-01", vid=0x2886, pid=0x802F)
+    print("estop bound to:", ns.resolve_uuid("slow_bus.SLAVE.node1.DEV.estop"))
+
+    # Re-run the DSL with `axis` DROPPED -> subtree-scoped regen deletes axis and
+    # preserves the estop binding (a different node).
+    c2 = Builder("/tmp/cfg_ns_build.db")
+    c2.define_node("SLAVE", "node1", rs485=12)
+    c2.device("estop", i2c=0x20, cls="SAMD21", sub="GPIO",
+              pins={"D0": "in:up", "D1": "in:up", "D2": "in:none", "D3": "in:down",
+                    "D7": "out:0", "D8": "out:0", "D9": "out:1", "D10": "out:0"},
+              interlock={"name": "safe", "expr": "(D0 && D1) && (D2 || D3)", "drive": {"D8": 1}})
+    c2.end_node(); c2.finish()
+    print("regen (axis dropped):", c2.commit_to(ns))
+    print("nodes:", ns.list_subtree("slow_bus"))
+    print("estop binding preserved:", ns.resolve_uuid("slow_bus.SLAVE.node1.DEV.estop"))
+    ns.close()

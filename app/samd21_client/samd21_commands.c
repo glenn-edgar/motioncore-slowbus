@@ -304,7 +304,9 @@ static void tc3_start_at_period(uint16_t period) {
     BOUNDED_SPIN(TC3->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
+#ifdef I2C_CLIENT
 static void adc_isr_service(void);   // ADC step, keyed off this tone clock (defined below)
+#endif
 
 // TC3 is the master clock: it generates the DAC waveform AND, in ADC mode, keys
 // the ADC sampler. Both run from this one ISR.
@@ -335,7 +337,9 @@ void TC3_Handler(void) {
         }
     }
 
+#ifdef I2C_CLIENT
     adc_isr_service();                    // ADC step (no-op unless the ADC engine is running)
+#endif
 }
 
 // ---------- CMD_DAC_WAVEFORM_WRITE ---------------------------------------
@@ -1342,7 +1346,12 @@ static void pio_int_assert(bool on) {
         PORT->Group[PIO_INT_GROUP].OUTCLR.reg = m;   // drive low
         PORT->Group[PIO_INT_GROUP].DIRSET.reg = m;
     } else {
-        PORT->Group[PIO_INT_GROUP].DIRCLR.reg = m;   // release: Hi-Z
+        // release: input + internal pull-up so the active-low INT idles HIGH and
+        // reads cleanly via REG_ILSNAP_INT_LIVE (parallels an external bus pull-up;
+        // a remote wired-OR node can still pull the line low).
+        PORT->Group[PIO_INT_GROUP].DIRCLR.reg = m;
+        PORT->Group[PIO_INT_GROUP].OUTSET.reg = m;   // OUT=1 -> pull-up direction
+        PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
     }
 }
 
@@ -1361,6 +1370,9 @@ static void pio_int_assert(bool on) {
 //   0x39 OUT_LIVE (r): the selected output pin's LIVE physical level (read-back).
 //        Open-collector outputs keep INEN on, so this confirms what is actually on
 //        the pin (e.g. an `oc` D6 driven low on trip reads 0) -- no jumper needed.
+//   0x3A INT_LIVE (r): the D6/PB08 interlock INT line's LIVE level (1=high/released,
+//        0=low/asserted). The interlock DRIVES D6; this lets the master READ it --
+//        the live wired-OR interlock-line state, in GPIO/ADC/MIXED. No jumper.
 #define REG_ILSNAP_VALID    0x30u
 #define REG_ILSNAP_NIN      0x31u
 #define REG_ILSNAP_NOUT     0x32u
@@ -1370,6 +1382,8 @@ static void pio_int_assert(bool on) {
 #define REG_ILSNAP_OUT_PHYS 0x37u
 #define REG_ILSNAP_OUT_VAL  0x38u
 #define REG_ILSNAP_OUT_LIVE 0x39u
+#define REG_ILSNAP_INT_LIVE 0x3Au
+#define PIO_INT_PHYS        ((uint8_t)((PIO_INT_GROUP << 5) | PIO_INT_PIN))   // D6=PB08=0x28
 
 static struct {
     bool     valid;
@@ -1413,6 +1427,7 @@ static uint8_t il_snap_reg_read(uint8_t reg) {
     case REG_ILSNAP_OUT_PHYS: return (s < g_il_snap.n_out) ? g_il_snap.out_phys[s] : 0xFFu;
     case REG_ILSNAP_OUT_VAL:  return (s < g_il_snap.n_out) ? g_il_snap.out_val[s] : 0xFFu;
     case REG_ILSNAP_OUT_LIVE: return (s < g_il_snap.n_out) ? pio_phys_read(g_il_snap.out_phys[s]) : 0xFFu;
+    case REG_ILSNAP_INT_LIVE: return pio_phys_read(PIO_INT_PHYS);   // live D6/PB08 INT line level
     default:                  return 0xFFu;
     }
 }
@@ -1440,8 +1455,7 @@ static void pio_il_drive_safe(void) {                   // force out_err pins to
 static void pio_il_arm(void) {
     il_snap_clear();                        // fresh arm: no stale freeze-frame
     g_pio_il_valid = false; g_pio_il_tripped = false;
-    PORT->Group[PIO_INT_GROUP].PINCFG[PIO_INT_PIN].reg = PORT_PINCFG_INEN;
-    PORT->Group[PIO_INT_GROUP].DIRCLR.reg = (1u << PIO_INT_PIN);   // open-drain INT: Hi-Z idle
+    pio_int_assert(false);                  // INT released: Hi-Z + internal pull-up, INEN on
     g_pio_il_state = 0u;
     int ils = store_find_str("ilcf");      // interlock-config named slot
     if (ils >= 0 && g_rec_len[ils] > 0u) {
@@ -1959,6 +1973,16 @@ static uint8_t   g_mixed_gpio_raw;                 // raw-level bitmap (bit i = 
 static uint8_t   g_mixed_gpio_deb;                 // debounced bitmap (bit i = input i)
 static uint32_t  g_mixed_next_ms;                  // ~100 Hz tick gate
 
+// mxmp — the MIXED fixed pin-map (commissioned file "mxmp"), applied at mode entry
+// and ENFORCED (the I2C master is read-only). One padbyte per configurable pad in
+// g_pio_ch order (D0,D1,D2,D3,D7,D8,D9,D10; D6 = INT, not here): role low-nibble,
+// debounce depth high-nibble. The interlock operates WITHIN this pin environment.
+#define MXMP_VERSION 1u
+enum { MXMP_SAFE = 0u, MXMP_IN, MXMP_IN_PU, MXMP_IN_PD, MXMP_OUT, MXMP_OC, MXMP_OC_PU, MXMP_ADC, MXMP_DAC };
+static uint8_t g_mxmp_role[8];                      // per MIXED pad, applied + cached for the interlock
+static uint8_t g_mxmp_deb[8];                       // per-pad debounce depth (in-roles; 0 = none, else 2..15)
+static bool    g_mixed_dac_en;                      // D0 role == dac -> the DAC bank (0x20-0x2C) is live
+
 // Compare one watch against a freshly-read input value. Same op switch as
 // eval_slot()/pio_watch_pass(); `v` is the debounced level (GPIO) or 16x ADC
 // value (ADC), already selected by the caller.
@@ -2165,13 +2189,17 @@ static uint8_t mixed_reg_read(uint8_t reg) {
     case REG_MIXED_GPIO_DEB: return g_mixed_gpio_deb;
     case REG_MIXED_ILSTATE:  return g_mixed_il_state;
     case REG_MIXED_ILSTAT:   return g_mixed_il_pstat;
-    default: { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }   // DAC bench regs (A0->A1 source)
+    default:                                                 // DAC bench regs (A0->A1 source)
+        if (!g_mixed_dac_en) return 0xFFu;                   // gated: D0 not commissioned `dac`
+        { uint8_t v = 0xFFu; dac_reg_read(reg, &v); return v; }
     }
 }
 static void mixed_reg_write(uint8_t reg, uint8_t val) {
     switch (reg) {
     case REG_MIXED_CH_SEL: if (val < IL_MAX_INPUTS) g_mixed_ch_sel = val; break;
-    default: dac_reg_write(reg, val); break;                 // DAC bench regs (test source)
+    default:                                                 // DAC bench regs (test source)
+        if (g_mixed_dac_en) dac_reg_write(reg, val);         // gated: ignored unless D0 = `dac`
+        break;
     }
 }
 
@@ -3086,6 +3114,80 @@ static void file_list_advance(bool from_start) {
 // and the offline transition (which leaves the active mode then tri-states).
 // ============================================================================
 
+// Drive one MIXED pad to the true safe state: Hi-Z, input buffer + pull OFF. This
+// is the ACTIVE safe (not reliant on the power-on reset default), so a `safe` pad
+// — or a runtime mode switch — never leaves a pad driven.
+static void mxmp_pad_safe(uint8_t g, uint8_t p) {
+    PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+    PORT->Group[g].DIRCLR.reg           = (1u << p);
+    PORT->Group[g].OUTCLR.reg           = (1u << p);
+    PORT->Group[g].PINCFG[p].reg        = 0u;              // INEN=0, PULLEN=0 -> true Hi-Z
+}
+
+// Apply the commissioned MIXED pin-map ("mxmp") to the 8 configurable pads, ONCE at
+// mode entry. Every pad gets an explicit hardware state from the file; absent/short/
+// bad-version -> every pad safe (Hi-Z). D6 (INT) is owned by mixed_il_arm, not here.
+// Records the per-pad role/debounce for the interlock and sets the DAC gate.
+static void mxmp_apply(void) {
+    g_mixed_dac_en = false;
+    int s = store_find_str("mxmp");
+    const uint8_t *d = (s >= 0) ? g_rec_data[s] : NULL;
+    bool ok = (d && g_rec_len[s] >= 9u && d[0] == MXMP_VERSION);
+    for (uint8_t i = 0; i < 8u; i++) {
+        uint8_t g = g_pio_ch[i].group, p = g_pio_ch[i].pin;
+        uint8_t role = MXMP_SAFE, deb = 0u;
+        if (ok) { uint8_t b = d[1u + i]; role = (uint8_t)(b & 0x0Fu); deb = (uint8_t)((b >> 4) & 0x0Fu); }
+        g_mxmp_role[i] = role; g_mxmp_deb[i] = deb;
+        switch (role) {
+        case MXMP_IN:                                          // input, no pull
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
+            break;
+        case MXMP_IN_PU:                                       // input, pull-up
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].OUTSET.reg = (1u << p);             // OUT=1 -> pull-up direction
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+            break;
+        case MXMP_IN_PD:                                       // input, pull-down
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].OUTCLR.reg = (1u << p);             // OUT=0 -> pull-down direction
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+            break;
+        case MXMP_OUT:                                         // push-pull output, idle low
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].OUTCLR.reg = (1u << p);
+            PORT->Group[g].DIRSET.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;   // INEN for read-back
+            break;
+        case MXMP_OC:                                          // open-collector: Hi-Z idle, ext pull-up
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN;
+            break;
+        case MXMP_OC_PU:                                       // open-collector: Hi-Z idle, internal pull-up
+            PORT->Group[g].PINCFG[p].bit.PMUXEN = 0;
+            PORT->Group[g].DIRCLR.reg = (1u << p);
+            PORT->Group[g].OUTSET.reg = (1u << p);
+            PORT->Group[g].PINCFG[p].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+            break;
+        case MXMP_ADC:                                         // analog input
+            adc_init();
+            adc_pin_config(g, p);                              // PMUX -> analog
+            break;
+        case MXMP_DAC:                                         // D0 only: DAC source (routed in mode_enter)
+            g_mixed_dac_en = true;
+            break;
+        case MXMP_SAFE:
+        default:
+            mxmp_pad_safe(g, p);
+            break;
+        }
+    }
+}
+
 // "leaving m" — undo whatever mode_enter(m) set up. IDLE = no-op.
 static void mode_leave(uint8_t m) {
     if (m == MODE_PIO) {                            // leaving PIO
@@ -3124,15 +3226,21 @@ static void mode_enter(uint8_t m) {
         adc_mode_setup();                           // DIV16 sampler + window stats + DAC const
         adc_il_arm();                               // parse ilcf, claim D6 output, arm interlock
     } else if (m == MODE_MIXED) {                   // entering MIXED
-        dac_init();                                 // DAC bench source available in MIXED (A0->A1)
-        PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;    // route PA02 -> DAC (mode entry may have freed it)
-        PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
-        DAC->CTRLB.bit.EOEN = 1;
-        BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
-        for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;  // idle: no waveform
-        g_dds.active = false;
-        DAC->DATA.reg = g_dac_offset;               // idle at the DC offset
-        mixed_il_arm();                             // parse interlock_cfg, claim pins, set up INT
+        mxmp_apply();                               // fixed pin-map: configure all 8 pads + set DAC gate
+        if (g_mixed_dac_en) {                       // D0 commissioned `dac` -> bring up the DAC source
+            dac_init();                             // (A0->A1 two-tone bench), route PA02 -> DAC
+            PORT->Group[0].PINCFG[2].bit.PMUXEN = 1;
+            PORT->Group[0].PMUX[1].bit.PMUXE    = PORT_PMUX_PMUXE_B_Val;
+            DAC->CTRLB.bit.EOEN = 1;
+            BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
+            for (uint8_t t = 0; t < DAC_NTONES; t++) g_dac_type[t] = DAC_TONE_OFF;  // idle: no waveform
+            g_dds.active = false;
+            DAC->DATA.reg = g_dac_offset;           // idle at the DC offset
+        } else {                                    // D0 not `dac` -> release the DAC so mxmp owns PA02
+            DAC->CTRLB.bit.EOEN = 0;
+            BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
+        }
+        mixed_il_arm();                             // interlock operates WITHIN the mxmp pin environment
     } else if (m == MODE_SERVO) {                   // entering SERVO
         DAC->CTRLB.bit.EOEN = 0;                    // free CH0=PA02 from the DAC (else it pins CH0 low)
         BOUNDED_SPIN(DAC->STATUS.bit.SYNCBUSY);
@@ -3670,6 +3778,166 @@ static uint8_t cmd_i2c_scan(shell_reader_t* args, shell_writer_t* result) {
     return SHELL_STATUS_OK;
 }
 
+// ---------- SD-card text logging (gateway only; FatFs on the XIAO base) ----
+// Host-driven: open/close/write/read/delete one file at a time, no directories.
+// Each write/read does open->op->close so every record is flushed (power-safe).
+// STEP A: timestamp is a per-boot sequence number; the real RTC stamp + OLED
+// last-log land with the pcf8563/ssd1306 binding.
+#ifndef I2C_CLIENT
+#include "ff.h"
+#include "i2c_bus.h"
+#include "pcf8563.h"
+#include "ssd1306.h"
+
+#define RTC_ADDR   0x51u
+#define OLED_ADDR  0x3Cu
+
+// i2c_bus_t bound to the gateway's own SERCOM2 I2C master (wraps the static
+// primitives) so the mirrored pcf8563/ssd1306 C drivers run on-chip.
+static int gw_i2c_w(void *c, uint8_t a, const uint8_t *b, size_t n, bool nostop) {
+    (void)c;
+    if (!i2c_start(a, false)) { i2c_stop(); return -1; }
+    for (size_t i = 0; i < n; i++) if (!i2c_write_byte(b[i])) { i2c_stop(); return -1; }
+    if (!nostop) i2c_stop();
+    return 0;
+}
+static int gw_i2c_r(void *c, uint8_t a, uint8_t *b, size_t n) {
+    (void)c;
+    if (!i2c_start(a, true)) { i2c_stop(); return -1; }
+    for (size_t i = 0; i < n; i++) b[i] = i2c_read_byte(i == n - 1);
+    i2c_stop();
+    return 0;
+}
+static const i2c_bus_t gw_bus = { .ctx = 0, .write = gw_i2c_w, .read = gw_i2c_r };
+
+static FATFS     s_log_fs;
+static bool      s_log_mounted;
+static char      s_log_name[13];    // active 8.3 file (+NUL); empty = none
+static ssd1306_t s_oled;
+static bool      s_oled_ok;
+
+// "YYYY-MM-DD HH:MM:SS " from the RTC -> out[20]. Fallback marker on bus error.
+static int log_stamp(char *out) {
+    pcf8563_time_t t;
+    if (!pcf8563_get(&gw_bus, RTC_ADDR, &t)) {
+        const char *f = "0000-00-00 --:--:-- "; for (int i = 0; i < 20; i++) out[i] = f[i]; return 20;
+    }
+    int p = 0;
+    out[p++] = (char)('0' + (t.year / 1000) % 10); out[p++] = (char)('0' + (t.year / 100) % 10);
+    out[p++] = (char)('0' + (t.year / 10) % 10);   out[p++] = (char)('0' + t.year % 10);
+    out[p++] = '-'; out[p++] = (char)('0' + t.month / 10); out[p++] = (char)('0' + t.month % 10);
+    out[p++] = '-'; out[p++] = (char)('0' + t.mday  / 10); out[p++] = (char)('0' + t.mday  % 10);
+    out[p++] = ' '; out[p++] = (char)('0' + t.hour  / 10); out[p++] = (char)('0' + t.hour  % 10);
+    out[p++] = ':'; out[p++] = (char)('0' + t.min   / 10); out[p++] = (char)('0' + t.min   % 10);
+    out[p++] = ':'; out[p++] = (char)('0' + t.sec   / 10); out[p++] = (char)('0' + t.sec   % 10);
+    out[p++] = ' ';
+    return p;   // 20
+}
+
+// Last log on the OLED: HH:MM:SS on the top row, text word-wrapped below (21 cols/row).
+static void oled_last(const char *stamp, const char *text, int textlen) {
+    if (!s_oled_ok) return;
+    ssd1306_clear(&s_oled);
+    char hms[9]; for (int i = 0; i < 8; i++) hms[i] = stamp[11 + i]; hms[8] = 0;   // HH:MM:SS
+    ssd1306_text(&s_oled, 0, 0, hms);
+    int y = 12, col = 0;
+    for (int i = 0; i < textlen; i++) {
+        if (col >= 21) { col = 0; y += 10; }
+        if (y > 52) break;
+        ssd1306_char(&s_oled, col * 6, y, text[i]);
+        col++;
+    }
+    ssd1306_show(&s_oled);
+}
+
+void sd_log_init(void) {
+    s_log_name[0] = 0;
+    s_log_mounted = (f_mount(&s_log_fs, "", 1) == FR_OK);   // forces card init now
+    s_oled_ok = ssd1306_init(&s_oled, &gw_bus, OLED_ADDR, 128, 64);
+    if (s_oled_ok) {
+        ssd1306_clear(&s_oled);
+        ssd1306_text(&s_oled, 0, 0,  "slow_bus gateway");
+        ssd1306_text(&s_oled, 0, 12, s_log_mounted ? "SD: ready" : "SD: no card");
+        ssd1306_show(&s_oled);
+    }
+}
+
+// pull an 8.3 name (1..12 chars) from args into out[13]; false on bad/empty
+static bool log_name(shell_reader_t* args, char* out) {
+    uint16_t n = sr_remaining(args);
+    if (n == 0 || n > 12) return false;
+    for (uint16_t i = 0; i < n; i++) out[i] = (char)sr_u8(args);
+    out[n] = 0;
+    return !args->overflow;
+}
+
+static uint8_t cmd_log_open(shell_reader_t* args, shell_writer_t* result) {
+    char name[13];
+    if (!log_name(args, name)) return SHELL_STATUS_BAD_ARGS;
+    if (!s_log_mounted)        return SHELL_STATUS_CMD_FAILED;
+    FIL fp;
+    if (f_open(&fp, name, FA_OPEN_ALWAYS | FA_READ) != FR_OK) return SHELL_STATUS_CMD_FAILED;
+    uint32_t sz = (uint32_t)f_size(&fp);
+    f_close(&fp);
+    for (int i = 0; i < 13; i++) s_log_name[i] = name[i];   // becomes the active file
+    sw_u32(result, sz);
+    return SHELL_STATUS_OK;
+}
+
+static uint8_t cmd_log_close(shell_reader_t* args, shell_writer_t* result) {
+    (void)args; (void)result;
+    s_log_name[0] = 0;
+    return SHELL_STATUS_OK;
+}
+
+static uint8_t cmd_log_write(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    if (!s_log_mounted || s_log_name[0] == 0) return SHELL_STATUS_CMD_FAILED;
+    uint16_t n = sr_remaining(args);
+    if (n > 200) return SHELL_STATUS_BAD_ARGS;              // text fits one USB block
+    char line[224];
+    int ts = log_stamp(line);                              // "YYYY-MM-DD HH:MM:SS " (20)
+    int p = ts;
+    for (uint16_t i = 0; i < n; i++) line[p++] = (char)sr_u8(args);
+    if (args->overflow) return SHELL_STATUS_BAD_ARGS;
+    line[p++] = '\n';
+    FIL fp;
+    if (f_open(&fp, s_log_name, FA_OPEN_APPEND | FA_WRITE) != FR_OK) return SHELL_STATUS_CMD_FAILED;
+    UINT bw = 0;
+    FRESULT fr = f_write(&fp, line, (UINT)p, &bw);
+    f_close(&fp);                                           // close = flush (durable)
+    if (fr != FR_OK || bw != (UINT)p) return SHELL_STATUS_CMD_FAILED;
+    oled_last(line, &line[ts], (int)n);                    // last log -> OLED
+    return SHELL_STATUS_OK;
+}
+
+static uint8_t cmd_log_read(shell_reader_t* args, shell_writer_t* result) {
+    uint32_t off = sr_u32(args);
+    uint8_t  len = sr_u8(args);
+    if (args->overflow) return SHELL_STATUS_BAD_ARGS;
+    if (!s_log_mounted || s_log_name[0] == 0) return SHELL_STATUS_CMD_FAILED;
+    if (len > 60) len = 60;                                 // result-budget cap
+    FIL fp;
+    if (f_open(&fp, s_log_name, FA_READ) != FR_OK) return SHELL_STATUS_CMD_FAILED;
+    if (f_lseek(&fp, off) != FR_OK) { f_close(&fp); return SHELL_STATUS_CMD_FAILED; }
+    uint8_t buf[60]; UINT br = 0;
+    FRESULT fr = f_read(&fp, buf, len, &br);
+    f_close(&fp);
+    if (fr != FR_OK) return SHELL_STATUS_CMD_FAILED;
+    sw_bytes(result, buf, (uint16_t)br);                    // br < len => EOF
+    return SHELL_STATUS_OK;
+}
+
+static uint8_t cmd_log_delete(shell_reader_t* args, shell_writer_t* result) {
+    (void)result;
+    char name[13];
+    if (!log_name(args, name)) return SHELL_STATUS_BAD_ARGS;
+    if (!s_log_mounted)        return SHELL_STATUS_CMD_FAILED;
+    s_log_name[0] = 0;                                      // deleting clears the active file
+    return (f_unlink(name) == FR_OK) ? SHELL_STATUS_OK : SHELL_STATUS_CMD_FAILED;
+}
+#endif // !I2C_CLIENT
+
 // ---------- CMD_TEST_HANG -------------------------------------------------
 // Layer-2 WDT bench probe. Disables IRQs and spins; the layer-2 WDT bites
 // after ~4 s and the chip resets. Never returns a reply frame.
@@ -3781,6 +4049,13 @@ static const shell_cmd_entry_t g_chip_commands[] = {
     { CMD_I2C_READ,            "i2c_read",           cmd_i2c_read           },
     { CMD_I2C_WRITE_READ,      "i2c_write_read",     cmd_i2c_write_read     },
     { CMD_I2C_SCAN,            "i2c_scan",           cmd_i2c_scan           },
+#ifndef I2C_CLIENT
+    { CMD_LOG_OPEN,            "log_open",           cmd_log_open           },
+    { CMD_LOG_CLOSE,           "log_close",          cmd_log_close          },
+    { CMD_LOG_WRITE,           "log_write",          cmd_log_write          },
+    { CMD_LOG_READ,            "log_read",           cmd_log_read           },
+    { CMD_LOG_DELETE,          "log_delete",         cmd_log_delete         },
+#endif
 #ifdef I2C_CLIENT
     { CMD_FILE_BEGIN,          "file_begin",         cmd_file_begin         },
     { CMD_FILE_DATA,           "file_data",          cmd_file_data          },
@@ -3825,5 +4100,6 @@ void samd21_peripherals_init(void) {
     i2c_slave_init();   // SERCOM2 = I2C slave to the Pico master (D4/D5)
 #else
     i2c_init();         // SERCOM2 = I2C master for the dongle's own devices
+    sd_log_init();      // gateway: SD card + FatFs mount for host logging
 #endif
 }

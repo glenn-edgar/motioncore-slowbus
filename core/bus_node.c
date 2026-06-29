@@ -44,6 +44,18 @@ bool bus_node_queue(uint8_t dest, uint8_t type, const uint8_t *payload, uint8_t 
     return false;
 }
 
+// Acknowledge a BC command immediately (the BC's inject step waits ~40 ms for an
+// ACK before it moves on to POLL for the reply). The reply itself is queued by
+// the app (bus_node_on_data) and shipped on the next POLL grant -- the async
+// two-phase model the BC arbiter is built around (DATA->ACK->POLL->reply).
+static void node_emit_ack(void) {
+    uint16_t words[BUS_FRAME_WORDS_MAX];
+    bus_frame_t ack = { .dest = BUS_ADDR_MASTER, .src = g_my_addr,
+                        .type = BUS_FT_ACK, .seq = 0, .len = 0 };
+    uint16_t n = bus_frame_encode(words, &ack);
+    bus_phy_send_words(words, n);
+}
+
 // Transmit the node's whole window: queued frames in order, then NO_MESSAGE.
 static void node_emit_window(void) {
     uint16_t words[BUS_FRAME_WORDS_MAX];
@@ -67,15 +79,13 @@ void bus_node_task(void) {
 
         uint8_t cls = f.type & BUS_FT_MASK;
         if (cls == BUS_FT_DATA) {
-            // TODO(bring-up): if (f.type & BUS_TF_TCP) queue an ACK/NAK(seq).
-            bus_node_on_data(f.src, f.payload, f.len);
-        }
-
-        // A grant addressed to us (POLL, or DATA from the BC) opens our window.
-        bool granted = (f.dest == g_my_addr) &&
-                       (cls == BUS_FT_POLL || (cls == BUS_FT_DATA && f.src == BUS_ADDR_MASTER));
-        if (granted) {
-            node_emit_window();
+            bus_node_on_data(f.src, f.payload, f.len);   // app may queue a reply
+            // A BC command is acknowledged now; its reply ships on the next POLL
+            // (two-phase: the BC injects DATA, awaits the ACK, then POLLs to
+            // collect). Peer DATA (src != BC) is fire-and-forget -- no ACK.
+            if (f.src == BUS_ADDR_MASTER && f.dest == g_my_addr) node_emit_ack();
+        } else if (cls == BUS_FT_POLL && f.dest == g_my_addr) {
+            node_emit_window();                          // ship queued replies + NO_MESSAGE
         }
     }
 }
