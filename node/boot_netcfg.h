@@ -6,14 +6,15 @@
 // or in git — built by tools/commission/lua/cfg_image.lua --ssid/--pass/...
 //
 // Pure parse/validate (no radio calls) — as testable as boot_identity.c. The
-// caller (the WiFi uplink, UPLINK=wifi) joins the AP and dials ip:port.
+// caller (the dual-transport uplink supervisor) tries the credentials in list
+// order, joins whichever AP is in range, then dials the (shared) agent ip:port.
 //
-// MISSING is benign for a USB-uplink build (no WiFi); a WiFi build with no 'neti'
-// has nothing to join -> the uplink stays down (caller policy).
+// MISSING is benign (no WiFi config -> the node is USB-or-standalone only).
 //
-// neti shape:
-//   { "v":1, "ss":<ssid text>, "pw":<pass text>, "ip":h'..4..', "pt":<port u16> }
-//   ip = agent IPv4 as a 4-byte string (a.b.c.d); pt = agent UDP listen port.
+// neti shape — MULTIPLE credentials, ONE shared agent endpoint (§dual-transport):
+//   v2: { "v":2, "ip":h'..4..', "pt":<u16>, "aps":[ {"ss":<text>,"pw":<text>}, ... ] }
+//   v1 (legacy, single AP): { "v":1, "ss":<text>, "pw":<text>, "ip":h'..4..', "pt":<u16> }
+//   ip = agent IPv4 (a.b.c.d); pt = agent UDP port. v1 parses into a 1-entry list.
 // ============================================================================
 #pragma once
 
@@ -21,6 +22,7 @@
 
 #define NETI_SSID_MAX 33   // 32 chars + NUL
 #define NETI_PASS_MAX 64   // 63 chars (WPA2 max) + NUL
+#define NETI_AP_MAX    4   // max credentials in the list (the 240-B neti row bounds the real count)
 
 enum {
     NETI_OK          =  0,
@@ -29,16 +31,21 @@ enum {
     NETI_ERR_SCHEMA  = -3,   // schema_ver mismatch
 };
 
-// Uplink to the zenoh-agent is UDP-only: connectionless, no dial/re-dial churn;
-// req/reply is made reliable by host_link's req_id+timeout. (TCP mode dropped.)
+// One AP credential. The agent endpoint is shared (top-level), not per-AP.
+typedef struct {
+    char ssid[NETI_SSID_MAX];   // AP SSID (required)
+    char pass[NETI_PASS_MAX];   // AP passphrase ("" = open)
+} netap_t;
 
 typedef struct {
-    char     ssid[NETI_SSID_MAX];   // AP SSID (required)
-    char     pass[NETI_PASS_MAX];   // AP passphrase ("" = open)
-    uint8_t  ip[4];                 // zenoh-agent IPv4 (a.b.c.d); 0.0.0.0 if absent
-    uint16_t port;                  // zenoh-agent port; 0 if absent
-    uint8_t  present;               // 1 if a valid 'neti' was loaded
+    uint8_t  n_ap;                  // # credentials loaded (0 if none)
+    uint8_t  present;               // 1 if >=1 valid AP credential
+    uint8_t  ip[4];                 // shared zenoh-agent IPv4 (a.b.c.d); 0.0.0.0 if absent
+    uint16_t port;                  // shared zenoh-agent UDP port; 0 if absent
+    netap_t  ap[NETI_AP_MAX];       // credentials, in priority (list) order
 } netcfg_t;
 
-// Read+validate 'neti' into *out (zeroed first). NETI_OK on success (present=1).
+// Pure parse+validate of a 'neti' CBOR body (host-testable; no flash). NETI_OK on success.
+int boot_parse_netcfg(const uint8_t *buf, uint32_t len, netcfg_t *out);
+// Read 'neti' from the config-FS then parse. NETI_ERR_MISSING if absent.
 int boot_read_netcfg(netcfg_t *out);

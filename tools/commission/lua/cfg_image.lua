@@ -101,8 +101,8 @@ while i <= #arg do
     elseif a == "--flash-size" then opt.flash_size = tonumber(nextval())
     elseif a == "--family"     then opt.family = nextval()   -- rp2040(default)|rp2350|data
     elseif a == "--port"       then opt.port = nextval()
-    elseif a == "--ssid"       then opt.ssid = nextval()        -- neti: WiFi AP SSID (-> 'neti' file)
-    elseif a == "--pass"       then opt.pass = nextval()        -- neti: WiFi AP passphrase ("" = open)
+    elseif a == "--ssid"       then opt.aps = opt.aps or {}; opt.aps[#opt.aps+1] = { ss = nextval(), pw = "" }  -- neti: WiFi AP SSID (repeatable -> credential list)
+    elseif a == "--pass"       then if not (opt.aps and #opt.aps > 0) then error("--pass must follow a --ssid") end; opt.aps[#opt.aps].pw = nextval()  -- passphrase for the preceding --ssid ("" = open)
     elseif a == "--agent-ip"   then opt.agent_ip = nextval()    -- neti: zenoh-agent IPv4 "a.b.c.d"
     elseif a == "--agent-port" then opt.agent_port = tonumber(nextval())  -- neti: zenoh-agent UDP port
     else error("unknown arg: " .. a) end
@@ -215,13 +215,16 @@ if #opt.il > 0 then
     ilcf_desc = (" + ilc{%d slot%s}"):format(#opt.il, #opt.il == 1 and "" or "s")
 end
 
--- neti (optional, WiFi creds + zenoh-agent endpoint for UPLINK=wifi) ----------
--- { v=1, ss=<ssid>, pw=<pass>, ip=h'..4..', pt=<port> }. Creds live ONLY in this
--- flashed UF2, never in source/git.
+-- neti (optional, WiFi creds + zenoh-agent endpoint) --------------------------
+-- §step5: v2 = a credential LIST + a SHARED agent endpoint:
+--   { v=2, aps=[ {ss=<ssid>,pw=<pass>}, ... ], ip=h'..4..', pt=<port> }
+-- (repeatable --ssid/--pass; the node joins whichever AP is in range.) Creds live
+-- ONLY in this flashed UF2, never in source/git. UDP-only uplink (no 'tp').
 local neti_desc = ""
-if opt.ssid then
-    -- UDP-only uplink: no 'tp' field is emitted (TCP mode dropped).
-    local nm = { v = 1, ss = opt.ssid, pw = opt.pass or "" }
+if opt.aps and #opt.aps > 0 then
+    local aps = {}
+    for _, ap in ipairs(opt.aps) do aps[#aps + 1] = { ss = ap.ss, pw = ap.pw or "" } end
+    local nm = { v = 2, aps = aps }
     if opt.agent_ip then
         local o = {}
         for b in opt.agent_ip:gmatch("(%d+)") do o[#o + 1] = tonumber(b) end
@@ -234,9 +237,10 @@ if opt.ssid then
         nm.pt = opt.agent_port
     end
     local neti = cbor.encode(nm)
-    assert(#neti <= STORE_DATA_MAX, "neti CBOR too big: " .. #neti .. " B (>" .. STORE_DATA_MAX .. ")")
+    assert(#neti <= STORE_DATA_MAX, "neti CBOR " .. #neti .. " B > " .. STORE_DATA_MAX .. " (fewer/shorter creds)")
     entries[#entries + 1] = { name = "neti", data = neti }
-    neti_desc = (" + neti{ssid=%q%s%s,udp}"):format(opt.ssid,
+    local names = {}; for _, ap in ipairs(opt.aps) do names[#names + 1] = ap.ss end
+    neti_desc = (" + neti{v2,aps=%d[%s]%s%s,udp}"):format(#opt.aps, table.concat(names, ","),
         opt.agent_ip and (",ip=" .. opt.agent_ip) or "",
         opt.agent_port and (":" .. opt.agent_port) or "")
 end

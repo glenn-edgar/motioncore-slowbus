@@ -325,11 +325,12 @@ static void bc_emit_boot_banner(void) {
                      g_identity_refused ? " REFUSED" : "", g_hwio_rc, g_ilcf_rc, (unsigned)g_il_armfail,
                      (unsigned)g_cfg_roster_n, (unsigned)g_bus_baud, g_neti_rc,
                      (unsigned)g_pool_selftest, (unsigned)g_pool_n, (unsigned)g_nodes_n);
-    // WiFi config: log the SSID + agent endpoint; the passphrase is redacted to its length.
+    // WiFi config: log AP count + first SSID + shared agent endpoint; passphrase redacted to length.
     if (g_neti_rc == NETI_OK && n > 0 && n < (int)sizeof b)
-        n += snprintf(b + n, (size_t)((int)sizeof b - n), " ssid=%s %u.%u.%u.%u:%u pwlen=%u",
-                      g_netcfg.ssid, g_netcfg.ip[0], g_netcfg.ip[1], g_netcfg.ip[2], g_netcfg.ip[3],
-                      (unsigned)g_netcfg.port, (unsigned)strlen(g_netcfg.pass));
+        n += snprintf(b + n, (size_t)((int)sizeof b - n), " aps=%u ssid0=%s %u.%u.%u.%u:%u pwlen=%u",
+                      (unsigned)g_netcfg.n_ap, g_netcfg.ap[0].ssid,
+                      g_netcfg.ip[0], g_netcfg.ip[1], g_netcfg.ip[2], g_netcfg.ip[3],
+                      (unsigned)g_netcfg.port, (unsigned)strlen(g_netcfg.ap[0].pass));
     if (n > (int)sizeof b) n = (int)sizeof b;
     (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)b, (uint8_t)n);
 }
@@ -550,7 +551,7 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint32_t fbf = g_fb_frames, fbd = g_fb_drops;
         uint32_t crl = g_corr_relayed, crf = g_corr_full, nrb = g_nodes_rebuilds;
         uint8_t ndead = g_nodes_dead;  // §17 step7 (cycle-maintained; g_nodes is defined later)
-        uint8_t r[79] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint8_t r[80] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -573,8 +574,9 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           (uint8_t)crl,(uint8_t)(crl>>8),(uint8_t)(crl>>16),(uint8_t)(crl>>24),// §17 fold cmd replies relayed [b67-70]
                           (uint8_t)crf,(uint8_t)(crf>>8),(uint8_t)(crf>>16),(uint8_t)(crf>>24),// corr-table-full drops [b71-74]
                           (uint8_t)nrb,(uint8_t)(nrb>>8),(uint8_t)(nrb>>16),(uint8_t)(nrb>>24),// §17 fold node-table rebuilds [b75-78]
-                          g_uplink_mode };  // §dual-transport: 0=standalone 1=usb 2=wifi [b79]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 79); break;
+                          g_uplink_mode,    // §dual-transport: 0=standalone 1=usb 2=wifi [b79]
+                          g_netcfg.n_ap };  // §step5: # WiFi credentials loaded [b80]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 80); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -996,7 +998,8 @@ static void uplink_supervisor_task(void *arg) {
     g_uplink_mode = UPL_STANDALONE; g_host_connected = false; g_uplink_active = false;
 
     int fd = -1;
-    bool join_pending = false; uint32_t join_deadline = 0; uint8_t join_fails = 0;
+    bool join_pending = false; uint32_t join_deadline = 0; uint16_t join_fails = 0;
+    uint8_t ap_idx = 0;   // §step5: which credential we're currently trying (try-each by priority)
     uint8_t want = UPL_STANDALONE, want_n = 0;
 
     for (;;) {
@@ -1005,16 +1008,24 @@ static void uplink_supervisor_task(void *arg) {
         bool usb = stdio_usb_connected();
 
         // ---- background WiFi join management (sliced; skipped while USB is preferred) ----
+        // §step5: MULTIPLE credentials -- try ap[ap_idx]; on fail/timeout advance to the next
+        // (round-robin by priority) so the node joins whichever known AP is in range. The agent
+        // endpoint (ip:port) is shared, so wifi_udp_open(&g_netcfg) is credential-independent.
         if (wifi_ok && g_netcfg.present && !usb) {
             if (!wifi_link_up(nif)) {
                 if (fd >= 0) { lwip_close(fd); fd = -1; }
+                if (ap_idx >= g_netcfg.n_ap) ap_idx = 0;
                 if (!join_pending) {
-                    cyw43_arch_wifi_connect_async(g_netcfg.ssid, g_netcfg.pass, CYW43_AUTH_WPA2_AES_PSK);
-                    join_pending = true; join_deadline = now + 20000u;
+                    cyw43_arch_wifi_connect_async(g_netcfg.ap[ap_idx].ssid, g_netcfg.ap[ap_idx].pass,
+                                                  CYW43_AUTH_WPA2_AES_PSK);
+                    join_pending = true; join_deadline = now + 10000u;    // ~10s/cred (present APs join in <6s)
                 } else if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) < 0 ||
-                           (int32_t)(now - join_deadline) > 0) {           // failed / timed out
+                           (int32_t)(now - join_deadline) > 0) {          // this credential failed / timed out
                     join_pending = false;
-                    if (++join_fails >= 5) {                               // radio wedged -> reset just CYW43
+                    if (g_netcfg.n_ap > 1) ap_idx = (uint8_t)((ap_idx + 1u) % g_netcfg.n_ap);  // next credential
+                    // Reset the radio only if NO credential connects after several full passes
+                    // (a wedged CYW43, not merely out-of-range APs).
+                    if (++join_fails >= (uint16_t)(5u * g_netcfg.n_ap)) {
                         cyw43_arch_deinit(); vTaskDelay(pdMS_TO_TICKS(150));
                         if (cyw43_arch_init() == 0) { cyw43_arch_enable_sta_mode(); wifi_no_powersave(); }
                         join_fails = 0;
