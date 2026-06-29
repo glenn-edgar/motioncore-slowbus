@@ -62,13 +62,11 @@
 #include "boot_identity.h"   // read+validate the unit identity ('idnt' config file)
 #include "boot_hwio.h"       // read the frozen HIL pin-role map ('hwio' config file)
 #include "boot_netcfg.h"     // read WiFi creds + zenoh-agent endpoint ('neti' config file)
-#ifdef UPLINK_WIFI
 #include <errno.h>
-#include "pico/cyw43_arch.h" // CYW43 WiFi (UPLINK=wifi build only)
+#include "pico/cyw43_arch.h" // §dual-transport: CYW43/lwIP ALWAYS linked; transport chosen at runtime
 #include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/sockets.h"
-#endif
 #include "boot_roster.h"     // read the master's slave roster ('slvr' config file)
 #include "interlock/interlock.h"  // Thread 2: ported SAMD21 interlock framework
 #include "interlock/il_hal.h"     //          + its pin HAL (platform seam below)
@@ -205,6 +203,10 @@ static int g_hwio_rc; // boot_read_hwio() result (HWIO_OK / _MISSING benign; oth
 static hwio_t g_hwio; // frozen HIL pin-role map + ADC annotation (always usable; defaults all-UNUSED)
 static int g_neti_rc; // boot_read_netcfg() result (NETI_OK / _MISSING benign; other = present-but-bad)
 static netcfg_t g_netcfg; // WiFi creds + zenoh-agent endpoint (present=0 unless a valid 'neti' loaded)
+// §dual-transport step 1: force USB so the bench stays USB-reachable while we prove the collapsed
+// build + RAM. volatile => BOTH uplink branches stay linked (true RAM). Step 2 replaces it with the
+// dynamic USB>WiFi>standalone selector (USB preempts WiFi at any time).
+static volatile bool g_uplink_force_usb = true;
 static int g_ilcf_rc = -2; // Thread-2 interlock bring-up for the banner: -2 pending,
                            // else the count of slots armed from ilc0..ilc9 (0..10)
 static uint32_t g_il_armfail = 0; // DIAG: first arm failure [slot:8][status:8][err0:8][err1:8]
@@ -866,7 +868,7 @@ static void bc_load_cfg_roster(void) {
     g_poll_enabled = (g_roster_n > 0);   // a config roster -> poll immediately
 }
 
-#ifndef UPLINK_WIFI
+// USB-CDC uplink (§dual-transport: always compiled; the runtime selector starts it in USB mode).
 static void uplink_task(void *arg) {
     (void)arg;
     bool prev_conn = false;
@@ -901,10 +903,8 @@ static void uplink_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
-#endif // !UPLINK_WIFI
 
-#ifdef UPLINK_WIFI
-// ---- WiFi uplink (UPLINK=wifi): same host_link frame stream over UDP to the -----
+// ---- WiFi uplink (§dual-transport: always compiled): same host_link frame stream over UDP to the -----
 // Linux zenoh-agent instead of USB-CDC. host_link is transport-agnostic, so this is
 // the USB uplink_task with getchar/putchar swapped for lwip recv/send. EVERYTHING is
 // non-blocking/polled: the HW watchdog (4 s) gates on HB_UPLINK going stale >500 ms,
@@ -1021,7 +1021,6 @@ static void wifi_uplink_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(500));   // brief pause before reconnecting
     }
 }
-#endif // UPLINK_WIFI
 
 // ---- core1 application engine: the chain_tree KB0 (static-link) -------------
 // cfl_runtime_run is the forever loop = this thread's body. The RP2040 timer
@@ -2686,11 +2685,12 @@ int main(void) {
     // the tightest at ~360 B headroom and the chain_tree walker deepens with each
     // KB; FreeRTOS heap has the room. Watchdog stays at 2 KB (trivial loop).
     xTaskCreate(bus_control_task, "bus",    configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_bus);
-#ifdef UPLINK_WIFI
-    xTaskCreate(wifi_uplink_task, "uplink", configMINIMAL_STACK_SIZE * 12, NULL, 2, &t_up);
-#else
-    xTaskCreate(uplink_task,      "uplink", configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_up);
-#endif
+    // §dual-transport step 1: ONE image carries BOTH uplinks; pick at runtime. Forced to USB now
+    // (g_uplink_force_usb); step 2 = the dynamic USB>WiFi>standalone selector. Both branches stay linked.
+    if (!g_uplink_force_usb && g_neti_rc == NETI_OK)
+        xTaskCreate(wifi_uplink_task, "uplink", configMINIMAL_STACK_SIZE * 12, NULL, 2, &t_up);
+    else
+        xTaskCreate(uplink_task,      "uplink", configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_up);
     xTaskCreate(app_engine_task,  "app",    configMINIMAL_STACK_SIZE * 8, NULL, 3, &t_app);
     xTaskCreate(watchdog_task,    "wd",     configMINIMAL_STACK_SIZE * 2, NULL, 1, &t_wd);
     xTaskCreate(servo_feeder_task,"servo",  configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL); // float; idle until a servo is configured

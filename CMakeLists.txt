@@ -145,19 +145,17 @@ function(define_bus_controller name)
         pico_stdlib pico_multicore hardware_watchdog hardware_flash pico_unique_id
         hardware_pio hardware_clocks hardware_adc hardware_pwm hardware_i2c pico_i2c_slave
         FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
-    if(A_WIFI)
-        target_link_libraries(${name} pico_cyw43_arch_lwip_sys_freertos)
-        target_compile_definitions(${name} PRIVATE UPLINK_WIFI=1)
-    else()
-        target_link_libraries(${name} pico_async_context_freertos)
-    endif()
+    # §dual-transport (2026-06-29): CYW43/lwIP ALWAYS linked -> ONE image does USB-CDC, WiFi/UDP,
+    # or standalone, selected at runtime (USB preempts). Was two targets (bus_controller [USB] +
+    # bus_controller_wifi [WIFI]); collapsed to one. cyw43_arch_lwip_sys_freertos brings its own
+    # FreeRTOS async context (replaces pico_async_context_freertos).
+    target_link_libraries(${name} pico_cyw43_arch_lwip_sys_freertos)
     pico_enable_stdio_usb(${name} 1)
     pico_enable_stdio_uart(${name} 0)
     pico_add_extra_outputs(${name})
 endfunction()
 
-define_bus_controller(bus_controller)            # USB-CDC uplink (proven)
-define_bus_controller(bus_controller_wifi WIFI)  # WiFi uplink to the zenoh-agent (W2c)
+define_bus_controller(bus_controller)            # §dual-transport: USB + WiFi + standalone, runtime-selected
 # Opt-in i2c0->i2c1 loopback self-test (claims GP20/21 as i2c0 slave 0x42).
 # Configure with -DI2C_SELFTEST=ON to build it in.
 option(I2C_SELFTEST "i2c0->i2c1 loopback self-test fixture" OFF)
