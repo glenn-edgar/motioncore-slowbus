@@ -29,11 +29,19 @@ sections (2026-06-28, PICO 2 W PORT) are history/reference.★
 - **RP2040-vs-RP2350-as-controller benchmark** (HW, roles swapped via re-commission): **intra-bus ~1000
   frames/s on BOTH** (wire/turnaround-bound, not MCU); **uplink round-trip MCU-bound — RP2350 ~1.6× RP2040**
   (USB inject 107 vs 66/s); USB>WiFi. See memory [[rp2040-vs-rp2350-bus-bench]].
-- **30-min UDP soaks — BOTH chips as controller, BOTH PASSED.** WiFi/UDP, free-run cycle + pp + injects:
-  NO reboots (uptime monotonic), rpc_err=0, mode stayed WiFi the whole run (no drop/reconnect), pool
-  avail=24/24 (no leak), bus sustained ~873-875 frames/s (poll +1.4M each). RP2040: slave miss=49
-  (0.003%), ov=187. RP2350: slave miss=412 (0.029% — ~8× the 2040 but still negligible; the RP2040-slave
-  turnaround under the faster 2350 master), ov=140. Dual-transport WiFi path stable on both for 30 min.
+- **30-min UDP soaks @460k — BOTH chips as controller, BOTH PASSED.** WiFi/UDP, free-run cycle + pp + injects:
+  NO reboots (uptime monotonic), rpc_err=0, mode stayed WiFi the whole run, pool avail=24/24 (no leak), bus
+  ~873-875 frames/s (poll +1.4M each). RP2040 miss 0.003%, RP2350 miss 0.029% (RP2040-slave turnaround under
+  the faster 2350 master). 
+- **10-min UDP soaks @230400 — BOTH chips as controller, BOTH PASSED.** Same setup, baud lowered to 230k
+  (re-commission both chips' idnt sp). No reboots, rpc_err=0, WiFi throughout, no leak. Bus ~600-680 frames/s
+  (lower than 460k's ~875 but NOT halved — turnaround ~209µs is fixed, only wire time doubles). RP2040 new
+  misses 0.14%, RP2350 0.05%. Stable at both baud rates. Bench restored to 460k after.
+  **★RE-COMMISSION GOTCHAS (cost a recovery):** changing baud = reflash BOTH chips (sp is bus-wide; mismatch
+  = bus down). A config UF2 is NOT executable → `picotool load -x` FAILS; use `load <cfg>` + `reboot -a`. The
+  1200-touch works on a MASTER (services USB) but NOT a SLAVE (node_role doesn't service CDC). Repeated
+  picotool resets with both chips connected confuse USB enumeration (`--ser` → "requires single device") →
+  **POWER-CYCLE both Picos to recover** (then --ser works again); --pid (RP2040=0x0009/RP2350=0x000a) helps.
 
 **★KEY OPS FACTS (this session):** Pico has NO over-USB config write — config is a whole-UF2 two-step flash
 (`cfg_image → picotool load` the config region @ top-64KB; firmware untouched, survives a firmware reflash).
