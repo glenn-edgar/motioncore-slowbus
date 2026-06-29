@@ -1,8 +1,11 @@
 # Bus Arbiter Spec — interrupt-driven, idle-gap delimited polling
 
-Status: **DESIGN** (2026-06-28). Supersedes the period-gated cooperative poller in
+Status: **SHIPPED** (2026-06-28, HW-verified). Supersedes the period-gated cooperative poller in
 `app/bus_controller/main.c` (`bus_control_task`, states `BS_SWEEP/BS_CMD_INJECT/BS_CMD_COLLECT`).
-Read with `docs/three-thread-design.md` (Thread 1 = I/O router). RP2040 + RP2350 (shared PHY).
+**The current default master arbiter is the §17 cyclic ping-pong engine** (`g_cycle_mode = 1`); the
+per-slot rotation described in §1–16 is now the runtime fallback (`CMD_BUS_CYCLE_MODE 0`) and the
+record of how the design got there. Read with `docs/three-thread-design.md` (Thread 1 = I/O router).
+RP2040 + RP2350 (shared PHY).
 
 ---
 
@@ -353,16 +356,23 @@ real** (TX/SM/assembler in ISR) → physical BOOTSEL recovery if it wedges; veri
 
 ## 17. Cyclic ping-pong message engine — the real-time data bus (SUPERSEDES §15–16 for the master)
 
-Status: **DESIGN** (2026-06-28, Glenn). The per-slot rotation (§1–16) is fine for liveness but its
-core0 cost is ∝ poll rate (HW: ~80% busy-spin at 1000/s; ~34% even after the alarm-block; rate-paced
-gets ~3–6% but caps per-node rate). The fleet needs **feedback loops: ~200 msg/s per node × ~6 nodes
-(~1200 grants/s, a design goal not hard)** at **low core0** and **bounded real-time**. This section is
-the master arbiter redesign that meets that; it replaces the per-slot rotation on the master.
+Status: **SHIPPED + DEFAULT** (2026-06-28, HW-verified). The per-slot rotation (§1–16) is fine for
+liveness but its core0 cost is ∝ poll rate (HW: ~80% busy-spin at 1000/s; ~34% even after the
+alarm-block; rate-paced gets ~3–6% but caps per-node rate). The fleet needs **feedback loops:
+~200 msg/s per node × ~6 nodes (~1200 grants/s, a design goal not hard)** at **low core0** and
+**bounded real-time**. This section is the master arbiter that meets that; it is the **default**
+(`g_cycle_mode = 1`) and a full superset of the per-slot rotation, which remains a runtime fallback
+via `CMD_BUS_CYCLE_MODE 0`. All of §17.1–17.9 plus the host/chain-flow **fold** (§17.10) and the
+**live roster rebuild** (§17.11) are implemented and HW-verified on the RP2040 master + RP2350 slave
+at 460800. Commits: pool/table → fold → default = `b199711`…`90efbee` on `samd21-namespace-db`.
 
 ### 17.1 Principles
-- **Fire-and-forget, UDP-style.** No bus-level reply/ack. A command is sent and the buffer recovered;
-  **feedback is separate node-originated datagrams** delivered to the app (zenoh / chain-tree), which
-  does correlation, the control loop, and loss handling — like UDP.
+- **Fire-and-forget, UDP-style** *for the data plane*. A feedback-loop command is sent and the buffer
+  recovered with no bus-level ack; **feedback is separate node-originated datagrams** delivered to the
+  app (zenoh / chain-tree), which does correlation, the control loop, and loss handling — like UDP.
+  The **fold** (§17.10) layers a *correlated request/reply* path on top for host RPC + chain-flow
+  (track the wire req_id, relay the matching reply to the requester) so cycle mode also serves the
+  classic RPC the per-slot path did — without giving up the fire-and-forget data plane.
 - **One producer path for both sources** (zenoh uplink + internal chain-tree): grab a TX buffer →
   fill → attach to the target node's list.
 - **Ping-pong the per-node list HEADERS** (not individual buffers): the bus controller drains the
@@ -409,11 +419,19 @@ Pool exhaustion is an **exception + zenoh notification + error counter** (never 
 ### 17.5 The cycle (BC task)
 ```
 cycle:
+  // (-1) ROSTER REBUILD if dirty (§17.11) — runtime register/clear changed the roster
+  if g_nodes_dirty:
+    spinlock { detach all node lists -> orphans; rebuild node_table from roster; drop stale corr; }
+    recover(orphans)                                // outside the lock; no buffer leak
+  // (0) HOST command drain (§17.10) — on_bus_msg staged a host->slave command
+  spinlock(g_lock) { if g_cmd_pending: snapshot it; clear pending }
+  if cmd: corr_add(req_id, addr, host); producer_send([op][body] -> node)   // fire-and-forget producer
   spinlock { swap(g_active, g_fill); }              // active = last cycle's fills
   t0 = now
   // (1) MESSAGE pass — fire-and-forget, marks nodes that got a command
   for node in node_table (by address):
-    for buf in g_active[node]:                      // lock-free (we own g_active)
+    spinlock { buf = g_active[node]; g_active[node] = NULL; }   // grab head under lock (producer race window)
+    for buf in chain:                              // then lock-free (private chain)
       bus_tx(node, buf->payload, buf->len)          // no wait, no ack
       mark[node] = true
       pool_recover(buf)                             // free-list push under spinlock
@@ -423,14 +441,21 @@ cycle:
     bus_tx(node, NO_MSG)                            // grant the node its turn
     arm idle-gap alarm; BLOCK                       // core0 free during the wait (§16)
     fb = collect()                                  // node's feedback datagram, or NO_MESSAGE, or silence
-    if fb: app_deliver(node, fb)                    // -> zenoh publish / chain-tree event
-    else { node.miss_count++; if >= MAX_MISS: node.dead = true }
+    if fb is a SHELL_REPLY:
+      if corr_take(fb.req_id) -> RELAY to requester (host RPC / re-tagged chain-flow)   // §17.10
+      else                    -> append to the per-cycle feedback BATCH                 // §17.8
+    elif silence: { node.miss_count++; if >= MAX_MISS: node.dead = true }
+  // (2a) DEAD-NODE slow-poll (§17.11): every Nth cycle re-probe one dead node; a reply re-enables it
+  // (2b) emit the batched feedback as ONE OP_BUS_FEEDBACK frame (if non-empty); deferred exhaustion notify
   cycle_stats(now - t0)                             // §17.7
   pace_to_period()                                  // optional fixed-rate (deterministic feedback)
 ```
 Notes: command turns don't wait (fire-and-forget); only NO_MSG turns block for feedback. A node
-commanded this cycle is polled next cycle. Dead nodes are skipped; the **task re-enables** them
-(clears `dead`, an atomic byte — no lock vs the BC since both are core0, or spinlock if paranoid).
+commanded this cycle is polled next cycle. Dead nodes are skipped and re-probed by the slow-poll
+(§17.11) — a response auto-re-enables them. **Per-node list heads are grabbed under the spinlock**
+(a producer can still be attaching during the swap window — both time-sliced on core0); the chain is
+then processed lock-free. Feedback that matches an outstanding command is **relayed to the requester**;
+unsolicited feedback is **batched** into one `OP_BUS_FEEDBACK` frame per cycle (§17.8).
 
 ### 17.6 Fixed-rate option (control loops)
 For jitter-free feedback, `pace_to_period()` blocks until `t0 + CYCLE_PERIOD` (e.g. 5 ms = 200 Hz).
@@ -454,12 +479,46 @@ event, not just a polled value). Plus pool high-water + exhaustion count + per-n
   attach). Two clients → same node = two buffers on that node's list, sent in order (last-writer-wins
   on a setpoint is an app policy); each carries its `origin_tag`.
 
-### 17.9 Build order
-1. Buffer pool (cfl_perm carve + free-list + spinlock) + the node-table-by-address.
-2. Ping-pong header sets + producer attach (one producer first: host/zenoh).
-3. The cycle (message pass + NO_MSG sweep with alarm-blocked feedback wait), single node, then N.
-4. Cycle-time stats + overrun/slack/slowest-node + zenoh notify.
-5. Pool-exhaustion exception + zenoh notify + high-water.
-6. Second producer (chain-tree engine) into the same path.
-7. Dead-node skip/re-enable; fixed-rate pacing option.
-8. Pub/sub uplink: batched feedback publish + command-key subscribe (agent side).
+### 17.9 Build order (all DONE + HW-verified)
+1. ✅ Buffer pool (cfl_perm carve + free-list + spinlock) + the node-table-by-address. `b199711`
+2. ✅ Ping-pong header sets + producer attach (one producer first: host/zenoh). `77e1ee1`
+3. ✅ The cycle (message pass + NO_MSG sweep with alarm-blocked feedback wait), single node, then N. `be0b5e5`
+4. ✅ Cycle-time stats + overrun/slack/slowest-node + zenoh notify. `644719f`
+5. ✅ Pool-exhaustion exception + zenoh notify + high-water. `9ba0d9a`
+6. ✅ Second producer (chain-tree engine, core1) into the same path. `2560685`
+7. ✅ Dead-node slow-poll/re-enable; fixed-rate pacing option. `c700b0b`
+8. ✅ Pub/sub uplink: batched feedback publish + command-key subscribe (agent side). `47dc800`/`edba4ec`
+9. ✅ **Fold** (§17.10): host + chain-flow command RPC served by the cycle (correlated reply relay). `bf5e884`
+10. ✅ **Default flip + live roster rebuild** (§17.11): `g_cycle_mode = 1`; rebuild node-table on roster change. `90efbee`
+
+### 17.10 The fold — host + chain-flow RPC over the cycle
+The per-slot path (§6) carried a request/reply command path the cycle initially bypassed. The fold
+serves it over the cycle so cycle mode fully replaces per-slot:
+- A small **correlation table** records each outstanding command's wire `req_id → {addr, is_orig,
+  host_req}`, guarded by the same hw spinlock (a core1 producer + the core0 cycle/feedback handler
+  touch it).
+- **Host direct** (`g_cmd_pending`, set by `on_bus_msg`): drained at the top of the cycle →
+  `producer_send([op][body])` + `corr_add`. The reply's req_id is already the host's, so it's relayed
+  as-is.
+- **Chain-flow** (engine origination, `is_orig`): `corr_add(sr → host_req)`; the reply's wire req_id
+  is re-tagged to the host's and relayed to APPCORE (mirrors the old per-slot COLLECT, incl. always
+  stripping the slave's piggybacked count).
+- In the NO_MSG sweep, a `SHELL_REPLY` whose req_id is in the table is **relayed to the requester**;
+  otherwise it is **batched as feedback** (§17.8). `OP_BUS_EXEC`'s two-phase ack is the one per-slot
+  behavior sent fire-forward instead (unused by host tooling).
+
+### 17.11 Default + live roster rebuild + dead-node slow-poll
+- **Default**: `g_cycle_mode = 1` at boot (cycle is a superset; per-slot is the `CMD_BUS_CYCLE_MODE 0`
+  fallback).
+- **Live roster rebuild**: the node-table was built once at task start, so runtime
+  `REGISTER_SLAVE`/`CLEAR_ROSTER` were invisible. Now the roster handlers set `g_nodes_dirty` and write
+  the roster under the spinlock; the cycle rebuilds the table at the top when dirty (detach + recover
+  every queued buffer → **no leak**, rebuild from the roster, drop stale correlations). `node_index_of`
+  in the producer moved **inside** the spinlock so a stale pre-rebuild index can't mis-attach.
+- **Lock order (must stay consistent)**: core0 takes `g_lock` *then* the pool spinlock; the rebuild and
+  producers take **only** the spinlock; never take `g_lock` while holding the spinlock (it disables IRQs).
+- **Dead-node slow-poll**: dead nodes are skipped in the live cycle; one is re-probed every Nth cycle
+  (round-robin), and a response auto-re-enables it. A no-response probe costs `T_RESP`, so only that one
+  cycle overruns (flagged by §17.7).
+- **Pacing**: `pace_to_period()` holds each cycle to a fixed period on the same idle alarm (core0 free,
+  no busy-wait); free-run when the period is 0.
