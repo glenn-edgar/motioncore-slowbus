@@ -2,13 +2,76 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-06-26 (EOD)**. Branch: **`samd21-namespace-db`** (clean + pushed).
-**★RESUME HERE: PICO 2 W PORT — step 5b = add an `il_parse_adc` arming path, then ADC/FFT/cepstrum
-spectral interlock conditions.** The Pico 2 W (RP2350) is a working DSP vibration node on the bus
-(3-channel 20kHz capture → FIR decimation → FFT/cepstrum) with the COMMON interlock engine live +
-the GP1 safety input driving the veto. Read the "PICO 2 W PORT" section just below. (Earlier major
-work this session, complete: WiFi dual-mode UDP/TCP transport + a GitHub credential remediation —
-see those sections.)★
+Last updated **2026-06-28 (EOD)**. Branch: **`master`** (clean + pushed; `samd21-namespace-db` MERGED
+then DELETED — master is now the single working line).
+**★RESUME HERE (next task, 2026-06-29): DUAL-TRANSPORT COLLAPSE — one runtime-selected image, 3 modes
+USB / WiFi / standalone, DYNAMIC switching with USB preempting WiFi at any time.** See the dated section
+directly below ("2026-06-28 EOD") for the full plan, the flash/RAM baseline, and the queued follow-ons
+(multiple WiFi credentials; make Python optional to the build). The §17 cyclic bus engine is COMPLETE and
+the DEFAULT, both transports proven, all merged to master. The older "PICO 2 W PORT" section further down
+is now history/reference.★
+
+---
+
+## ★ 2026-06-28 (EOD) — §17 SHIPPED + MERGED TO MASTER; TOMORROW = DUAL-TRANSPORT COLLAPSE ★
+
+**DONE today (all HW-verified, on master via merge `0691a0f`):**
+- **§17 cyclic ping-pong bus engine COMPLETE (steps 1–8 + the host/chain-flow fold).** Now the **DEFAULT**
+  master arbiter (`g_cycle_mode=1`; per-slot rotation is the `CMD_BUS_CYCLE_MODE 0` fallback) and a full
+  superset of per-slot: fire-and-forget data plane, batched per-cycle feedback, pool-exhaustion exception,
+  real-time pacing + watchdog stats, dead-node slow-poll/re-enable, correlated host RPC + chain-flow, and a
+  live node-table rebuild on runtime roster change. Spec: `docs/bus-arbiter-spec.md` §17.
+- **Pub/sub uplink agent** (`host/zenoh_agent/agent.lua`): feedback PUBLISH + command SUBSCRIBE; +a
+  **lossless continuous feedback drain** (persistent SLIP decoder + exec forwards non-reply frames).
+- **WiFi master end-to-end verified** (RPC clean; feedback ~40/50 = expected UDP loss). Container agent
+  rebuilt+redeployed. Bench then **restored to USB** for dev.
+- **Merged `samd21-namespace-db` → master** (169 commits; master had merged PRs #1–15). Only 2 files
+  conflicted (samd21_commands.c, slave_dsl.py) — branch was the canonical superset; resolved by taking the
+  branch's complete version. GOTCHA: a naive line-merge **duplicated the `bench_*` block** (both sides added
+  it at different offsets → C redefinition) — caught by BUILDING, not by the clean marker scan. Verified
+  post-merge: samd21_client builds, bus_controller builds, slave_dsl self-test PASS. Branch deleted.
+
+**TOMORROW — dual-transport collapse (decided design):**
+- One binary per chip, transport chosen at runtime. **USB > WiFi > standalone**, **dynamic** (a host on USB
+  preempts WiFi at any time; unplug → fall back to WiFi if joined, else standalone). The RS-485 bus + nodes
+  + chain-tree engine + interlock **run in ALL THREE modes** — standalone just SINKS the uplink emits.
+- Detection = CDC *connection* state (`g_host_connected`, DTR/line-state), NOT mere enumeration. The image
+  must ALWAYS link CYW43+lwIP (WiFi runtime now, not compile-time) and keep the USB-CDC path; the selector
+  binds host_link to the active transport. Standalone gates `host_link_s2m` on uplink-active (don't
+  block/leak the §17 cycle). WiFi joins in the background; debounce the switch; quiesce writer before rebind.
+- **Build order:** ① collapse the 2 CMake targets → ONE; build **+ boot** on RP2040 AND RP2350 (RAM check).
+  ② mode selector on the host-connected edge + debounce + background join. ③ standalone sink. ④ HW-verify all
+  3 transitions (USB plug/unplug, WiFi up/down, neither) — bus+slave stay alive.
+- **Then ⑤ MULTIPLE WiFi CREDENTIALS:** neti → v=2 `aps=[{ss,pw,ip,pt},…]` list; on WiFi entry, scan + match
+  visible SSIDs by list order, connect first match, use its endpoint. Touches boot_netcfg.{h,c}, the join
+  code, cfg_image.lua. (Open: per-AP endpoint vs shared — lean per-AP + default.)
+- **Follow-on (separate track) — make Python OPTIONAL to the build:** core toolchain twins already exist;
+  the ONE build-critical dep is `python3 uf2conv.py` (app/samd21_client/Makefile:196) → write `uf2conv.lua`
+  (reuse cfg_image.lua's `uf2_block`) + swap the Makefile. Then ns_commission/examples/SAMD21-test twins.
+
+**FLASH/RAM BASELINE (measured 2026-06-28; flash≈text, RAM≈bss incl FreeRTOS heap + lwIP/CYW43 pools).**
+Pico W RP2040 = 2MB flash / 264KB SRAM · Pico 2 W RP2350 = 4MB flash / 520KB SRAM.
+
+| image | chip | flash | RAM(bss) | free RAM |
+|---|---|---|---|---|
+| bus_controller (USB) | RP2040 | 240KB | 104KB | ~163KB |
+| bus_controller_wifi  | RP2040 | 548KB | **155KB** | **~111KB** |
+| bus_controller (USB) | RP2350 | 227KB | 104KB | ~423KB |
+| bus_controller_wifi  | RP2350 | 531KB | 155KB | ~365KB |
+| vib_node (DSP)       | RP2350 | 173KB | 254KB | ~266KB |
+
+Flash is a non-issue. RAM is the only watch item = the WiFi image's ~155KB bss; the collapsed image ≈ WiFi
+image + USB-CDC path → expect ~160-165KB bss → **RP2040 ~100-110KB free (THE constraint; boot-test it)**,
+RP2350 ~360KB free (no concern). WiFi stack costs ~51KB RAM over USB-only.
+
+**ARCHITECTURE PRINCIPLE (Glenn):** every Pico-family node shares the SAME USB/WiFi/RS-485 bus platform
+(§17 engine + 3-mode transport + host_link + common interlock engine + commission/config-FS); **ONLY the
+I/O subsystem changes per variant** (integer ADC mode, vib_node FFT/cepstrum, future SPI/I2C/motor/IMU as
+additive measurement sources). New node = swap the I/O subsystem, NEVER fork the bus model.
+
+**BENCH STATE for tomorrow:** master E661 = USB `bus_controller`, cycle-default, on `/dev/ttyACM1`; slave
+91D7 = `bus_controller` slave 0x09 ALIVE @460800; E661's WiFi `neti` creds current (WiFi worked today, agent
+@192.168.1.66:47447); zenoh router + (new pub/sub) agent containers up. Repo + Pi tree on master, clean.
 
 ---
 
