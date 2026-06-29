@@ -300,6 +300,10 @@ static void bus_nodetable_build(void);
 static void bus_pp_selftest(void);
 static void bus_run_cycle(void);
 static bool bus_msg_send(uint8_t dest_addr, const uint8_t *payload, uint8_t len, uint32_t tag);
+// §17 fold: outstanding host/engine command -> slave-reply correlation (cycle mode).
+static volatile uint32_t g_corr_relayed, g_corr_full;   // stats (POLL_STATS + handle_slot_frame use them)
+static bool corr_add(uint16_t req, uint8_t addr, bool is_orig, uint16_t host_req);
+static bool corr_take(uint16_t req, uint8_t addr, bool *is_orig, uint16_t *host_req);
 
 static void bc_emit_boot_banner(void) {
     char b[200];
@@ -521,8 +525,9 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint32_t ex = g_pool_exhausted; uint16_t lw = g_pool_low;
         uint32_t dv = g_dead_revives, pc = g_cycle_pace_us;
         uint32_t fbf = g_fb_frames, fbd = g_fb_drops;
+        uint32_t crl = g_corr_relayed, crf = g_corr_full;
         uint8_t ndead = g_nodes_dead;  // §17 step7 (cycle-maintained; g_nodes is defined later)
-        uint8_t r[66] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint8_t r[74] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -541,8 +546,10 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           ndead,                                                               // current dead-node count [b54]
                           (uint8_t)pc,(uint8_t)(pc>>8),(uint8_t)(pc>>16),(uint8_t)(pc>>24),    // cycle pace us [b55-58]
                           (uint8_t)fbf,(uint8_t)(fbf>>8),(uint8_t)(fbf>>16),(uint8_t)(fbf>>24),// §17 step8 feedback frames [b59-62]
-                          (uint8_t)fbd,(uint8_t)(fbd>>8),(uint8_t)(fbd>>16),(uint8_t)(fbd>>24) };// feedback drops [b63-66]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 66); break;
+                          (uint8_t)fbd,(uint8_t)(fbd>>8),(uint8_t)(fbd>>16),(uint8_t)(fbd>>24),// feedback drops [b63-66]
+                          (uint8_t)crl,(uint8_t)(crl>>8),(uint8_t)(crl>>16),(uint8_t)(crl>>24),// §17 fold cmd replies relayed [b67-70]
+                          (uint8_t)crf,(uint8_t)(crf>>8),(uint8_t)(crf>>16),(uint8_t)(crf>>24) };// corr-table-full drops [b71-74]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 74); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -610,7 +617,29 @@ static void handle_slot_frame(uint8_t addr, const bus_frame_t *rf) {
         rf->payload[0] == (uint8_t)(OP_SHELL_REPLY & 0xFF) &&
         rf->payload[1] == (uint8_t)(OP_SHELL_REPLY >> 8)) {
         uint8_t plen = (uint8_t)(rf->len - 2);
-        if (g_cycle_collecting) {   // §17 step8: batch this node's feedback (one frame/cycle)
+        // §17 fold: is this the reply to an outstanding host/engine command? The reply
+        // carries the wire req_id at payload[2..3]. If correlated, RELAY it to the
+        // requester (host RPC / re-tagged engine origination) instead of batching it.
+        uint16_t rrq = (plen >= 2) ? ((uint16_t)rf->payload[2] | ((uint16_t)rf->payload[3] << 8)) : 0;
+        bool is_orig = false; uint16_t host_req = 0;
+        if (plen >= 2 && corr_take(rrq, addr, &is_orig, &host_req)) {
+            g_corr_relayed++;
+            if (is_orig) {   // engine origination (chain-flow / pp) -- mirror the per-slot COLLECT
+                uint8_t rb[BUS_PAYLOAD_MAX]; uint8_t rn = plen;
+                memcpy(rb, &rf->payload[2], rn);
+                if (rn >= 7) {   // the bus echo ALWAYS piggybacks the slave's u32 count -> capture+strip
+                    g_pp_slave_seen = (uint32_t)rb[rn-4] | ((uint32_t)rb[rn-3] << 8) |
+                                      ((uint32_t)rb[rn-2] << 16) | ((uint32_t)rb[rn-1] << 24);
+                    rn -= 4;
+                }
+                if (!g_pp_run) {   // re-tag the wire req_id back to the host's, relay to APPCORE
+                    if (rn >= 2) { rb[0] = (uint8_t)host_req; rb[1] = (uint8_t)(host_req >> 8); }
+                    (void)host_link_s2m(&g_hl, BUS_ADDR_APPCORE, OP_SHELL_REPLY, rb, rn);
+                }
+            } else {           // host direct command -- the req_id is already the host's; relay as-is
+                (void)host_link_s2m(&g_hl, addr, OP_SHELL_REPLY, &rf->payload[2], plen);
+            }
+        } else if (g_cycle_collecting) {   // §17 step8: unsolicited -> batch as feedback (one frame/cycle)
             if ((int)g_fb_n + 2 + (int)plen <= (int)sizeof g_fb_buf) {
                 g_fb_buf[g_fb_n++] = addr; g_fb_buf[g_fb_n++] = plen;
                 for (uint8_t i = 0; i < plen; i++) g_fb_buf[g_fb_n++] = rf->payload[2 + i];
@@ -1014,6 +1043,36 @@ static void pool_recover(tx_buf_t *b) {
     b->next = g_pool_free; g_pool_free = b; g_pool_avail++;
     critical_section_exit(&g_pool_cs);
 }
+
+// §17 fold: host/engine command -> slave-reply correlation for cycle mode. The cycle
+// fires commands fire-and-forget (producer path); the reply rides a later NO_MSG poll,
+// so we can't block-and-collect like the per-slot path. Instead we record the wire
+// req_id here and, when handle_slot_frame later sees a SHELL_REPLY carrying it, relay it
+// to the requester instead of batching it as feedback. Guarded by g_pool_cs because a
+// core1 producer (kbapp_on_echo_to) and the core0 cycle/handle_slot_frame all touch it.
+#define CMDCORR_MAX 8u
+typedef struct { uint16_t req; uint16_t host_req; uint8_t addr; uint8_t is_orig; uint8_t used; } cmdcorr_t;
+static cmdcorr_t g_corr[CMDCORR_MAX];   // g_corr_relayed/g_corr_full declared earlier (POLL_STATS uses them)
+static bool corr_add(uint16_t req, uint8_t addr, bool is_orig, uint16_t host_req) {
+    bool ok = false;
+    critical_section_enter_blocking(&g_pool_cs);
+    for (uint8_t i = 0; i < CMDCORR_MAX; i++) if (!g_corr[i].used) {
+        g_corr[i].req = req; g_corr[i].addr = addr; g_corr[i].is_orig = is_orig ? 1u : 0u;
+        g_corr[i].host_req = host_req; g_corr[i].used = 1u; ok = true; break;
+    }
+    critical_section_exit(&g_pool_cs);
+    if (!ok) g_corr_full++;
+    return ok;
+}
+static bool corr_take(uint16_t req, uint8_t addr, bool *is_orig, uint16_t *host_req) {
+    bool hit = false;
+    critical_section_enter_blocking(&g_pool_cs);
+    for (uint8_t i = 0; i < CMDCORR_MAX; i++) if (g_corr[i].used && g_corr[i].req == req && g_corr[i].addr == addr) {
+        *is_orig = g_corr[i].is_orig != 0; *host_req = g_corr[i].host_req; g_corr[i].used = 0u; hit = true; break;
+    }
+    critical_section_exit(&g_pool_cs);
+    return hit;
+}
 static void bus_pool_init(void) {            // call once, after cfl_runtime_create (g_perm ready)
     if (g_pool_n) return;
     critical_section_init(&g_pool_cs);
@@ -1110,6 +1169,24 @@ static void bus_pp_selftest(void) {
 // NO_MSG sweep (poll every unmarked live node, alarm-blocked feedback wait, §16);
 // cycle-time stat. Runs in place of the per-slot rotation when g_cycle_mode is set.
 static void bus_run_cycle(void) {
+    // (0) §17 fold: drain a pending HOST->slave command into the producer path. on_bus_msg
+    // (uplink, under g_lock) staged it in g_cmd_*; we fire it fire-and-forget like any
+    // producer and record correlation so its reply is relayed to the host (handle_slot_frame),
+    // not batched. This makes cycle mode serve host RPC -- the per-slot BS_CMD path is bypassed.
+    LOCK();
+    if (g_cmd_pending) {
+        uint8_t fr[BUS_PAYLOAD_MAX]; uint8_t fn = 0;
+        fr[fn++] = (uint8_t)(g_cmd_op & 0xFF); fr[fn++] = (uint8_t)(g_cmd_op >> 8);
+        uint8_t m = g_cmd_len; if (m > (uint8_t)(BUS_PAYLOAD_MAX - fn)) m = (uint8_t)(BUS_PAYLOAD_MAX - fn);
+        for (uint8_t i = 0; i < m; i++) fr[fn++] = g_cmd_body[i];
+        uint8_t  cs = g_cmd_slave; uint16_t crq = g_cmd_req_id;
+        g_cmd_pending = false;          // free the slot for the next host command (reply correlates by req_id)
+        UNLOCK();
+        corr_add(crq, cs, false, crq);
+        (void)bus_msg_send(cs, fr, fn, 0xC1000000u | crq);
+    } else {
+        UNLOCK();
+    }
     bus_pingpong_swap();
     uint32_t t0 = time_us_32();
     uint8_t a = g_active_idx;
@@ -1621,8 +1698,10 @@ void kbapp_on_echo_to(void *handle, unsigned node_index) {
     // (grab->fill->attach under the hw spinlock, the SAME path the host/uplink
     // producer on core0 uses). This is the genuine cross-core concurrent attach the
     // hw spinlock exists for (a FreeRTOS mutex couldn't guard a core1 producer vs the
-    // core0 cycle drain). Fire-and-forget: no orig_q, no COLLECT correlation (feedback
-    // rides a later NO_MSG poll, §17). Falls back to the per-slot g_orig_q path otherwise.
+    // core0 cycle drain). The §17 FOLD adds reply correlation: record {sr -> host_req}
+    // so handle_slot_frame relays the slave's reply back to this host req_id (re-tagged)
+    // instead of batching it -- chain-flow over the cycle now round-trips like per-slot.
+    // Falls back to the per-slot g_orig_q path when not in cycle mode.
     if (g_cycle_mode) {
         uint16_t sr = (uint16_t)(++g_orig_seq); if (sr == 0) sr = (uint16_t)(++g_orig_seq);
         uint8_t pb[BUS_PAYLOAD_MAX]; uint8_t pn = 0;
@@ -1631,6 +1710,7 @@ void kbapp_on_echo_to(void *handle, unsigned node_index) {
         pb[pn++] = (uint8_t)(CMD_APP_ECHO & 0xFF);  pb[pn++] = (uint8_t)(CMD_APP_ECHO >> 8);
         if (m > (uint8_t)(BUS_PAYLOAD_MAX - pn)) m = (uint8_t)(BUS_PAYLOAD_MAX - pn);
         for (uint8_t i = 0; i < m; i++) pb[pn++] = q->bytes[i];
+        corr_add(sr, q->addr, true, q->req_id);                  // correlate the reply (relay/pp-piggyback)
         (void)bus_msg_send(q->addr, pb, pn, 0xC2000000u | sr);   // core1 producer
         return;
     }
