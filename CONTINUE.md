@@ -2,14 +2,46 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-06-28 (EOD)**. Branch: **`master`** (clean + pushed; `samd21-namespace-db` MERGED
-then DELETED — master is now the single working line).
-**★RESUME HERE (next task, 2026-06-29): DUAL-TRANSPORT COLLAPSE — one runtime-selected image, 3 modes
-USB / WiFi / standalone, DYNAMIC switching with USB preempting WiFi at any time.** See the dated section
-directly below ("2026-06-28 EOD") for the full plan, the flash/RAM baseline, and the queued follow-ons
-(multiple WiFi credentials; make Python optional to the build). The §17 cyclic bus engine is COMPLETE and
-the DEFAULT, both transports proven, all merged to master. The older "PICO 2 W PORT" section further down
-is now history/reference.★
+Last updated **2026-06-29 (EOD)**. Branch: **`master`** (clean + pushed).
+**★RESUME HERE: DUAL-TRANSPORT COLLAPSE + multi-WiFi-cred + Python-free build are ALL DONE & HW-verified
+(2026-06-29). No committed task in flight.** Next candidates (your pick): wire SPI/I2C/motor I/O subsystems
+onto the common platform ([[pico-node-architecture]]); the SAMD21 test-harness→LuaJIT port (deferred — needs
+a SAMD21 chip on the bench, being handled in another window); or fold the host/chain-flow command path
+deeper. See the "2026-06-29 EOD" section directly below for what shipped today + the bench state. Older
+sections (2026-06-28, PICO 2 W PORT) are history/reference.★
+
+---
+
+## ★ 2026-06-29 (EOD) — DUAL-TRANSPORT COLLAPSE + MULTI-CRED + PYTHON-FREE BUILD; RP2040-vs-RP2350 BENCH ★
+
+**DONE today (all HW-verified, all on master):**
+- **Dual-transport collapse (steps 1–5) — ONE runtime image, 3 modes USB/WiFi/standalone, DYNAMIC (USB
+  preempts WiFi at any time).** step1 `6d0a9ab` (CMake → one always-CYW43 image; RAM ~155KB bss/RP2040,
+  fits), step2 `5fac102` (uplink_supervisor_task + per-slice pumps; USB>WiFi>standalone selector, debounced,
+  background WiFi join), step3 `2c951b7` (standalone source-gate on g_uplink_active + CMD_BUS_UPLINK_FORCE
+  0x016C), step5 `3b50bf9` (multiple WiFi creds: neti **v2** = {v,ip,pt,aps:[{ss,pw},…]} list + shared
+  endpoint + try-each join; cfg_image --ssid/--pass repeatable). Detection = stdio_usb_connected (DTR), not
+  enumeration. POLL_STATS b79=uplink_mode, b80=n_ap.
+- **Build is PYTHON-FREE** (`7376816`): tools/uf2conv.lua (byte-identical to tinyusb's uf2conv.py) replaced
+  the one python build dep; pico cmake build was already python-free. Stock Pi (LuaJIT+arm-none-eabi) builds
+  all. Remaining python = SAMD21 *test/commission* tooling only (non-build; another window is porting it).
+- **Perf counters** (`7a84a7a`): g_bus_msgs + host_link tx_msgs/rx_msgs, POLL_STATS b81-92.
+- **RP2040-vs-RP2350-as-controller benchmark** (HW, roles swapped via re-commission): **intra-bus ~1000
+  frames/s on BOTH** (wire/turnaround-bound, not MCU); **uplink round-trip MCU-bound — RP2350 ~1.6× RP2040**
+  (USB inject 107 vs 66/s); USB>WiFi. See memory [[rp2040-vs-rp2350-bus-bench]].
+- **30-min UDP soak (RP2040)** running at EOD — result in /tmp/soak.log on the Pi + memory.
+
+**★KEY OPS FACTS (this session):** Pico has NO over-USB config write — config is a whole-UF2 two-step flash
+(`cfg_image → picotool load` the config region @ top-64KB; firmware untouched, survives a firmware reflash).
+Wrong idnt → **quarantine (recoverable, NOT brick)** — uplink stays up to re-flash. To swap master/slave =
+re-commission idnt (vr/addr): MASTER vr=1 addr=0 (VARIANT_BUS_CTRL_USB; vr=2 BUS_CTRL_WIFI is NOT in
+variant_supported), SLAVE vr=3 addr=9. cfg_image flags: --uid --chip(0=rp2040/1=rp2350) --variant --addr
+--speed --flash-size(2097152/4194304) --family(rp2040/rp2350) --slvr "9:3:2" --ssid/--pass(×N) --agent-ip
+--agent-port. Creds from ~/wifi.data (3 ssid/pass pairs; agent 192.168.1.66:47447 — NEVER print/commit).
+
+**★BENCH STATE (restored after the bench): E661 (RP2040) = MASTER, dual-transport, 3-cred WiFi-roaming
+(default WiFi; open picolink on /dev/ttyACM1 → USB preempts). 91D7 (RP2350) = SLAVE 0x09 ALIVE @460800.**
+zenoh router + pub/sub agent containers up. Repo on master, clean.
 
 ---
 
