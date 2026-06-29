@@ -271,8 +271,9 @@ static volatile uint16_t g_pool_avail;     // current free count (banner/POLL_ST
 static volatile uint16_t g_pool_low;       // low-water (min avail = peak in-flight)
 static volatile uint32_t g_pool_exhausted; // §17 step5: grab-NULL events (producer out-ran the bus)
 static volatile bool g_pool_ready;         // set by bus_pool_init (core1); bus task waits on it
+static critical_section_t g_pool_cs;       // hw spinlock: pool free-list + node lists + roster rebuild + corr (defined early; the roster handlers use it)
 static uint8_t  g_nodes_n, g_pp_selftest;
-static volatile uint8_t  g_cycle_mode;            // §17 step3: 0=per-slot rotation, 1=cyclic engine
+static volatile uint8_t  g_cycle_mode = 1u;       // §17: DEFAULT 1=cyclic engine (full superset); 0=per-slot rotation fallback (CMD_BUS_CYCLE_MODE)
 static volatile uint32_t g_cycle_last, g_cycle_min, g_cycle_max;  // full-cycle time (us)
 // §17 step4 real-time watchdog: deadline + overrun/slack/slowest-node
 static volatile uint32_t g_cycle_deadline_us = 5000;   // 200 Hz default; CMD_BUS_SET_DEADLINE
@@ -285,6 +286,8 @@ static volatile uint32_t g_cycle_pace_us;              // 0=free-run; else hold 
 static volatile uint32_t g_dead_slowpoll_div = 200;    // probe one dead node every N cycles (200 @200Hz ~= 1Hz)
 static volatile uint32_t g_dead_revives;               // dead->alive resurrections (stat)
 static volatile uint8_t  g_nodes_dead;                  // current dead-node count (cycle-maintained; POLL_STATS reads it)
+static volatile bool     g_nodes_dirty;                 // roster changed at runtime -> cycle rebuilds g_nodes
+static volatile uint32_t g_nodes_rebuilds;              // count of runtime node-table rebuilds (stat)
 static uint8_t  g_dead_cursor;                          // round-robin index over dead nodes
 // §17 step8: per-cycle feedback batch -- handle_slot_frame appends here while a cycle
 // collects (instead of a per-frame host_link_s2m); bus_run_cycle emits ONE OP_BUS_FEEDBACK.
@@ -482,16 +485,26 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
     case CMD_ECHO:
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, args, alen); break;
     case CMD_BUS_CLEAR_ROSTER:
-        g_roster_n = 0; g_cursor = 0; g_cmd_pending = false;
+        // §17 fold: the cycle rebuilds g_nodes from g_roster on g_nodes_dirty. The roster
+        // write is serialized with the rebuild's read on g_pool_cs (we already hold g_lock;
+        // g_lock->g_pool_cs is the established order). g_pool_cs exists only after the pool
+        // is carved; before that no cycle/rebuild runs, so the plain write is safe.
+        if (g_pool_ready) critical_section_enter_blocking(&g_pool_cs);
+        g_roster_n = 0; g_cursor = 0; g_nodes_dirty = true;
+        if (g_pool_ready) critical_section_exit(&g_pool_cs);
+        g_cmd_pending = false;
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_BUS_REGISTER_SLAVE: {
         uint8_t reason = BUS_REG_OK;
         if (alen >= 6 && g_roster_n < ROSTER_MAX) {
-            slave_t *s = &g_roster[g_roster_n++]; memset(s, 0, sizeof *s);
+            if (g_pool_ready) critical_section_enter_blocking(&g_pool_cs);
+            slave_t *s = &g_roster[g_roster_n]; memset(s, 0, sizeof *s);
             s->addr = args[0];
             s->class_id = (uint32_t)args[1] | ((uint32_t)args[2] << 8) |
                           ((uint32_t)args[3] << 16) | ((uint32_t)args[4] << 24);
             s->flags = args[5];
+            g_roster_n++; g_nodes_dirty = true;   // publish the new entry, then flag rebuild
+            if (g_pool_ready) critical_section_exit(&g_pool_cs);
         }
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, &reason, 1); break;
     }
@@ -525,9 +538,9 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint32_t ex = g_pool_exhausted; uint16_t lw = g_pool_low;
         uint32_t dv = g_dead_revives, pc = g_cycle_pace_us;
         uint32_t fbf = g_fb_frames, fbd = g_fb_drops;
-        uint32_t crl = g_corr_relayed, crf = g_corr_full;
+        uint32_t crl = g_corr_relayed, crf = g_corr_full, nrb = g_nodes_rebuilds;
         uint8_t ndead = g_nodes_dead;  // §17 step7 (cycle-maintained; g_nodes is defined later)
-        uint8_t r[74] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint8_t r[78] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -548,8 +561,9 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           (uint8_t)fbf,(uint8_t)(fbf>>8),(uint8_t)(fbf>>16),(uint8_t)(fbf>>24),// §17 step8 feedback frames [b59-62]
                           (uint8_t)fbd,(uint8_t)(fbd>>8),(uint8_t)(fbd>>16),(uint8_t)(fbd>>24),// feedback drops [b63-66]
                           (uint8_t)crl,(uint8_t)(crl>>8),(uint8_t)(crl>>16),(uint8_t)(crl>>24),// §17 fold cmd replies relayed [b67-70]
-                          (uint8_t)crf,(uint8_t)(crf>>8),(uint8_t)(crf>>16),(uint8_t)(crf>>24) };// corr-table-full drops [b71-74]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 74); break;
+                          (uint8_t)crf,(uint8_t)(crf>>8),(uint8_t)(crf>>16),(uint8_t)(crf>>24),// corr-table-full drops [b71-74]
+                          (uint8_t)nrb,(uint8_t)(nrb>>8),(uint8_t)(nrb>>16),(uint8_t)(nrb>>24) };// §17 fold node-table rebuilds [b75-78]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 78); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -1026,7 +1040,7 @@ static char                  g_perm_buf[16 * 1024] __attribute__((aligned(8)));
 #define BUS_POOL_N   24u
 typedef struct tx_buf { struct tx_buf *next; uint8_t dest_node; uint8_t len;
                         uint8_t payload[BUS_PAYLOAD_MAX]; uint32_t origin_tag; } tx_buf_t;
-static critical_section_t g_pool_cs;
+// g_pool_cs defined earlier (the roster handlers use it before this block)
 static tx_buf_t          *g_pool_free;                 // free-list head
 // g_pool_avail, g_pool_low, g_pool_n, g_pool_selftest declared earlier (banner/POLL_STATS use them)
 
@@ -1120,8 +1134,6 @@ static int node_index_of(uint8_t addr) {
 // Producer API (host/zenoh, chain-tree): grab a buffer, fill it, attach to dest's fill list.
 // false = unknown node or pool exhausted (the exhaustion exception/notify lands in step 5).
 static bool bus_msg_send(uint8_t dest_addr, const uint8_t *payload, uint8_t len, uint32_t tag) {
-    int idx = node_index_of(dest_addr);
-    if (idx < 0) return false;
     if (len > BUS_PAYLOAD_MAX) len = BUS_PAYLOAD_MAX;
     tx_buf_t *b = pool_grab();
     if (!b) {   // §17 step5: exhaustion is an exception -> COUNT ONLY (no silent drop).
@@ -1131,12 +1143,21 @@ static bool bus_msg_send(uint8_t dest_addr, const uint8_t *payload, uint8_t len,
         g_pool_exhausted++;
         return false;
     }
-    b->dest_node = (uint8_t)idx; b->len = len; b->origin_tag = tag;
+    b->len = len; b->origin_tag = tag;
     for (uint8_t i = 0; i < len; i++) b->payload[i] = payload[i];
+    // node_index_of + the attach MUST be under the spinlock: a runtime roster rebuild
+    // (bus_run_cycle, same g_pool_cs) can renumber g_nodes, so an index taken outside the
+    // lock could be stale. If the node vanished (rebuild removed it), recover the buffer.
     critical_section_enter_blocking(&g_pool_cs);
-    uint8_t f = g_active_idx ^ 1u;
-    b->next = g_nodes[idx].list[f]; g_nodes[idx].list[f] = b;   // push onto the fill list
+    int idx = node_index_of(dest_addr);
+    bool ok = (idx >= 0);
+    if (ok) {
+        b->dest_node = (uint8_t)idx;
+        uint8_t f = g_active_idx ^ 1u;
+        b->next = g_nodes[idx].list[f]; g_nodes[idx].list[f] = b;   // push onto the fill list
+    }
     critical_section_exit(&g_pool_cs);
+    if (!ok) { pool_recover(b); return false; }
     return true;
 }
 static void bus_pingpong_swap(void) {    // cycle boundary: flip active/fill
@@ -1169,6 +1190,26 @@ static void bus_pp_selftest(void) {
 // NO_MSG sweep (poll every unmarked live node, alarm-blocked feedback wait, §16);
 // cycle-time stat. Runs in place of the per-slot rotation when g_cycle_mode is set.
 static void bus_run_cycle(void) {
+    // (-1) §17 fold: rebuild the node table if the roster changed at runtime
+    // (CMD_BUS_REGISTER_SLAVE / CLEAR_ROSTER set g_nodes_dirty). Done here on the bus task
+    // under g_pool_cs so it serializes with producers (bus_msg_send's node_index_of+attach)
+    // and the roster write. Detach any queued buffers first (recover them -> no leak); old
+    // correlations to removed nodes won't be answered, so drop them. Rare/administrative.
+    if (g_nodes_dirty) {
+        tx_buf_t *orphans = NULL;
+        critical_section_enter_blocking(&g_pool_cs);
+        g_nodes_dirty = false;
+        for (uint8_t i = 0; i < g_nodes_n; i++)
+            for (uint8_t bl = 0; bl < 2; bl++) {
+                tx_buf_t *p = g_nodes[i].list[bl]; g_nodes[i].list[bl] = NULL;
+                while (p) { tx_buf_t *nx = p->next; p->next = orphans; orphans = p; p = nx; }
+            }
+        bus_nodetable_build();                       // fresh g_nodes from g_roster (list[2]=NULL, dead=0)
+        for (uint8_t i = 0; i < CMDCORR_MAX; i++) g_corr[i].used = 0u;   // drop stale correlations
+        critical_section_exit(&g_pool_cs);
+        while (orphans) { tx_buf_t *nx = orphans->next; pool_recover(orphans); orphans = nx; }
+        g_nodes_rebuilds++;
+    }
     // (0) §17 fold: drain a pending HOST->slave command into the producer path. on_bus_msg
     // (uplink, under g_lock) staged it in g_cmd_*; we fire it fire-and-forget like any
     // producer and record correlation so its reply is relayed to the host (handle_slot_frame),
