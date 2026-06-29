@@ -203,10 +203,13 @@ static int g_hwio_rc; // boot_read_hwio() result (HWIO_OK / _MISSING benign; oth
 static hwio_t g_hwio; // frozen HIL pin-role map + ADC annotation (always usable; defaults all-UNUSED)
 static int g_neti_rc; // boot_read_netcfg() result (NETI_OK / _MISSING benign; other = present-but-bad)
 static netcfg_t g_netcfg; // WiFi creds + zenoh-agent endpoint (present=0 unless a valid 'neti' loaded)
-// §dual-transport step 1: force USB so the bench stays USB-reachable while we prove the collapsed
-// build + RAM. volatile => BOTH uplink branches stay linked (true RAM). Step 2 replaces it with the
-// dynamic USB>WiFi>standalone selector (USB preempts WiFi at any time).
-static volatile bool g_uplink_force_usb = true;
+// §dual-transport step 2: ONE uplink supervisor picks the transport at runtime — USB > WiFi >
+// standalone, dynamic (USB PREEMPTS WiFi at any time). The RS-485 bus + engine + interlock run in
+// ALL modes; only host_link's transport changes. g_uplink_active=false (standalone) tells the §17
+// cycle to sink its emits (step 3 gates at the source; step 2 has a pump-side sink).
+enum { UPL_STANDALONE = 0, UPL_USB = 1, UPL_WIFI = 2 };
+static volatile uint8_t g_uplink_mode;    // current transport (POLL_STATS / observability)
+static volatile bool    g_uplink_active;  // true in USB/WiFi, false in standalone
 static int g_ilcf_rc = -2; // Thread-2 interlock bring-up for the banner: -2 pending,
                            // else the count of slots armed from ilc0..ilc9 (0..10)
 static uint32_t g_il_armfail = 0; // DIAG: first arm failure [slot:8][status:8][err0:8][err1:8]
@@ -542,7 +545,7 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint32_t fbf = g_fb_frames, fbd = g_fb_drops;
         uint32_t crl = g_corr_relayed, crf = g_corr_full, nrb = g_nodes_rebuilds;
         uint8_t ndead = g_nodes_dead;  // §17 step7 (cycle-maintained; g_nodes is defined later)
-        uint8_t r[78] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint8_t r[79] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -564,8 +567,9 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           (uint8_t)fbd,(uint8_t)(fbd>>8),(uint8_t)(fbd>>16),(uint8_t)(fbd>>24),// feedback drops [b63-66]
                           (uint8_t)crl,(uint8_t)(crl>>8),(uint8_t)(crl>>16),(uint8_t)(crl>>24),// §17 fold cmd replies relayed [b67-70]
                           (uint8_t)crf,(uint8_t)(crf>>8),(uint8_t)(crf>>16),(uint8_t)(crf>>24),// corr-table-full drops [b71-74]
-                          (uint8_t)nrb,(uint8_t)(nrb>>8),(uint8_t)(nrb>>16),(uint8_t)(nrb>>24) };// §17 fold node-table rebuilds [b75-78]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 78); break;
+                          (uint8_t)nrb,(uint8_t)(nrb>>8),(uint8_t)(nrb>>16),(uint8_t)(nrb>>24),// §17 fold node-table rebuilds [b75-78]
+                          g_uplink_mode };  // §dual-transport: 0=standalone 1=usb 2=wifi [b79]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 79); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -868,40 +872,48 @@ static void bc_load_cfg_roster(void) {
     g_poll_enabled = (g_roster_n > 0);   // a config roster -> poll immediately
 }
 
-// USB-CDC uplink (§dual-transport: always compiled; the runtime selector starts it in USB mode).
-static void uplink_task(void *arg) {
-    (void)arg;
-    bool prev_conn = false;
-    for (;;) {
-        g_hb[HB_UPLINK]++; g_hb_us[HB_UPLINK] = time_us_32();
+// ---- per-slice uplink PUMPS (non-blocking; the supervisor calls one per iteration) ---------
+// host_link is transport-agnostic: each pump does the SAME drain-TX / feed-RX work over its
+// transport, so USB can preempt WiFi mid-stream just by switching which pump the supervisor runs.
 
-        bool conn = stdio_usb_connected();
-        if (prev_conn && !conn) {              // host went away -> re-arm
-            LOCK();
-            host_link_reset_boot(&g_hl);
-            g_cmd_pending = false;
-            bc_load_cfg_roster();   // drop host-registered slaves; restore the commissioned roster
-            UNLOCK();
-        }
-        bool attached = (!prev_conn && conn);  // host just attached -> banner becomes deliverable
-        prev_conn = conn;
-        g_host_connected = conn;                   // core0-published condition for core1
+// USB-CDC: feed host->us getchar, tick, relay core1 replies, drain us->host putchar.
+static void usb_pump(void) {
+    uint8_t out[64]; uint32_t n; appcore_rep_t up;
+    LOCK();
+    int c;
+    while ((c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT)
+        host_link_feed(&g_hl, (uint8_t)c);     // may invoke on_bus_msg/on_local_shell
+    host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), true);
+    while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)   // relay core1 replies/reports
+        (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
+    n = host_link_tx_drain(&g_hl, out, sizeof out);
+    UNLOCK();
+    if (n) { for (uint32_t i = 0; i < n; i++) putchar_raw(out[i]); stdio_flush(); }
+}
 
-        uint8_t out[64]; uint32_t n; appcore_rep_t up;
-        LOCK();
-        int c;
-        while ((c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT)
-            host_link_feed(&g_hl, (uint8_t)c);     // may invoke on_bus_msg/on_local_shell
-        host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), conn);
-        if (attached) bc_emit_boot_banner();   // re-announce identity to the freshly-attached host
-        while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)   // relay core1 replies/reports
-            (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
-        n = host_link_tx_drain(&g_hl, out, sizeof out);
-        UNLOCK();
+// Standalone (NO uplink): SINK so nothing fills while there is no host -- discard core1 replies
+// and drain+drop any host_link TX. (Step 3 gates the §17 cycle's emits at the source via
+// g_uplink_active; this pump-side sink is the safety net so a buffer can never wedge the cycle.)
+static void standalone_pump(void) {
+    uint8_t out[64]; appcore_rep_t up;
+    LOCK();
+    host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), false);
+    while (xQueueReceive(g_up_q, &up, 0) == pdTRUE) { /* discard: no uplink */ }
+    (void)host_link_tx_drain(&g_hl, out, sizeof out);   // drain + discard
+    UNLOCK();
+}
 
-        if (n) { for (uint32_t i = 0; i < n; i++) putchar_raw(out[i]); stdio_flush(); }
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
+// Entering an uplink mode (USB/WiFi): fresh host_link boot + restore the commissioned roster +
+// re-announce identity. Entering standalone: just publish "no host".
+static void uplink_enter(bool active) {
+    LOCK();
+    host_link_reset_boot(&g_hl);
+    g_cmd_pending = false;
+    bc_load_cfg_roster();   // drop host-registered slaves; restore the commissioned roster
+    UNLOCK();
+    g_host_connected = active;   // core0-published condition for core1 (stream gating etc.)
+    g_uplink_active  = active;
+    if (active) bc_emit_boot_banner();   // announce identity to the freshly-bound host/agent
 }
 
 // ---- WiFi uplink (§dual-transport: always compiled): same host_link frame stream over UDP to the -----
@@ -937,88 +949,96 @@ static int wifi_udp_open(const netcfg_t *nc) {
     return fd;
 }
 
-// Run host_link over the connected UDP socket until the link drops, then close.
-static void wifi_serve(int fd, struct netif *nif) {
-    struct timeval rtv = { 0, 50000 };         // 50 ms recv timeout (bounds the loop block)
-    lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
-    LOCK();
-    host_link_reset_boot(&g_hl);
-    g_cmd_pending = false;
-    bc_load_cfg_roster();   // restore the commissioned roster on a fresh link
-    UNLOCK();
-    g_host_connected = true;
-    bc_emit_boot_banner();  // announce identity to the agent
-
+// WiFi/UDP pump: ONE non-blocking slice of host_link over the agent socket. Returns false if the
+// link/socket died (-> supervisor closes fd + re-evaluates -> standalone/rejoin). MSG_DONTWAIT:
+// this lwIP doesn't honor SO_RCVTIMEO on the UDP recvmbox, so a blocking recv would hang the task
+// >4 s and the HW watchdog would reboot us (the old UDP reboot loop).
+static bool wifi_pump(int fd, struct netif *nif) {
+    if (!wifi_link_up(nif)) return false;            // WiFi dropped under us
     uint8_t rx[128], out[256];
-    bool link_ok = true;
-    while (link_ok) {
-        WIFI_HB();
-        if (!wifi_link_up(nif)) break;   // WiFi dropped under us -> back to the supervisor
-        // Drain TX first so the banner/replies go out before we block on recv.
-        LOCK();
-        host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), true);
-        appcore_rep_t up;
-        while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)
-            (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
-        uint32_t m = host_link_tx_drain(&g_hl, out, sizeof out);
-        UNLOCK();
-        if (m && lwip_write(fd, out, m) < 0) { link_ok = false; break; }  // dead link
-        // RX: MSG_DONTWAIT makes recv return immediately when there's no data (this lwIP
-        // does NOT honor SO_RCVTIMEO on the UDP recvmbox — a blocking recv there hangs the
-        // task >4 s and the HW watchdog reboots us, the UDP-mode reboot loop). Per-call
-        // non-blocking keeps writes blocking, so a transient EWOULDBLOCK can't false-break.
-        // <=0 (timeout/no-data/EWOULDBLOCK) all mean "nothing this round"; keep looping.
-        int n = lwip_recv(fd, rx, sizeof rx, MSG_DONTWAIT);
-        if (n > 0) { LOCK(); for (int i = 0; i < n; i++) host_link_feed(&g_hl, rx[i]); UNLOCK(); }
-        else vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    g_host_connected = false;
-    lwip_close(fd);
+    LOCK();
+    host_link_tick(&g_hl, to_ms_since_boot(get_absolute_time()), true);
+    appcore_rep_t up;
+    while (xQueueReceive(g_up_q, &up, 0) == pdTRUE)
+        (void)host_link_s2m(&g_hl, up.dest, up.opcode, up.payload, up.len);
+    uint32_t m = host_link_tx_drain(&g_hl, out, sizeof out);
+    UNLOCK();
+    if (m && lwip_write(fd, out, m) < 0) return false;   // dead link
+    int n = lwip_recv(fd, rx, sizeof rx, MSG_DONTWAIT);
+    if (n > 0) { LOCK(); for (int i = 0; i < n; i++) host_link_feed(&g_hl, rx[i]); UNLOCK(); }
+    return true;
 }
 
-static void wifi_uplink_task(void *arg) {
+// §dual-transport step 2: the ONE uplink SUPERVISOR. cyw43 init'd once; WiFi (re)joins in the
+// BACKGROUND (sliced async, never blocking) so it is warm the instant USB drops. Each iteration:
+// pick the desired transport (USB > WiFi > standalone), debounce + commit the switch, then pump one
+// slice of the active mode. USB PREEMPTS WiFi at any time. The bus/engine/interlock run on other
+// tasks regardless of mode; standalone just sinks (uplink inactive).
+#define UPLINK_DEBOUNCE 10u      // stable iterations (~30-40 ms) before committing a mode change
+static void uplink_supervisor_task(void *arg) {
     (void)arg;
     WIFI_HB();
-    if (cyw43_arch_init() != 0) { for (;;) { WIFI_HB(); vTaskDelay(pdMS_TO_TICKS(200)); } }
-    cyw43_arch_enable_sta_mode();
-    wifi_no_powersave();
-    struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
-    g_host_connected = false;
-    uint8_t join_fails = 0;
+    bool wifi_ok = (cyw43_arch_init() == 0);
+    struct netif *nif = NULL;
+    if (wifi_ok) { cyw43_arch_enable_sta_mode(); wifi_no_powersave(); nif = &cyw43_state.netif[CYW43_ITF_STA]; }
+    g_uplink_mode = UPL_STANDALONE; g_host_connected = false; g_uplink_active = false;
+
+    int fd = -1;
+    bool join_pending = false; uint32_t join_deadline = 0; uint8_t join_fails = 0;
+    uint8_t want = UPL_STANDALONE, want_n = 0;
 
     for (;;) {
         WIFI_HB();
-        if (!g_netcfg.present) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        bool usb = stdio_usb_connected();
 
-        // ---- supervisor: (re)join whenever the link is down (even if a stale IP lingers) ----
-        if (!wifi_link_up(nif)) {
-            cyw43_arch_wifi_connect_async(g_netcfg.ssid, g_netcfg.pass, CYW43_AUTH_WPA2_AES_PSK);
-            for (int i = 0; i < 200; i++) {        // ~20 s, polled (HB kept fresh)
-                WIFI_HB();
-                if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) < 0) break;  // join failed -> retry
-                if (wifi_link_up(nif)) break;                                        // associated + IP
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
+        // ---- background WiFi join management (sliced; skipped while USB is preferred) ----
+        if (wifi_ok && g_netcfg.present && !usb) {
             if (!wifi_link_up(nif)) {
-                // Persistent failure -> the radio may be wedged. Reset just the CYW43
-                // (deinit/reinit reloads its firmware), MCU keeps running. No power-cycle.
-                if (++join_fails >= 5) {
-                    cyw43_arch_deinit(); vTaskDelay(pdMS_TO_TICKS(200));
-                    if (cyw43_arch_init() == 0) { cyw43_arch_enable_sta_mode(); wifi_no_powersave(); }
-                    join_fails = 0;
+                if (fd >= 0) { lwip_close(fd); fd = -1; }
+                if (!join_pending) {
+                    cyw43_arch_wifi_connect_async(g_netcfg.ssid, g_netcfg.pass, CYW43_AUTH_WPA2_AES_PSK);
+                    join_pending = true; join_deadline = now + 20000u;
+                } else if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) < 0 ||
+                           (int32_t)(now - join_deadline) > 0) {           // failed / timed out
+                    join_pending = false;
+                    if (++join_fails >= 5) {                               // radio wedged -> reset just CYW43
+                        cyw43_arch_deinit(); vTaskDelay(pdMS_TO_TICKS(150));
+                        if (cyw43_arch_init() == 0) { cyw43_arch_enable_sta_mode(); wifi_no_powersave(); }
+                        join_fails = 0;
+                    }
                 }
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
+            } else {                                                      // associated + IP
+                join_pending = false; join_fails = 0;
+                if (fd < 0) fd = wifi_udp_open(&g_netcfg);
             }
-            join_fails = 0;
-            wifi_no_powersave();   // re-assert after a (re)join
         }
 
-        // ---- open the UDP socket to the agent + serve host_link (UDP-only) ----
-        int fd = wifi_udp_open(&g_netcfg);
-        if (fd < 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
-        wifi_serve(fd, nif);   // runs until the link drops, then closes fd
-        vTaskDelay(pdMS_TO_TICKS(500));   // brief pause before reconnecting
+        // ---- desired transport (USB > WiFi > standalone) ----
+        uint8_t desired = usb ? UPL_USB
+                        : ((wifi_ok && wifi_link_up(nif) && fd >= 0) ? UPL_WIFI : UPL_STANDALONE);
+
+        // ---- debounce, then commit the switch (USB preempts; a brief DTR/link blip won't thrash) ----
+        if (desired != g_uplink_mode) {
+            if (desired == want) want_n++; else { want = desired; want_n = 1; }
+            if (want_n >= UPLINK_DEBOUNCE) {
+                if (g_uplink_mode == UPL_WIFI && fd >= 0) { lwip_close(fd); fd = -1; }  // leaving WiFi
+                g_uplink_mode = desired; want_n = 0;
+                uplink_enter(desired != UPL_STANDALONE);
+            }
+        } else { want = desired; want_n = 0; }
+
+        // ---- pump one slice of the active mode ----
+        if (g_uplink_mode == UPL_USB)        usb_pump();
+        else if (g_uplink_mode == UPL_WIFI) {
+            if (!wifi_pump(fd, nif)) {        // link/socket died -> drop to standalone; rejoin next loops
+                if (fd >= 0) { lwip_close(fd); fd = -1; }
+                g_uplink_mode = UPL_STANDALONE; g_host_connected = false; g_uplink_active = false;
+                want = UPL_STANDALONE; want_n = 0;
+            }
+        } else                               standalone_pump();
+
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -2685,12 +2705,9 @@ int main(void) {
     // the tightest at ~360 B headroom and the chain_tree walker deepens with each
     // KB; FreeRTOS heap has the room. Watchdog stays at 2 KB (trivial loop).
     xTaskCreate(bus_control_task, "bus",    configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_bus);
-    // §dual-transport step 1: ONE image carries BOTH uplinks; pick at runtime. Forced to USB now
-    // (g_uplink_force_usb); step 2 = the dynamic USB>WiFi>standalone selector. Both branches stay linked.
-    if (!g_uplink_force_usb && g_neti_rc == NETI_OK)
-        xTaskCreate(wifi_uplink_task, "uplink", configMINIMAL_STACK_SIZE * 12, NULL, 2, &t_up);
-    else
-        xTaskCreate(uplink_task,      "uplink", configMINIMAL_STACK_SIZE * 8, NULL, 2, &t_up);
+    // §dual-transport step 2: ONE supervisor selects USB/WiFi/standalone at runtime (USB preempts).
+    // *12 stack = the WiFi path's depth (lwIP/cyw43); USB/standalone use far less.
+    xTaskCreate(uplink_supervisor_task, "uplink", configMINIMAL_STACK_SIZE * 12, NULL, 2, &t_up);
     xTaskCreate(app_engine_task,  "app",    configMINIMAL_STACK_SIZE * 8, NULL, 3, &t_app);
     xTaskCreate(watchdog_task,    "wd",     configMINIMAL_STACK_SIZE * 2, NULL, 1, &t_wd);
     xTaskCreate(servo_feeder_task,"servo",  configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL); // float; idle until a servo is configured
