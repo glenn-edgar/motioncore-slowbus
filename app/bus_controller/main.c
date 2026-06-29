@@ -102,6 +102,7 @@
 #define CMD_BUS_MEASURE_TA       0x0167u // arbiter step 2: latch the measured POLL->reply turnaround
 #define CMD_BUS_CYCLE_MODE       0x0168u // §17 step3: [0|1] per-slot rotation vs the cyclic engine
 #define CMD_BUS_MSG_INJECT       0x0169u // §17 step3 test: [addr][payload...] -> bus_msg_send (producer)
+#define CMD_BUS_SET_DEADLINE     0x016Au // §17 step4: [deadline_us u32] real-time cycle deadline
 #define BUS_REG_OK               0u
 #define SHELL_OK                 0u
 #define SHELL_UNKNOWN_CMD        1u
@@ -270,6 +271,12 @@ static volatile bool g_pool_ready;         // set by bus_pool_init (core1); bus 
 static uint8_t  g_nodes_n, g_pp_selftest;
 static volatile uint8_t  g_cycle_mode;            // §17 step3: 0=per-slot rotation, 1=cyclic engine
 static volatile uint32_t g_cycle_last, g_cycle_min, g_cycle_max;  // full-cycle time (us)
+// §17 step4 real-time watchdog: deadline + overrun/slack/slowest-node
+static volatile uint32_t g_cycle_deadline_us = 5000;   // 200 Hz default; CMD_BUS_SET_DEADLINE
+static volatile uint32_t g_cycle_overruns;             // cycles exceeding the deadline
+static volatile int32_t  g_cycle_minslack = 0x7FFFFFFF; // min (deadline - cycle); <0 once overran
+static volatile uint8_t  g_cycle_slow_addr;            // node addr that took longest in a cycle
+static volatile uint32_t g_cycle_slow_us;              // that node's slot time
 static void bus_nodetable_build(void);
 static void bus_pp_selftest(void);
 static void bus_run_cycle(void);
@@ -490,7 +497,8 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
     case CMD_BUS_POLL_STATS: {   // step 2 + §17 step1: poll counters + turnaround + pool/table
         uint32_t t = g_poll_total, a = g_poll_alive, m = g_poll_miss; uint16_t ta = g_meas_ta_us;
         uint32_t cl = g_cycle_last, cmn = g_cycle_min, cmx = g_cycle_max;
-        uint8_t r[32] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint32_t ov = g_cycle_overruns; int32_t sk = g_cycle_minslack; uint32_t su = g_cycle_slow_us;
+        uint8_t r[43] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -499,8 +507,11 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           g_pp_selftest,                                           // §17 step2 [b20]
                           (uint8_t)cl,(uint8_t)(cl>>8),(uint8_t)(cl>>16),(uint8_t)(cl>>24),    // cycle_last us [b21-24]
                           (uint8_t)cmn,(uint8_t)(cmn>>8),(uint8_t)(cmn>>16),(uint8_t)(cmn>>24),// cycle_min  [b25-28]
-                          (uint8_t)cmx,(uint8_t)(cmx>>8),(uint8_t)(cmx>>16),(uint8_t)(cmx>>24)};// cycle_max [b29-32]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 32); break;
+                          (uint8_t)cmx,(uint8_t)(cmx>>8),(uint8_t)(cmx>>16),(uint8_t)(cmx>>24), // cycle_max [b29-32]
+                          (uint8_t)ov,(uint8_t)(ov>>8),(uint8_t)(ov>>16),(uint8_t)(ov>>24),     // overruns [b33-36]
+                          (uint8_t)sk,(uint8_t)(sk>>8),(uint8_t)(sk>>16),(uint8_t)(sk>>24),     // min slack (signed) [b37-40]
+                          g_cycle_slow_addr, (uint8_t)su,(uint8_t)(su>>8) };                    // slowest node addr + us [b41-43]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 43); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -514,6 +525,10 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint8_t rr = ok ? 1u : 0u;
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, &rr, 1); break;
     }
+    case CMD_BUS_SET_DEADLINE:   // §17 step4: set the real-time cycle deadline + reset watchdog stats
+        if (alen >= 4) g_cycle_deadline_us = (uint32_t)args[0]|((uint32_t)args[1]<<8)|((uint32_t)args[2]<<16)|((uint32_t)args[3]<<24);
+        g_cycle_overruns = 0; g_cycle_minslack = 0x7FFFFFFF;
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_APP_PP_START:   // [addr] -> start the free-running chain-flow ping-pong loop
         if (alen >= 1) g_pp_addr = args[0];
         g_pp_master = 0; g_pp_slave_seen = 0;
@@ -1055,9 +1070,13 @@ static void bus_run_cycle(void) {
         }
     }
     // (2) NO_MSG sweep -- poll each unmarked live node for feedback + liveness
+    uint32_t slow_us = 0; uint8_t slow_addr = 0;
     for (uint8_t i = 0; i < g_nodes_n; i++) {
         if (g_nodes[i].dead || marked[i]) continue;
+        uint32_t st = time_us_32();
         slot_result_t sr = bus_poll_slot(g_nodes[i].addr, &rf);   // alarm-blocked feedback wait
+        uint32_t sl = time_us_32() - st;
+        if (sl > slow_us) { slow_us = sl; slow_addr = g_nodes[i].addr; }
         uint32_t now = to_ms_since_boot(get_absolute_time());
         LOCK();
         g_poll_total++;
@@ -1069,11 +1088,29 @@ static void bus_run_cycle(void) {
         }
         UNLOCK();
     }
-    // (3) cycle-time stat (full sweep)
+    // (3) cycle-time stat + real-time watchdog (overrun / slack / slowest node)
     uint32_t ct = time_us_32() - t0;
     g_cycle_last = ct;
     if (ct > g_cycle_max) g_cycle_max = ct;
     if (g_cycle_min == 0 || ct < g_cycle_min) g_cycle_min = ct;
+    g_cycle_slow_addr = slow_addr; g_cycle_slow_us = slow_us;
+    int32_t slack = (int32_t)g_cycle_deadline_us - (int32_t)ct;
+    if (slack < g_cycle_minslack) g_cycle_minslack = slack;
+    if (ct > g_cycle_deadline_us) {
+        g_cycle_overruns++;
+        static uint32_t s_last_notify_ms;          // rate-limit the push to <=10/s
+        uint32_t nms = to_ms_since_boot(get_absolute_time());
+        if ((uint32_t)(nms - s_last_notify_ms) >= 100u) {
+            s_last_notify_ms = nms;
+            char m[64];
+            int mn = snprintf(m, sizeof m, "[overrun] cycle=%uus deadline=%uus slow=0x%02X/%uus",
+                              (unsigned)ct, (unsigned)g_cycle_deadline_us, slow_addr, (unsigned)slow_us);
+            if (mn > 0) {
+                if (mn >= (int)sizeof m) mn = (int)sizeof m - 1;
+                LOCK(); (void)host_link_s2m(&g_hl, 1, OP_DBG_LOG, (const uint8_t *)m, (uint8_t)mn); UNLOCK();
+            }
+        }
+    }
 }
 
 static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
