@@ -103,6 +103,7 @@
 #define CMD_BUS_CYCLE_MODE       0x0168u // §17 step3: [0|1] per-slot rotation vs the cyclic engine
 #define CMD_BUS_MSG_INJECT       0x0169u // §17 step3 test: [addr][payload...] -> bus_msg_send (producer)
 #define CMD_BUS_SET_DEADLINE     0x016Au // §17 step4: [deadline_us u32] real-time cycle deadline
+#define CMD_BUS_SET_PACE         0x016Bu // §17 step7: [pace_us u32][slowpoll_div u32 opt] fixed-rate + dead-probe rate
 #define BUS_REG_OK               0u
 #define SHELL_OK                 0u
 #define SHELL_UNKNOWN_CMD        1u
@@ -279,6 +280,13 @@ static volatile uint32_t g_cycle_overruns;             // cycles exceeding the d
 static volatile int32_t  g_cycle_minslack = 0x7FFFFFFF; // min (deadline - cycle); <0 once overran
 static volatile uint8_t  g_cycle_slow_addr;            // node addr that took longest in a cycle
 static volatile uint32_t g_cycle_slow_us;              // that node's slot time
+// §17 step7: fixed-rate pacing + dead-node slow-poll/re-enable
+static volatile uint32_t g_cycle_pace_us;              // 0=free-run; else hold each cycle to this period (jitter-free)
+static volatile uint32_t g_dead_slowpoll_div = 200;    // probe one dead node every N cycles (200 @200Hz ~= 1Hz)
+static volatile uint32_t g_dead_revives;               // dead->alive resurrections (stat)
+static volatile uint8_t  g_nodes_dead;                  // current dead-node count (cycle-maintained; POLL_STATS reads it)
+static uint8_t  g_dead_cursor;                          // round-robin index over dead nodes
+static uint32_t g_dead_tick;                            // cycles since the last dead-node probe
 static void bus_nodetable_build(void);
 static void bus_pp_selftest(void);
 static void bus_run_cycle(void);
@@ -502,7 +510,9 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint32_t cl = g_cycle_last, cmn = g_cycle_min, cmx = g_cycle_max;
         uint32_t ov = g_cycle_overruns; int32_t sk = g_cycle_minslack; uint32_t su = g_cycle_slow_us;
         uint32_t ex = g_pool_exhausted; uint16_t lw = g_pool_low;
-        uint8_t r[49] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint32_t dv = g_dead_revives, pc = g_cycle_pace_us;
+        uint8_t ndead = g_nodes_dead;  // §17 step7 (cycle-maintained; g_nodes is defined later)
+        uint8_t r[58] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -516,8 +526,11 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           (uint8_t)sk,(uint8_t)(sk>>8),(uint8_t)(sk>>16),(uint8_t)(sk>>24),     // min slack (signed) [b37-40]
                           g_cycle_slow_addr, (uint8_t)su,(uint8_t)(su>>8),                      // slowest node addr + us [b41-43]
                           (uint8_t)lw,(uint8_t)(lw>>8),                                          // §17 step5 pool low-water [b44-45]
-                          (uint8_t)ex,(uint8_t)(ex>>8),(uint8_t)(ex>>16),(uint8_t)(ex>>24) };    // pool exhausted count [b46-49]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 49); break;
+                          (uint8_t)ex,(uint8_t)(ex>>8),(uint8_t)(ex>>16),(uint8_t)(ex>>24),    // pool exhausted count [b46-49]
+                          (uint8_t)dv,(uint8_t)(dv>>8),(uint8_t)(dv>>16),(uint8_t)(dv>>24),    // §17 step7 dead revives [b50-53]
+                          ndead,                                                               // current dead-node count [b54]
+                          (uint8_t)pc,(uint8_t)(pc>>8),(uint8_t)(pc>>16),(uint8_t)(pc>>24) };  // cycle pace us [b55-58]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 58); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -537,6 +550,10 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
     case CMD_BUS_SET_DEADLINE:   // §17 step4: set the real-time cycle deadline + reset watchdog stats
         if (alen >= 4) g_cycle_deadline_us = (uint32_t)args[0]|((uint32_t)args[1]<<8)|((uint32_t)args[2]<<16)|((uint32_t)args[3]<<24);
         g_cycle_overruns = 0; g_cycle_minslack = 0x7FFFFFFF;
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
+    case CMD_BUS_SET_PACE:   // §17 step7: [pace_us u32] (0=free-run) [+ slowpoll_div u32 opt]
+        if (alen >= 4) g_cycle_pace_us = (uint32_t)args[0]|((uint32_t)args[1]<<8)|((uint32_t)args[2]<<16)|((uint32_t)args[3]<<24);
+        if (alen >= 8) g_dead_slowpoll_div = (uint32_t)args[4]|((uint32_t)args[5]<<8)|((uint32_t)args[6]<<16)|((uint32_t)args[7]<<24);
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, NULL, 0); break;
     case CMD_APP_PP_START:   // [addr] -> start the free-running chain-flow ping-pong loop
         if (alen >= 1) g_pp_addr = args[0];
@@ -1111,6 +1128,30 @@ static void bus_run_cycle(void) {
         }
         UNLOCK();
     }
+    // (2a) §17 step7: DEAD-NODE slow-poll. Dead nodes are skipped above (never sent
+    // messages, not swept) so the live cycle stays fast. Re-probe ONE dead node every
+    // g_dead_slowpoll_div cycles (round-robin) so a recovered node rejoins on its own.
+    // A no-response probe costs T_RESP (~3ms) -> that ONE cycle overruns (expected for a
+    // slow-poll; the overrun stat flags it); the other div-1 cycles are unaffected.
+    if (g_dead_slowpoll_div && ++g_dead_tick >= g_dead_slowpoll_div) {
+        g_dead_tick = 0;
+        for (uint8_t k = 0; k < g_nodes_n; k++) {
+            uint8_t i = (uint8_t)((g_dead_cursor + k) % g_nodes_n);
+            if (!g_nodes[i].dead) continue;
+            g_dead_cursor = (uint8_t)((i + 1) % g_nodes_n);
+            slot_result_t sr = bus_poll_slot(g_nodes[i].addr, &rf);
+            uint32_t now = to_ms_since_boot(get_absolute_time());
+            LOCK();
+            g_poll_total++;
+            if (sr != SLOT_NO_RESPONSE) {   // resurrected -> back into the live rotation
+                g_nodes[i].dead = 0; g_nodes[i].miss = 0;
+                g_poll_alive++; mark_alive(g_nodes[i].addr, now); g_dead_revives++;
+            } else { g_poll_miss++; }
+            UNLOCK();
+            break;                          // at most one dead probe per interval
+        }
+    }
+    { uint8_t nd = 0; for (uint8_t i = 0; i < g_nodes_n; i++) if (g_nodes[i].dead) nd++; g_nodes_dead = nd; }
     // (2b) deferred pool-exhaustion notify (§17 step5): producers only bump the
     // counter -- emit the rate-limited zenoh notify HERE, where no outer g_lock is
     // held, so we never re-enter the uplink thread's mutex (see bus_msg_send).
@@ -1157,6 +1198,23 @@ static void bus_run_cycle(void) {
     // last) so the rate is engine-tick paced (~100/s) and the slave's reply queue can't
     // pile up. Self-correcting if a kick is dropped (g_pp_kicks only counts queued ones).
     if (g_pp_run && g_pp_kicks == g_pp_master) pp_kick();
+
+    // (5) §17 step7: FIXED-RATE PACING. Hold each cycle to g_cycle_pace_us (0=free-run)
+    // measured from this cycle's start (t0) so the control loop sees a steady period with
+    // low jitter. If work finished early, sleep the remainder on the SAME idle alarm the
+    // slot uses (rot_alarm_cb wakes us) -- core0 stays free, no busy-wait. No slot is
+    // active here so the RX ISR won't touch the alarm. Overran (work>=pace) -> no wait
+    // (already counted as an overrun above); the period naturally re-anchors next cycle.
+    if (g_cycle_pace_us) {
+        uint32_t elapsed = time_us_32() - t0;
+        if (elapsed < g_cycle_pace_us) {
+            uint32_t rem = g_cycle_pace_us - elapsed;
+            (void)ulTaskNotifyTake(pdTRUE, 0);                 // clear any stale notify
+            hardware_alarm_set_target(g_gap_alarm, make_timeout_time_us(rem));
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(rem / 1000u + 4u));   // wake on alarm (+safety)
+            hardware_alarm_cancel(g_gap_alarm);
+        }
+    }
 }
 
 static uint16_t              g_kb0_node;   // KB0 start node (event injection target)
