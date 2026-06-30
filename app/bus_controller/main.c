@@ -2474,7 +2474,7 @@ static void interlock_thread2_start(void) {
         // nodes (#1). Either a GP1 trip OR a node going dead drives the GP0 wired-OR veto.
         // On a slave _nodesdead is always 0, so the clause is a no-op there.
         static const char gp1_il[] =
-            "gp1il;cfg[(gp1):in,up,(gp0):oc,up];watch[gp1:1];watch[_nodesdead:0];out_ok[gp0:1];out_err[gp0:0]";
+            "gp1il;cfg[(gp1):in,up,debounce_4,(gp0):oc,up];watch[gp1:1];watch[_nodesdead:0];out_ok[gp0:1];out_err[gp0:0]";
         const uint16_t gl = (uint16_t)(sizeof gp1_il - 1u);
         bool preserved = (g_interlock_persist.slots[0].state == INTERLOCK_SLOT_ARMED) &&
                          (g_interlock_persist.dsl_len[0] == gl) &&
