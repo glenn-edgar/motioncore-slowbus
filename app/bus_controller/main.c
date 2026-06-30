@@ -2437,8 +2437,8 @@ static void interlock_thread2_start(void) {
     interlock_warm_restore();
     uint32_t fp = interlock_cfg_fingerprint();
     if (fp != g_interlock_persist.cfg_fingerprint || interlock_armed_count() == 0) {
-        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++)
-            interlock_disarm_slot(slot);                     // drop any stale armed set
+        for (uint8_t slot = 1; slot < INTERLOCK_MAX_SLOTS; slot++)
+            interlock_disarm_slot(slot);                     // drop stale CONFIG slots; keep slot 0 (built-in)
         uint8_t armed = 0;
         for (uint8_t slot = 1; slot < INTERLOCK_MAX_SLOTS; slot++) {   // slot 0 = built-in; config = ilc1..ilc9
             const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
@@ -2456,18 +2456,28 @@ static void interlock_thread2_start(void) {
     } else {
         g_ilcf_rc = (int)interlock_armed_count();            // warm, same config → preserved
     }
-    // Built-in GP1 safety interlock — slot 0, ALWAYS armed via the COMMON engine. The
-    // pull-up holds gp1 HIGH = OK; a device pulling gp1 LOW fails the watch -> trip. GP0
-    // is an OPEN-DRAIN (oc) wired-OR veto: OK -> released (hi-Z, an external pull-up holds
-    // the shared line HIGH), trip -> driven LOW. Many nodes share the line; any one trips
-    // -> line low. (Needs an external pull-up on the GP0 line; GP1 has the internal one.)
+    // Built-in GP1 safety interlock — slot 0, via the COMMON engine. The pull-up holds
+    // gp1 HIGH = OK; a device pulling gp1 LOW fails the watch -> trip. GP0 is an OPEN-DRAIN
+    // (oc) wired-OR veto: OK -> released (hi-Z, an external pull-up holds the shared line
+    // HIGH), trip -> driven LOW. Many nodes share the line; any one trips -> line low.
+    // (Needs an external pull-up on the GP0 line; GP1 has the internal one.)
+    //
+    // Arm it ONLY if a warm restore didn't already preserve the SAME built-in DSL, so a
+    // latched trip SURVIVES a warm (watchdog/glitch) reset. A cold boot (slots wiped) or a
+    // changed built-in DSL re-arms fresh (which intentionally drops the old latch).
     {
         static const char gp1_il[] =
             "gp1il;cfg[(gp1):in,up,(gp0):oc];watch[gp1:1];out_ok[gp0:1];out_err[gp0:0]";
-        uint8_t err[3];
-        uint8_t st = interlock_set_slot_dsl(0, gp1_il, (uint16_t)(sizeof gp1_il - 1u), err);
-        if (st != SHELL_OK && !g_il_armfail)                 // DIAG: capture a slot-0 arm failure
-            g_il_armfail = ((uint32_t)st << 16) | ((uint32_t)err[0] << 8) | err[1];
+        const uint16_t gl = (uint16_t)(sizeof gp1_il - 1u);
+        bool preserved = (g_interlock_persist.slots[0].state == INTERLOCK_SLOT_ARMED) &&
+                         (g_interlock_persist.dsl_len[0] == gl) &&
+                         (memcmp(g_interlock_persist.dsl_text[0], gp1_il, gl) == 0);
+        if (!preserved) {
+            uint8_t err[3];
+            uint8_t st = interlock_set_slot_dsl(0, gp1_il, gl, err);
+            if (st != SHELL_OK && !g_il_armfail)             // DIAG: capture a slot-0 arm failure
+                g_il_armfail = ((uint32_t)st << 16) | ((uint32_t)err[0] << 8) | err[1];
+        }
     }
     // Priority 4 — ABOVE the chain-tree engine (prio 3): safety preempts the
     // application, so engine load can't delay the veto. core1, with the ADC ISR.
