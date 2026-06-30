@@ -248,6 +248,12 @@ static uint            g_gap_alarm;          // master: claimed hardware alarm
 static volatile bool   g_slot_active;        // master: a liveness slot awaits the bus
 static volatile uint32_t g_slot_poll_us;     // master: time the POLL went out
 static volatile bool   g_slot_first;         // master: first reply word seen this slot
+// Miss diagnostics (POLL_STATS b93-100): split SLOT_NO_RESPONSE into SILENT (no word at
+// all -> the node is absent/dead) vs PARTIAL (a reply started but no complete frame from
+// addr -> a mid-burst stall the grace-redrain couldn't recover within the window, or CRC).
+// Useful for low-baud / long-bus operation, where PARTIAL is the signal that reply bursts
+// are stalling (see bus_poll_slot's grace-redrain).
+static volatile uint32_t g_miss_silent, g_miss_partial;
 
 static void rot_alarm_cb(uint n) {           // idle-gap / T_RESP fired -> wake the bus task once
     (void)n;
@@ -554,7 +560,8 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         uint32_t crl = g_corr_relayed, crf = g_corr_full, nrb = g_nodes_rebuilds;
         uint32_t bm = g_bus_msgs, utx = g_hl.tx_msgs, urx = g_hl.rx_msgs;  // perf counters
         uint8_t ndead = g_nodes_dead;  // §17 step7 (cycle-maintained; g_nodes is defined later)
-        uint8_t r[92] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
+        uint32_t msil = g_miss_silent, mpar = g_miss_partial;  // miss split (b93-100)
+        uint8_t r[100] = { (uint8_t)t,(uint8_t)(t>>8),(uint8_t)(t>>16),(uint8_t)(t>>24),
                           (uint8_t)a,(uint8_t)(a>>8),(uint8_t)(a>>16),(uint8_t)(a>>24),
                           (uint8_t)m,(uint8_t)(m>>8),(uint8_t)(m>>16),(uint8_t)(m>>24),
                           (uint8_t)ta,(uint8_t)(ta>>8),
@@ -581,8 +588,10 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           g_netcfg.n_ap,    // §step5: # WiFi credentials loaded [b80]
                           (uint8_t)bm,(uint8_t)(bm>>8),(uint8_t)(bm>>16),(uint8_t)(bm>>24),    // perf: intra-bus msgs [b81-84]
                           (uint8_t)utx,(uint8_t)(utx>>8),(uint8_t)(utx>>16),(uint8_t)(utx>>24),// perf: uplink TX msgs (USB/UDP) [b85-88]
-                          (uint8_t)urx,(uint8_t)(urx>>8),(uint8_t)(urx>>16),(uint8_t)(urx>>24)};// perf: uplink RX msgs (USB/UDP) [b89-92]
-        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 92); break;
+                          (uint8_t)urx,(uint8_t)(urx>>8),(uint8_t)(urx>>16),(uint8_t)(urx>>24),// perf: uplink RX msgs (USB/UDP) [b89-92]
+                          (uint8_t)msil,(uint8_t)(msil>>8),(uint8_t)(msil>>16),(uint8_t)(msil>>24),// miss SILENT (node absent) [b93-96]
+                          (uint8_t)mpar,(uint8_t)(mpar>>8),(uint8_t)(mpar>>16),(uint8_t)(mpar>>24)};// miss PARTIAL (reply stalled) [b97-100]
+        host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 100); break;
     }
     case CMD_BUS_MEASURE_TA:     // turnaround is now measured every slot (RX ISR); just latch it
         g_meas_ta_us = g_last_ta_us;
@@ -710,13 +719,36 @@ static slot_result_t bus_poll_slot(uint8_t addr, bus_frame_t *rf) {
     (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(T_WINDOW_MAX_US / 1000u + 4u));  // wake on alarm (or safety)
     g_slot_active = false;
     hardware_alarm_cancel(g_gap_alarm);
-    bool babble = (uint32_t)(time_us_32() - g_slot_poll_us) >= T_WINDOW_MAX_US;
     bool from_addr = false;
     uint16_t w;
-    while (bus_phy_rx_pop(&w)) {
-        if (bus_asm_feed(&g_bc, w, rf) && rf->src == addr) { from_addr = true; handle_slot_frame(addr, rf); }
+    // Drain + grace-extend. A complete frame from `addr` ends the slot. But the fast
+    // T_GAP idle alarm can fire WHILE the slave is still transmitting: under load the
+    // slave's reply burst stalls (its TX FIFO underruns while it runs an injected
+    // command), opening a >T_GAP gap mid-burst. The PHY drops no words here (FIFO not
+    // overrun) -- the rest simply hasn't been sent yet. So once a reply has STARTED
+    // (g_slot_first: at least one word heard, even just the leading preamble, which
+    // leaves the assembler IDLE), don't miss on a premature close: hold the slot open
+    // and re-drain until the frame completes or the T_WINDOW_MAX budget is spent. A
+    // slot that drew no word at all (true silent miss / dead node) breaks immediately.
+    // The no-stall case assembles on the first pass -> zero throughput cost.
+    for (;;) {
+        while (bus_phy_rx_pop(&w)) {
+            if (bus_asm_feed(&g_bc, w, rf) && rf->src == addr) { from_addr = true; handle_slot_frame(addr, rf); }
+        }
+        if (from_addr || !g_slot_first) break;                                   // complete, or no reply started
+        if ((uint32_t)(time_us_32() - g_slot_poll_us) >= T_WINDOW_MAX_US) break; // anti-babble budget spent
+        hardware_alarm_set_target(g_gap_alarm, make_timeout_time_us(T_RESP_US)); // wait for the burst to resume
+        g_slot_active = true;
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(T_WINDOW_MAX_US / 1000u + 4u));
+        g_slot_active = false;
+        hardware_alarm_cancel(g_gap_alarm);
     }
-    if (!from_addr) return SLOT_NO_RESPONSE;
+    bool babble = (uint32_t)(time_us_32() - g_slot_poll_us) >= T_WINDOW_MAX_US;
+    if (!from_addr) {
+        if (g_slot_first) g_miss_partial++;   // a reply started but never completed (stall beyond the window / CRC)
+        else              g_miss_silent++;    // no word at all -> node absent/dead
+        return SLOT_NO_RESPONSE;
+    }
     return babble ? SLOT_BABBLE : SLOT_OK;
 }
 
