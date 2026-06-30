@@ -71,6 +71,19 @@ static volatile uint8_t g_il_clear_request = 0;
 
 void interlock_request_global_clear(void) { g_il_clear_request = 1; }
 
+// Latch-grace window (wired-OR support). For IL_GRACE_MS after a global clear or at
+// boot, the tick SUPPRESSES setting NEW latches (existing/warm latches keep driving,
+// so latch-survival is unaffected). On a self-sensing wired-OR line every node holds
+// the shared veto low once tripped; without a grace, a clear is undone the same tick
+// (the line is still low because the OTHER nodes haven't released yet). The grace lets
+// all nodes drop their latch + release their output together, the line rises on the
+// pull-ups, and the next eval is OK — so a coordinated "clear all" actually resets the
+// chain. It also stops a boot/wiring transient on the shared line from false-latching.
+#define IL_GRACE_MS  250u
+static uint32_t g_il_grace_until_ms = 0;
+static bool il_in_grace(void) { return (int32_t)(g_il_grace_until_ms - board_millis()) > 0; }
+void interlock_begin_grace(void) { g_il_grace_until_ms = board_millis() + IL_GRACE_MS; }
+
 // ---------------------------------------------------------------------------
 // Status buffer (slice 5). Rebuilt at the end of every interlock_tick_all()
 // run. Lives in .data — does NOT need to survive WDT (host can re-poll the
@@ -687,6 +700,7 @@ void interlock_tick_all(void) {
         g_il_clear_request = 0;
         for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++)
             g_interlock_persist.slots[slot].latched = 0;
+        interlock_begin_grace();   // wired-OR: hold off re-latch so all nodes can release together
     }
 
     // Phase 1 — evaluate. Dispatch by role mode:
@@ -717,11 +731,16 @@ void interlock_tick_all(void) {
     // sticky latch; the latch only clears via Phase 0 (global clear) when the
     // condition has actually recovered. So once tripped, a slot keeps vetoing
     // even after its input recovers, until an explicit clear.
-    for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
-        interlock_slot_persist_t* sp = &g_interlock_persist.slots[slot];
-        if (sp->state != INTERLOCK_SLOT_ARMED) continue;
-        if (g_interlock_persist.inst[slot].tf_state == (uint8_t)IL_TF_FALSE)
-            sp->latched = 1;
+    // During the grace window, suppress setting NEW latches (existing latches keep
+    // driving in Phase 2 — latch-survival intact). This is what lets a wired-OR chain
+    // clear: all nodes drop+hold-off, the line rises, the next eval is OK.
+    if (!il_in_grace()) {
+        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
+            interlock_slot_persist_t* sp = &g_interlock_persist.slots[slot];
+            if (sp->state != INTERLOCK_SLOT_ARMED) continue;
+            if (g_interlock_persist.inst[slot].tf_state == (uint8_t)IL_TF_FALSE)
+                sp->latched = 1;
+        }
     }
 
     // Phase 2 — drive outputs. The veto is the union (OR) of every ARMED slot's

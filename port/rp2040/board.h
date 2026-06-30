@@ -27,10 +27,11 @@
 // --- interlock (Thread 2 owns both pins; the ilcf DSL / hwio must not reassign) -
 // GP0 = hard VETO output (fail-safe). GP1 = the dedicated interlock INPUT with the
 // INTERNAL PULL-UP enabled, so the SAFE state is HIGH; a device that pulls GP1 LOW
-// trips the interlock. GP0 is an OPEN-DRAIN wired-OR veto: OK = released (hi-Z; an
-// EXTERNAL pull-up holds the shared line HIGH), trip = driven LOW. Many nodes share
-// the GP0 line; any one tripping pulls it low. Built-in slot-0 DSL:
-//   gp1il;cfg[(gp1):in,up,(gp0):oc];watch[gp1:1];out_ok[gp0:1];out_err[gp0:0]
+// trips the interlock. GP0 is an OPEN-DRAIN wired-OR veto with the INTERNAL pull-up
+// (oc:up): OK = released (hi-Z, the internal pull-up holds the shared line HIGH; many
+// nodes' pull-ups parallel — no external resistor needed), trip = driven LOW. Many
+// nodes share the GP0 line; any one tripping pulls it low. Built-in slot-0 DSL:
+//   gp1il;cfg[(gp1):in,up,(gp0):oc,up];watch[gp1:1];watch[_nodesdead:0];out_ok[gp0:1];out_err[gp0:0]
 #define INTERLOCK_VETO_PIN 0u        // GP0 (pin 1): interlock hard veto (GPIO, fail-safe)
 #define INTERLOCK_IN_PIN   1u        // GP1 (pin 2): interlock input (int. pull-up, ACTIVE-LOW)
 

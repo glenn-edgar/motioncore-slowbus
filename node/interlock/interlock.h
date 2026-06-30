@@ -413,6 +413,12 @@ void     interlock_set_slot_tf(uint8_t slot, il_tf_state_t tf);
 // path. Returns immediately; the clear takes effect on the following tick.
 void     interlock_request_global_clear(void);
 
+// Start a latch-grace window (IL_GRACE_MS): suppress setting NEW latches while it runs
+// (existing latches keep driving). Call at boot so a wired-OR shared veto line settling
+// high doesn't false-latch; the tick also calls it internally after a global clear so a
+// coordinated "clear all" can reset a self-holding wired-OR chain.
+void     interlock_begin_grace(void);
+
 // Mark slot EMPTY. No-op if already EMPTY. Releases all HAL pin claims
 // belonging to this slot.
 uint8_t  interlock_disarm_slot(uint8_t slot);
