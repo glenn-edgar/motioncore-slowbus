@@ -47,12 +47,16 @@
 #define ENC_PIN_B          7u        // GP7  (pin 10)
 #define ENC_PIN_Z          8u        // GP8  (pin 11)  index/home pulse
 
-// --- 20 kHz PWM (drives the ADC center-capture timing) ----------------------
-#define PWM_20K_PIN        10u       // GP10 (pin 14), PWM slice 5 channel A
+// --- 20 kHz PWM (drives the ADC center-capture timing) — RELOCATED off GP10 --
+// GP10/11 are the BASE async-I²C bus (see port/rp2040/board.h); leave them free so
+// a node carries the base bench I²C. The PWM slice/channel are derived from the pin.
+#define PWM_20K_PIN        21u       // GP21 (pin 27)  [was GP10]
 #define PWM_20K_HZ         20000u
 
-// --- I2C — single bus (i2c0, GP12/13 = header pins 16/17) -------------------
-#define I2C_PIN_SDA        12u       // i2c0 SDA, GP12 (pin 16)
+// --- I2C — base layout (the variant keeps the base's two-bus map) ------------
+// i2c0 GP12/13 = the base POLLED bus; the base ASYNC bus is i2c1 on GP10/11 (now
+// free here). vib_node uses neither today; defined to match the base pin map.
+#define I2C_PIN_SDA        12u       // i2c0 SDA, GP12 (pin 16)  [base POLLED bus]
 #define I2C_PIN_SCL        13u       // i2c0 SCL, GP13 (pin 17)
 #define I2C_INST           i2c0
 
@@ -71,7 +75,9 @@
 #define ADC_PIN_CH2        28u       // ADC2, GP28 (header pin 34)
 #define ADC_CH_COUNT       3u
 
-// Spare/expansion GPIO: GP5, GP9, GP11, GP14, GP21, GP22 (header pins 7/12/15/19/27/29).
+// Spare/expansion GPIO: GP5, GP9, GP14, GP22 (header pins 7/12/19/29).
+// (GP10/11 = base async-I²C bus; GP12/13 = base polled-I²C; GP21 = 20 kHz PWM.)
+// Base alignment: GP0/GP1 interlock, GP15/16 RS-485, GP22 reserved as the base PWM-test pin.
 
 uint32_t board_millis(void);   // ms since boot (used by the scheduler)
 void     board_init(void);

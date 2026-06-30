@@ -1,15 +1,15 @@
 // ============================================================================
-// board.h — RP2040 / Pico W board glue + pin map shared by the port layer.
+// board.h — THE BASE board / pin map (Pico W AND Pico 2 W).
 //
-// One bus, one tree. Bus speed and BC-master/slave role come from the flashed
-// `idnt` config (idnt.sp / idnt.vr), read at boot — so the old GP0/GP1 boot
-// straps are RETIRED and GP0/GP1 are now free (spare/expansion).
+// This is the COMMON base model: the `bus_controller` image uses this map on BOTH
+// the RP2040 (Pico W) and the RP2350 (Pico 2 W) — they share the same physical
+// pinout (see CMakeLists BC_INC). RP2350 *variations* (motion/vibration: encoder,
+// SPI, 20 kHz center-capture ADC) live in port/rp2350/board.h and layer on top of
+// the spare pins; derivative builds may remap freely.
 //
-// "pico1" role: GPIO interface + I2C manager. Reduced HIL set vs. the old map —
-// NO SPI, TWO I2C (polled + async), ONE HIL UART, plus an 8-pin contiguous GPIO
-// block and the 3-channel ADC analog spine. PWM + quadrature were dropped to the
-// Pico2 (RP2350). Header exposes GP0-GP22 + GP26/27/28; GP23/24/25/29 are
-// CYW43-internal. See docs/README.md for the physical two-side layout.
+// Bus speed and BC-master/slave role come from the flashed `idnt` config
+// (idnt.sp / idnt.vr), read at boot. Header exposes GP0-GP22 + GP26/27/28;
+// GP23/24/25/29 are CYW43-internal (WiFi). See docs/README.md for the layout.
 // ============================================================================
 #pragma once
 
@@ -24,10 +24,15 @@
 
 #define BUS_DEFAULT_BAUD   115200u   // fall-through default; idnt.sp selects the speed
 
-// GP0/GP1 (header pins 1/2): freed when role/speed moved to the idnt config.
-// GP0 = the interlock HARD VETO output (reserved — Thread 2 drives it; the ilcf
-// DSL / hwio must not assign it elsewhere). GP1 stays spare/expansion.
+// --- interlock (Thread 2 owns both pins; the ilcf DSL / hwio must not reassign) -
+// GP0 = hard VETO output (fail-safe). GP1 = the dedicated interlock INPUT with the
+// INTERNAL PULL-UP enabled, so the SAFE state is HIGH; a device that pulls GP1 LOW
+// trips the interlock. GP0 is an OPEN-DRAIN wired-OR veto: OK = released (hi-Z; an
+// EXTERNAL pull-up holds the shared line HIGH), trip = driven LOW. Many nodes share
+// the GP0 line; any one tripping pulls it low. Built-in slot-0 DSL:
+//   gp1il;cfg[(gp1):in,up,(gp0):oc];watch[gp1:1];out_ok[gp0:1];out_err[gp0:0]
 #define INTERLOCK_VETO_PIN 0u        // GP0 (pin 1): interlock hard veto (GPIO, fail-safe)
+#define INTERLOCK_IN_PIN   1u        // GP1 (pin 2): interlock input (int. pull-up, ACTIVE-LOW)
 
 // --- HIL GPIO block (8 pins, contiguous GP2..GP9 = header pins 4..12) -------
 // The flexible HIL block — today GPIO / servo-bank / pulse-count, and MAY gain
@@ -45,35 +50,33 @@
 #define HIL_PIN_GPIO7      9u
 
 // --- I2C — TWO buses (split for safety; see docs/three-thread-design.md) -----
-// ASYNC bus (i2c1, GP10/11): bench + chain-tree one-off read/write requests.
-// (HIL_* names kept — the HIL I2C commands already target this bus.)
-#define HIL_PIN_I2C_SDA    10u       // i2c1 SDA, GP10 (pin 14)   [ASYNC bus]
+// ASYNC bus (i2c1, GP10/11 = pins 14/15): bench + chain-tree one-off read/write
+// requests. (HIL_* names kept — the HIL I2C commands already target this bus.)
+#define HIL_PIN_I2C_SDA    10u       // i2c1 SDA, GP10 (pin 14)   [ASYNC / bench bus]
 #define HIL_PIN_I2C_SCL    11u       // i2c1 SCL, GP11 (pin 15)
 #define HIL_I2C_INST       i2c1
-// POLLED bus (i2c0, GP20/21): periodically-sampled devices (INA219, …) → the
-// shared mirror that feeds the interlock. Isolated from async traffic so a sample
-// is never delayed past its freshness deadline. Device inventory = frozen config.
-// (Supersedes the opt-in I2C_SELFTEST fixture that used i2c0 on GP20/21.)
-#define I2C_POLLED_SDA     20u       // i2c0 SDA, GP20 (pin 26)   [POLLED bus]
-#define I2C_POLLED_SCL     21u       // i2c0 SCL, GP21 (pin 27)
+// POLLED bus (i2c0, GP12/13 = pins 16/17): periodically-sampled devices (INA219, …)
+// → the shared mirror that feeds the interlock. Isolated from async traffic so a
+// sample is never delayed past its freshness deadline. Device inventory = frozen config.
+#define I2C_POLLED_SDA     12u       // i2c0 SDA, GP12 (pin 16)   [POLLED bus]
+#define I2C_POLLED_SCL     13u       // i2c0 SCL, GP13 (pin 17)
 #define I2C_POLLED_INST    i2c0
 
-// --- UART — single HIL serial, uart0 (separate from the PIO RS-485 bus) ------
-#define HIL_PIN_UART_TX    12u       // uart0 TX, GP12 (pin 16)
-#define HIL_PIN_UART_RX    13u       // uart0 RX, GP13 (pin 17)
-#define HIL_UART_INST      uart0
-
-// PWM (GP14) and the quadrature decoder (GP17/18) were DROPPED from the RP2040
-// (2026-06-23) — those functions move to the Pico2 (RP2350). GP14/GP17/GP18 are
-// now free (spare/expansion).
+// --- PWM test output (GP22 = pin 29) ----------------------------------------
+// A settable-frequency/duty PWM, mainly a TEST stimulus: feed it (via an RC
+// low-pass for a DC level, or raw for an AC/known-frequency source) into an ADC
+// input, or loop it into a digital/counter input for a no-external-gear self-test.
+#define PWM_TEST_PIN       22u       // GP22 (pin 29)
+#define PWM_TEST_DEFAULT_HZ 1000u    // boot default; runtime-settable via bench command
 
 // ADC (analog inputs; one SAR, round-robin muxed, not simultaneous)
 #define HIL_PIN_ADC0       26u
 #define HIL_PIN_ADC1       27u
 #define HIL_PIN_ADC2       28u
 
-// Spare/expansion GPIO: GP1, GP14, GP17, GP18, GP19, GP22 (header pins 2/19/22/24/25/29).
-// (GP0 = interlock veto; GP20/21 = polled-I²C bus.)
+// Spare/expansion GPIO: GP14, GP17, GP18, GP19, GP20, GP21 (header pins 19/22/24/25/26/27).
+// (GP0/1 = interlock; GP10/11 = async-I²C; GP12/13 = polled-I²C; GP15/16 = bus; GP22 = PWM-test.)
+// NOTE: the old HIL UART (GP12/13) is retired — those pins are the polled-I²C bus now.
 
 uint32_t board_millis(void);   // ms since boot (used by the scheduler)
 void     board_init(void);

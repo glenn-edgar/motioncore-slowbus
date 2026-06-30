@@ -642,8 +642,16 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
                           (uint8_t)ps, (uint8_t)(ps>>8), (uint8_t)(ps>>16), (uint8_t)(ps>>24) };
         host_link_shell_reply(&g_hl, req_id, SHELL_OK, r, 12); break;
     }
-    default:
-        host_link_shell_reply(&g_hl, req_id, SHELL_UNKNOWN_CMD, NULL, 0); break;
+    default: {
+        // Chain to the shared node dispatcher (echo / GPIO / interlock status+clear), so
+        // the MASTER exposes the same operate commands over its USB shell that a slave
+        // answers over the bus — e.g. CMD_INTERLOCK_STATUS for its own Thread-2 interlock.
+        uint8_t out[64]; uint8_t outlen = 0;
+        uint8_t st = node_cmd_dispatch(cmd, args, alen, out, sizeof out, &outlen);
+        if (st != CMD_NOT_MINE) host_link_shell_reply(&g_hl, req_id, st, out, outlen);
+        else                    host_link_shell_reply(&g_hl, req_id, SHELL_UNKNOWN_CMD, NULL, 0);
+        break;
+    }
     }
 }
 
@@ -2355,10 +2363,12 @@ volatile uint16_t g_stack_hwm_bytes = 0;
 volatile uint32_t g_last_m2s_rx_ms  = 0;
 
 // ---- il_hal platform seam — bind the HAL to the frozen hwio roles + shared ADC.
-// Pins the interlock may bind: GP0 (veto output), GP2..GP9 (HIL block, per hwio
-// role), GP26/27/28 (ADC). Everything else is fixed-function → reserved.
+// Pins the interlock may bind: GP0 (veto output), GP1 (dedicated interlock input),
+// GP2..GP9 (HIL block, per hwio role), GP26/27/28 (ADC). Everything else is
+// fixed-function → reserved.
 bool il_plat_pin_reserved(uint8_t gpio) {
     if (gpio == INTERLOCK_VETO_PIN) return false;                            // GP0 veto
+    if (gpio == INTERLOCK_IN_PIN) return false;                              // GP1 interlock input
     if (gpio >= HIL_GPIO_BASE && gpio < HIL_GPIO_BASE + HIL_GPIO_COUNT) return false; // GP2..9
     if (gpio >= ADC0_GPIO && gpio < ADC0_GPIO + ADC_NCH) return false;       // GP26..28
     return true;
@@ -2370,7 +2380,9 @@ bool il_plat_pin_cap(uint8_t gpio, hal_pin_mode_t mode) {
             return g_hwio_role[gpio - HIL_GPIO_BASE] == HWIO_ROLE_OUTPUT;
         return false;
     }
-    // input modes: must be an hwio input-roled HIL pin (interlock reads, never reconfigures)
+    // input modes: the dedicated GP1 interlock input, or an hwio input-roled HIL pin
+    // (the interlock reads them; it never reconfigures an hwio-owned pin).
+    if (gpio == INTERLOCK_IN_PIN) return true;                               // GP1 dedicated interlock input
     if (gpio >= HIL_GPIO_BASE && gpio < HIL_GPIO_BASE + HIL_GPIO_COUNT) {
         uint8_t r = g_hwio_role[gpio - HIL_GPIO_BASE];
         return r == HWIO_ROLE_INPUT || r == HWIO_ROLE_INPUT_PULLUP || r == HWIO_ROLE_INPUT_PULLDOWN;
@@ -2398,7 +2410,8 @@ static void il_tick_task(void *arg) {
 // the fingerprint used to detect a config change across a warm reset.
 static uint32_t interlock_cfg_fingerprint(void) {
     uint32_t fp = 2166136261u;
-    for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
+    // Slot 0 is the built-in GP1 safety input (not config-derived); config = ilc1..ilc9.
+    for (uint8_t slot = 1; slot < INTERLOCK_MAX_SLOTS; slot++) {
         const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
         uint8_t buf[CFG_FILE_MAX]; uint32_t len;
         if (cfg_load(name, buf, sizeof buf, &len) != 0 || len == 0) continue;
@@ -2414,13 +2427,20 @@ static uint32_t interlock_cfg_fingerprint(void) {
 // reflashed interlock config takes effect WITHOUT a power cycle, while an unchanged
 // config + warm reset preserves the armed/latched safety state. Spawns the tick task.
 static void interlock_thread2_start(void) {
+    // GP1 dedicated interlock input HW: input + internal pull-up (safe = HIGH). The
+    // il HAL also claims it when slot 0 arms (cfg gp1:in,up); this is belt-and-suspenders
+    // so the line is held high the instant peripherals come up, before the first tick.
+    gpio_init(INTERLOCK_IN_PIN);
+    gpio_set_dir(INTERLOCK_IN_PIN, GPIO_IN);
+    gpio_pull_up(INTERLOCK_IN_PIN);
+
     interlock_warm_restore();
     uint32_t fp = interlock_cfg_fingerprint();
     if (fp != g_interlock_persist.cfg_fingerprint || interlock_armed_count() == 0) {
         for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++)
             interlock_disarm_slot(slot);                     // drop any stale armed set
         uint8_t armed = 0;
-        for (uint8_t slot = 0; slot < INTERLOCK_MAX_SLOTS; slot++) {
+        for (uint8_t slot = 1; slot < INTERLOCK_MAX_SLOTS; slot++) {   // slot 0 = built-in; config = ilc1..ilc9
             const char name[CFG_NAME_LEN] = { 'i', 'l', 'c', (char)('0' + slot) };
             uint8_t buf[CFG_FILE_MAX]; uint32_t len;
             if (cfg_load(name, buf, sizeof buf, &len) != 0 || len == 0) continue;  // absent → empty
@@ -2432,9 +2452,22 @@ static void interlock_thread2_start(void) {
                                ((uint32_t)err[0] << 8) | err[1];
         }
         g_interlock_persist.cfg_fingerprint = fp;
-        g_ilcf_rc = armed;                                   // 0..10 slots armed from config
+        g_ilcf_rc = armed;                                   // 0..9 config slots armed (slot 0 = built-in, below)
     } else {
         g_ilcf_rc = (int)interlock_armed_count();            // warm, same config → preserved
+    }
+    // Built-in GP1 safety interlock — slot 0, ALWAYS armed via the COMMON engine. The
+    // pull-up holds gp1 HIGH = OK; a device pulling gp1 LOW fails the watch -> trip. GP0
+    // is an OPEN-DRAIN (oc) wired-OR veto: OK -> released (hi-Z, an external pull-up holds
+    // the shared line HIGH), trip -> driven LOW. Many nodes share the line; any one trips
+    // -> line low. (Needs an external pull-up on the GP0 line; GP1 has the internal one.)
+    {
+        static const char gp1_il[] =
+            "gp1il;cfg[(gp1):in,up,(gp0):oc];watch[gp1:1];out_ok[gp0:1];out_err[gp0:0]";
+        uint8_t err[3];
+        uint8_t st = interlock_set_slot_dsl(0, gp1_il, (uint16_t)(sizeof gp1_il - 1u), err);
+        if (st != SHELL_OK && !g_il_armfail)                 // DIAG: capture a slot-0 arm failure
+            g_il_armfail = ((uint32_t)st << 16) | ((uint32_t)err[0] << 8) | err[1];
     }
     // Priority 4 — ABOVE the chain-tree engine (prio 3): safety preempts the
     // application, so engine load can't delay the veto. core1, with the ADC ISR.

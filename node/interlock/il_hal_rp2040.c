@@ -24,8 +24,15 @@ typedef struct {
     uint8_t ok_value;         // output mode only
     uint8_t err_value;        // output mode only
     uint8_t adc_channel;      // ADC mode only (0..2), else 0xFF
-    uint8_t reserved[3];
+    uint8_t open_drain;       // output mode: 0=push-pull, 1=oc, 2=oc:up
+    uint8_t reserved[2];
 } hal_pin_claim_record_t;
+
+// Apply a logical value to a claimed GPIO output. Push-pull drives the level
+// directly. Open-drain (oc / oc:up) realizes value 1 = RELEASE (hi-Z; an external —
+// or internal, for oc:up — pull-up takes the line high) and value 0 = DRIVE LOW.
+// This is what makes a wired-OR veto line work: many nodes share it, any one drives low.
+static void hal_pin_apply_output(uint8_t id, uint8_t value);
 
 static hal_pin_claim_record_t g_claims[HAL_PIN_TABLE_SIZE];
 static bool                   g_claims_initialised = false;
@@ -37,6 +44,7 @@ static void ensure_initialised(void) {
         g_claims[i].mode        = HAL_PIN_MODE_UNCLAIMED;
         g_claims[i].ok_value    = 0;
         g_claims[i].err_value   = 0;
+        g_claims[i].open_drain  = 0;
         g_claims[i].adc_channel = 0xFFu;
     }
     g_claims_initialised = true;
@@ -102,10 +110,11 @@ uint16_t hal_pin_read_adc(uint8_t phys_id) {
 }
 
 hal_pin_claim_status_t hal_pin_claim_output(uint8_t phys_id, uint8_t slot,
-                                            uint8_t ok_value, uint8_t err_value) {
+                                            uint8_t ok_value, uint8_t err_value,
+                                            uint8_t open_drain) {
     ensure_initialised();
     if (phys_id >= HAL_PIN_TABLE_SIZE) return HAL_PIN_CLAIM_NO_SUCH_PIN;
-    if (ok_value > 1u || err_value > 1u) return HAL_PIN_CLAIM_BAD_MODE;
+    if (ok_value > 1u || err_value > 1u || open_drain > 2u) return HAL_PIN_CLAIM_BAD_MODE;
     if (ok_value == err_value)           return HAL_PIN_CLAIM_VALUE_MISMATCH;
 
     if (il_plat_pin_reserved(phys_id)) return HAL_PIN_CLAIM_RESERVED;
@@ -115,21 +124,39 @@ hal_pin_claim_status_t hal_pin_claim_output(uint8_t phys_id, uint8_t slot,
 
     if (g_claims[phys_id].slot_mask != 0) {
         if (g_claims[phys_id].mode != HAL_PIN_MODE_GPIO_OUT) return HAL_PIN_CLAIM_TAKEN;
-        if (g_claims[phys_id].ok_value  != ok_value ||
-            g_claims[phys_id].err_value != err_value) return HAL_PIN_CLAIM_VALUE_MISMATCH;
-        g_claims[phys_id].slot_mask |= slot_bit;   // share; idempotent
+        if (g_claims[phys_id].ok_value   != ok_value ||
+            g_claims[phys_id].err_value  != err_value ||
+            g_claims[phys_id].open_drain != open_drain) return HAL_PIN_CLAIM_VALUE_MISMATCH;
+        g_claims[phys_id].slot_mask |= slot_bit;   // share; idempotent (wired-OR drive)
         return HAL_PIN_CLAIM_OK;
     }
 
     // First claim — the interlock OWNS its outputs (the veto): configure + drive OK.
     gpio_init(phys_id);
-    gpio_put(phys_id, ok_value);
-    gpio_set_dir(phys_id, true);
+    g_claims[phys_id].open_drain = open_drain;      // set before apply (apply reads it)
+    g_claims[phys_id].ok_value   = ok_value;
+    g_claims[phys_id].err_value  = err_value;
+    hal_pin_apply_output(phys_id, ok_value);        // initial state = OK (push-pull level, or oc release/drive)
     g_claims[phys_id].slot_mask = slot_bit;
     g_claims[phys_id].mode      = (uint8_t)HAL_PIN_MODE_GPIO_OUT;
-    g_claims[phys_id].ok_value  = ok_value;
-    g_claims[phys_id].err_value = err_value;
     return HAL_PIN_CLAIM_OK;
+}
+
+static void hal_pin_apply_output(uint8_t id, uint8_t value) {
+    const hal_pin_claim_record_t *c = &g_claims[id];
+    if (c->open_drain) {
+        if (value) {                                // RELEASE -> hi-Z, pull-up takes the line high
+            gpio_set_dir(id, false);
+            if (c->open_drain == 2u) gpio_pull_up(id);       // oc:up: internal pull-up
+            else                     gpio_disable_pulls(id); // oc:    external pull-up only
+        } else {                                    // DRIVE LOW (assert the wired-OR veto)
+            gpio_put(id, 0);
+            gpio_set_dir(id, true);
+        }
+    } else {                                        // push-pull: drive the level directly
+        gpio_put(id, value ? 1u : 0u);
+        gpio_set_dir(id, true);
+    }
 }
 
 void hal_pin_release_slot(uint8_t slot) {
@@ -142,12 +169,13 @@ void hal_pin_release_slot(uint8_t slot) {
             // Only outputs were reconfigured by the HAL; return them to OK, then
             // hi-Z. Inputs/ADC were never touched (hwio owns them) — leave as-is.
             if (g_claims[id].mode == (uint8_t)HAL_PIN_MODE_GPIO_OUT) {
-                gpio_put(id, g_claims[id].ok_value);
-                gpio_set_dir(id, false);
+                gpio_set_dir(id, false);        // release to hi-Z (safe; pull-up/downstream decides)
+                gpio_disable_pulls(id);
             }
             g_claims[id].mode        = HAL_PIN_MODE_UNCLAIMED;
             g_claims[id].ok_value    = 0;
             g_claims[id].err_value   = 0;
+            g_claims[id].open_drain  = 0;
             g_claims[id].adc_channel = 0xFFu;
         }
     }
@@ -195,6 +223,6 @@ void hal_pin_drive_outputs(il_slotmask_t veto_mask, il_slotmask_t managed_mask) 
         if (c->mode != (uint8_t)HAL_PIN_MODE_GPIO_OUT) continue;
         if ((c->slot_mask & managed_mask) == 0u) continue;        // unmanaged slot drives itself
         uint8_t val = (c->slot_mask & veto_mask) ? c->err_value : c->ok_value;
-        gpio_put(id, val ? 1u : 0u);
+        hal_pin_apply_output(id, val);   // push-pull level, or oc release(1)/drive-low(0)
     }
 }

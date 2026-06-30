@@ -435,7 +435,8 @@ static hal_pin_claim_status_t claim_inst_pins(uint8_t slot, const il_inst_t* ins
     for (uint8_t i = 0; i < inst->output_count; i++) {
         cs = hal_pin_claim_output(inst->outputs[i].phys_id, slot,
                                   inst->outputs[i].ok_value,
-                                  inst->outputs[i].err_value);
+                                  inst->outputs[i].err_value,
+                                  inst->outputs[i].open_drain);
         if (cs != HAL_PIN_CLAIM_OK) goto rollback;
     }
     return HAL_PIN_CLAIM_OK;

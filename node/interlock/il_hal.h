@@ -53,9 +53,12 @@ hal_pin_claim_status_t hal_pin_claim_adc(uint8_t phys_id, uint8_t slot,
                                          uint8_t oversample_exp, uint8_t sh_cyc);
 uint16_t               hal_pin_read_adc(uint8_t phys_id);
 
-// Output claim — shareable across slots iff (ok,err) match (OR-of-vetoes drive).
+// Output claim — shareable across slots iff (ok,err,open_drain) match (OR-of-vetoes
+// drive). open_drain: 0 = push-pull, 1 = oc (drive-low / hi-Z-release, external pull-up),
+// 2 = oc:up (oc + internal pull-up). For oc, value 1 = RELEASE (hi-Z), value 0 = DRIVE LOW.
 hal_pin_claim_status_t hal_pin_claim_output(uint8_t phys_id, uint8_t slot,
-                                            uint8_t ok_value, uint8_t err_value);
+                                            uint8_t ok_value, uint8_t err_value,
+                                            uint8_t open_drain);
 
 void           hal_pin_release_slot(uint8_t slot);
 il_slotmask_t  hal_pin_get_owners(uint8_t phys_id);
