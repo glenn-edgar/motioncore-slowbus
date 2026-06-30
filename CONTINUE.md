@@ -2,13 +2,75 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-06-29 (EOD)**. Branch: **`master`** (clean + pushed).
-**★RESUME HERE: DUAL-TRANSPORT COLLAPSE + multi-WiFi-cred + Python-free build are ALL DONE & HW-verified
-(2026-06-29). No committed task in flight.** Next candidates (your pick): wire SPI/I2C/motor I/O subsystems
-onto the common platform ([[pico-node-architecture]]); the SAMD21 test-harness→LuaJIT port (deferred — needs
-a SAMD21 chip on the bench, being handled in another window); or fold the host/chain-flow command path
-deeper. See the "2026-06-29 EOD" section directly below for what shipped today + the bench state. Older
-sections (2026-06-28, PICO 2 W PORT) are history/reference.★
+Last updated **2026-06-29 (grace-redrain fix)**. Branch: **`master`** (clean; commit `f1c3045`).
+**★RESUME HERE: LOW-BAUD MISS RATE ROOT-CAUSED + FIXED (grace-redrain, `f1c3045`), HW-verified across the
+full matrix. No task in flight.** Earlier today: DUAL-TRANSPORT COLLAPSE + multi-WiFi-cred + Python-free
+build (all DONE & HW-verified). **TOMORROW'S PLAN is the section directly below** — finish interlock + analog
+bench commands on the base RP2040/RP2350, then polled I2C. See the "grace-redrain" section for today's fix,
+then the "2026-06-29 EOD" section. Older sections are history/reference.★
+
+---
+
+## ★ TOMORROW'S PLAN (next session) ★
+
+In order:
+1. **Finish the INTERLOCK on the base RP2040 + RP2350** — the common interlock engine on the bus_controller
+   node (DSL parse + arm + evaluate + output drive). The COMMON interlock engine was integrated/HW-verified
+   on the Pico 2 W vib_node line ([[pico2w-port]]); bring it to completion on the BASE bus_controller for both
+   chips. (Deferred pieces noted in [[pico2w-port]]: `il_parse_adc` ADC-stream interlock; spectral interlock.)
+2. **Finish the ANALOG BENCH COMMANDS on the base RP2040 + RP2350** — the ADC/DAC bench command surface
+   (read/stream/measure) wired up + HW-verified on both base chips, parity with the existing host-side bench.
+3. **THEN: polled I2C** — bring up the Pico-master polled-I2C front-end (the long-planned next step after the
+   RS-485 bus work; mirrors the SAMD21 USB→I2C bridge driver lib [[drivers-library]] / [[samd21-next-steps]]
+   "NEXT: I2C (Pico master)"). Bind `i2c_bus_t` in firmware behind the bus command surface.
+
+Bench is ready: E661 (RP2040) master + 8DC2 (RP2350) slave @460k on the fix firmware (see bench state below).
+
+---
+
+## ★ 2026-06-29 (LATE) — LOW-BAUD MISS RATE: ROOT-CAUSE + GRACE-REDRAIN FIX (`f1c3045`) ★
+
+**Symptom:** the @230k poll miss rate was ~40× the @460k rate (e.g. RP2040-master+RP2350-slave: 0.0035%→
+0.145%). Lowering baud should be SAFER (longer per-bit margin), so this was backwards.
+
+**Disproved the easy theories first:** (1) the PIO clkdiv (`clkdiv = sys_clk/(8·baud)`, port/rp2040/
+rs485.pio) is exact at every chip×baud (≤0.0064% off, even FINER at 230k) and RX-sampling geometry is
+identical in PIO cycles → NOT the PHY. (2) A pure **two-RP2350** loop still showed the jump (@460k 0.0004%
+→ @230k 0.0343%) → NOT RP2040-specific, NOT a wire issue. (3) An earlier attempt to make T_RESP/T_GAP
+bit-time-relative made it WORSE (lower throughput, misses unchanged) — reverted, never committed.
+
+**Root cause (found via temp POLL_STATS diag counters — miss SILENT vs PARTIAL + FIFO-overflow):**
+misses appear ONLY under WiFi+inject load (230k+USB free-run = 0/186k), and are **100% PARTIAL** (a reply
+STARTED but never completed), **0 SILENT**, with **RX-FIFO-overflow = 0** (master drops no words). So the
+poll always lands and the slave always starts replying — but under inject load the **SLAVE underruns its
+TX FIFO mid-reply** (busy running the injected command), opening a **~700µs gap on the wire**. At 230k the
+reply burst spans 2× the wall-time, so it overlaps that stall far more often → the master's 300µs idle-gap
+alarm closed the slot MID-FRAME → PARTIAL miss. Widening T_GAP 300→2000µs killed the misses but HALVED
+throughput (every slot pays the longer end-of-burst tail) — so the blunt knob is the wrong fix.
+
+**Fix (`f1c3045`, app/bus_controller/main.c `bus_poll_slot`, master-side, baud-independent):** GRACE-REDRAIN
+— once a reply has STARTED (`g_slot_first`; even just the leading 0xFF preamble, which leaves the assembler
+IDLE — so the trigger is `g_slot_first`, NOT assembler-mid-frame, which was a first wrong cut), HOLD the slot
+open and re-drain until the frame completes or the T_WINDOW_MAX anti-babble budget is spent, instead of
+missing on a premature gap-close. No-stall slots assemble on the first pass → **ZERO throughput cost**; a
+slot with no word at all (dead node) still misses promptly. Also kept the **SILENT/PARTIAL miss split** as
+permanent POLL_STATS observability for low-baud/long-bus monitoring → **POLL_STATS is now 100 B** (b93-96
+miss SILENT = node absent, b97-100 miss PARTIAL = reply stalled). Reverted two dead-ends along the way:
+raising PIO0_IRQ_0 priority (no effect — not IRQ-level contention) and the blanket T_GAP/T_RESP scaling.
+
+**HW-verified (2×Pico 2 W bench + RP2040), all under WiFi+inject load:**
+| config | baud | pre-fix miss | post-fix miss |
+|---|---|---|---|
+| 2× RP2350 | 230k | 0.0343% | **0 / 424,820 (10 min)** |
+| RP2040 master + RP2350 slave | 460k | 0.0035% | **0 / 243,296** |
+| RP2040 master + RP2350 slave | 230k | **0.145%** | **0 / 333,964 (10 min)** ← original worst case |
+Full poll rate retained in every case. Outcome: the bus can now drop to lower baud (longer cable / marginal
+transceivers) with NO miss penalty, on either MCU as master. Details in memory [[rp2040-vs-rp2350-bus-bench]].
+
+**★BENCH STATE (restored to 460k production):** E661 (RP2040) = MASTER addr 0 @460k, 3-cred WiFi-roaming;
+8DC2 (RP2350, the 2nd Pico 2 W) = SLAVE 0x09 @460k ALIVE; both on the fix firmware. 91D7 (RP2350) = 460k
+slave config but currently UNPLUGGED (user swapped it out for E661 to retest the 2040 as master). Nothing
+left at 230k. zenoh router + agent containers up. Repo on master, clean.
 
 ---
 
@@ -51,9 +113,9 @@ variant_supported), SLAVE vr=3 addr=9. cfg_image flags: --uid --chip(0=rp2040/1=
 --speed --flash-size(2097152/4194304) --family(rp2040/rp2350) --slvr "9:3:2" --ssid/--pass(×N) --agent-ip
 --agent-port. Creds from ~/wifi.data (3 ssid/pass pairs; agent 192.168.1.66:47447 — NEVER print/commit).
 
-**★BENCH STATE (restored after the bench): E661 (RP2040) = MASTER, dual-transport, 3-cred WiFi-roaming
-(default WiFi; open picolink on /dev/ttyACM1 → USB preempts). 91D7 (RP2350) = SLAVE 0x09 ALIVE @460800.**
-zenoh router + pub/sub agent containers up. Repo on master, clean.
+**★BENCH STATE (as of this EOD — SUPERSEDED, see the grace-redrain section above for the current bench):
+E661 (RP2040) = MASTER, dual-transport, 3-cred WiFi-roaming (default WiFi; open picolink on /dev/ttyACM1 →
+USB preempts). 91D7 (RP2350) = SLAVE 0x09 ALIVE @460800.** zenoh router + pub/sub agent containers up.
 
 ---
 
