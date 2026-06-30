@@ -2,29 +2,47 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-06-29 (grace-redrain fix)**. Branch: **`master`** (clean; commit `f1c3045`).
-**★RESUME HERE: LOW-BAUD MISS RATE ROOT-CAUSED + FIXED (grace-redrain, `f1c3045`), HW-verified across the
-full matrix. No task in flight.** Earlier today: DUAL-TRANSPORT COLLAPSE + multi-WiFi-cred + Python-free
-build (all DONE & HW-verified). **TOMORROW'S PLAN is the section directly below** — finish interlock + analog
-bench commands on the base RP2040/RP2350, then polled I2C. See the "grace-redrain" section for today's fix,
-then the "2026-06-29 EOD" section. Older sections are history/reference.★
+Last updated **2026-06-30 (base interlock complete)**. Branch: **`master`** (clean; commit `9924c37`).
+**★RESUME HERE: BASE INTERLOCK DONE + HW-verified on TWO nodes (2026-06-30) — GP1 safety-in + open-drain
+oc:up wired-OR GP0 veto, clear/boot grace, #1 dead-node→veto, gp1 debounce. 6 commits 885b46f→9924c37; full
+detail in memory [[interlock-base-wired-or]]. No task in flight.** NEXT = the PLAN section below: ADC bench
+commands on the base chips (+ interlock #2/#3), then polled I2C. Prior days: grace-redrain low-baud fix
+(`f1c3045`); dual-transport + multi-cred + python-free build. Older sections are history/reference.★
 
 ---
 
-## ★ TOMORROW'S PLAN (next session) ★
+## ★ 2026-06-30 — BASE INTERLOCK COMPLETE (wired-OR safety chain) ★
 
-In order:
-1. **Finish the INTERLOCK on the base RP2040 + RP2350** — the common interlock engine on the bus_controller
-   node (DSL parse + arm + evaluate + output drive). The COMMON interlock engine was integrated/HW-verified
-   on the Pico 2 W vib_node line ([[pico2w-port]]); bring it to completion on the BASE bus_controller for both
-   chips. (Deferred pieces noted in [[pico2w-port]]: `il_parse_adc` ADC-stream interlock; spectral interlock.)
-2. **Finish the ANALOG BENCH COMMANDS on the base RP2040 + RP2350** — the ADC/DAC bench command surface
-   (read/stream/measure) wired up + HW-verified on both base chips, parity with the existing host-side bench.
-3. **THEN: polled I2C** — bring up the Pico-master polled-I2C front-end (the long-planned next step after the
-   RS-485 bus work; mirrors the SAMD21 USB→I2C bridge driver lib [[drivers-library]] / [[samd21-next-steps]]
-   "NEXT: I2C (Pico master)"). Bind `i2c_bus_t` in firmware behind the bus command surface.
+Brought the COMMON interlock engine to completion on the base `bus_controller` (RP2040 + RP2350), HW-verified
+across **two nodes on one shared wired-OR line** (E661 RP2040 master + CAF4 RP2350 slave-9 @460k). Six commits:
+- `885b46f` base GP1 safety input + open-drain GP0 veto + master exposes its own interlock over USB
+- `bbec0f9` latched trip survives a warm reset
+- `85820cc` **#1** dead bus node → veto (supervised liveness; IL_VIRT_NODES_DEAD / `_nodesdead`)
+- `f000afc` wired-OR: GP0 **oc:up** (internal pull-up, no external resistor) + clear/boot **grace window**
+- `9924c37` **gp1 debounce_4** — ride through a node-reboot transient on the shared line
 
-Bench is ready: E661 (RP2040) master + 8DC2 (RP2350) slave @460k on the fix firmware (see bench state below).
+Model: GP0 = open-drain oc:up wired-OR veto; GP1 = active-low pulled-up sense (debounce_4). Built-in **slot 0**
+(always armed) = `gp1il;cfg[(gp1):in,up,debounce_4,(gp0):oc,up];watch[gp1:1];watch[_nodesdead:0];out_ok[gp0:1];out_err[gp0:0]`;
+config interlocks = ilc1..ilc9. Wiring: all nodes' GP0+GP1 on ONE wire (internal pull-ups, common GND).
+Verified: propagation, self-hold (pin-level GP0=0/line=0 latched), coordinated clear-all (grace), latch
+survives warm reset, dead-node→veto, node-reboot no longer false-trips the chain. CMD_INTERLOCK_STATUS 0x0211
+/ CLEAR 0x0210; slave read via master bus-relay. Details: memory [[interlock-base-wired-or]].
+
+---
+
+## ★ PLAN (next session) ★
+
+1. **ADC bench commands on the base RP2040 + RP2350** — the ADC read/stream/measure command surface, plus the
+   GP22 settable-freq/duty **PWM test source** (board.h has PWM_TEST_PIN); parity with the host-side bench.
+   NB: RP2040 = generic 3-ch analog spine; RP2350 base ADC is generic too (center-capture is a vib variant).
+2. **Interlock #2 + #3** (pair with ADC): #2 pull-up-alive line self-test; #3 **supervised analog loop**
+   (open/short/trip discrimination via an ADC channel + EOL resistor) — the genuinely cut-line-fail-safe option.
+3. **THEN polled I2C** — Pico-master polled-I2C front-end (base I2C: polled i2c0 GP12/13, async i2c1 GP10/11);
+   mirrors the SAMD21 USB→I2C bridge lib [[drivers-library]] / [[samd21-next-steps]]. Bind `i2c_bus_t`.
+
+**★BENCH STATE:** E661 (RP2040) = MASTER + CAF4 (RP2350) = SLAVE 0x09 @460k; wired-OR interlock line = one
+jumper across both nodes' GP0+GP1 (internal pull-ups, no external resistor), common GND. (8DC2/91D7 are the
+other RP2350s, currently unplugged.) zenoh router+agent up. Repo on master, clean.
 
 ---
 
