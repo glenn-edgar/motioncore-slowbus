@@ -303,6 +303,10 @@ static volatile uint32_t g_cycle_pace_us;              // 0=free-run; else hold 
 static volatile uint32_t g_dead_slowpoll_div = 200;    // probe one dead node every N cycles (200 @200Hz ~= 1Hz)
 static volatile uint32_t g_dead_revives;               // dead->alive resurrections (stat)
 static volatile uint8_t  g_nodes_dead;                  // current dead-node count (cycle-maintained; POLL_STATS reads it)
+// #1: dead-node -> veto. The cycle mirrors g_nodes_dead here; interlock.c reads it via
+// IL_VIRT_NODES_DEAD so a lost node trips the (wired-OR) GP0 veto. Non-static (extern'd by
+// interlock.c). Master-only (a slave never polls -> stays 0).
+volatile uint8_t         g_il_nodes_dead = 0;
 static volatile bool     g_nodes_dirty;                 // roster changed at runtime -> cycle rebuilds g_nodes
 static volatile uint32_t g_nodes_rebuilds;              // count of runtime node-table rebuilds (stat)
 static uint8_t  g_dead_cursor;                          // round-robin index over dead nodes
@@ -1384,7 +1388,7 @@ static void bus_run_cycle(void) {
             break;                          // at most one dead probe per interval
         }
     }
-    { uint8_t nd = 0; for (uint8_t i = 0; i < g_nodes_n; i++) if (g_nodes[i].dead) nd++; g_nodes_dead = nd; }
+    { uint8_t nd = 0; for (uint8_t i = 0; i < g_nodes_n; i++) if (g_nodes[i].dead) nd++; g_nodes_dead = nd; g_il_nodes_dead = nd; }  // #1: feed the dead-node->veto virtual
     // (2b) deferred pool-exhaustion notify (§17 step5): producers only bump the
     // counter -- emit the rate-limited zenoh notify HERE, where no outer g_lock is
     // held, so we never re-enter the uplink thread's mutex (see bus_msg_send).
@@ -2466,13 +2470,18 @@ static void interlock_thread2_start(void) {
     // latched trip SURVIVES a warm (watchdog/glitch) reset. A cold boot (slots wiped) or a
     // changed built-in DSL re-arms fresh (which intentionally drops the old latch).
     {
+        // watch[gp1:1] AND watch[_nodesdead:0]: OK requires GP1 high AND zero dead bus
+        // nodes (#1). Either a GP1 trip OR a node going dead drives the GP0 wired-OR veto.
+        // On a slave _nodesdead is always 0, so the clause is a no-op there.
         static const char gp1_il[] =
-            "gp1il;cfg[(gp1):in,up,(gp0):oc];watch[gp1:1];out_ok[gp0:1];out_err[gp0:0]";
+            "gp1il;cfg[(gp1):in,up,(gp0):oc];watch[gp1:1];watch[_nodesdead:0];out_ok[gp0:1];out_err[gp0:0]";
         const uint16_t gl = (uint16_t)(sizeof gp1_il - 1u);
         bool preserved = (g_interlock_persist.slots[0].state == INTERLOCK_SLOT_ARMED) &&
                          (g_interlock_persist.dsl_len[0] == gl) &&
                          (memcmp(g_interlock_persist.dsl_text[0], gp1_il, gl) == 0);
         if (!preserved) {
+            interlock_disarm_slot(0);    // a warm_restore may hold the OLD built-in here; drop it so the
+                                         // re-arm to the current DSL takes (set_slot_dsl rejects an ARMED slot)
             uint8_t err[3];
             uint8_t st = interlock_set_slot_dsl(0, gp1_il, gl, err);
             if (st != SHELL_OK && !g_il_armfail)             // DIAG: capture a slot-0 arm failure

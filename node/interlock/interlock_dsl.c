@@ -182,6 +182,7 @@ static const il_virt_pin_t k_virt_pins[] = {
     { "_t_since_m2s", IL_VIRT_T_SINCE_M2S },
     { "_uptime",      IL_VIRT_UPTIME      },
     { "_stack_hwm",   IL_VIRT_STACK_HWM   },
+    { "_nodesdead",   IL_VIRT_NODES_DEAD  },
 };
 static const uint8_t k_virt_pin_count = sizeof(k_virt_pins) / sizeof(k_virt_pins[0]);
 

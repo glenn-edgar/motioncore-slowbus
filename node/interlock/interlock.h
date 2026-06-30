@@ -81,6 +81,7 @@ typedef enum {
 #define IL_VIRT_T_SINCE_M2S  0xF0u   // seconds since last received m2s frame
 #define IL_VIRT_UPTIME       0xF1u   // seconds since boot
 #define IL_VIRT_STACK_HWM    0xF2u   // peak stack depth in bytes
+#define IL_VIRT_NODES_DEAD   0xF3u   // master: # enabled bus nodes currently DEAD (0 on a slave)
 
 typedef enum {
     IL_OP_EQ = 0,

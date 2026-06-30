@@ -32,6 +32,10 @@
 extern volatile uint16_t g_stack_hwm_bytes;
 extern uint32_t          board_millis(void);
 extern volatile uint32_t g_last_m2s_rx_ms;
+// Master-only: count of enabled bus nodes currently marked DEAD (poll-miss). The
+// master's cycle maintains it; a slave never polls, so it stays 0 there. Feeds the
+// IL_VIRT_NODES_DEAD virtual input -> a dead node trips the (wired-OR) veto.
+extern volatile uint8_t  g_il_nodes_dead;
 
 // ---------------------------------------------------------------------------
 // Persistent state — lives in the .noinit linker section so RAM contents
@@ -124,6 +128,8 @@ static uint16_t read_virtual_input(uint8_t virt_id) {
         }
         case IL_VIRT_STACK_HWM:
             return g_stack_hwm_bytes;
+        case IL_VIRT_NODES_DEAD:
+            return g_il_nodes_dead;
         default:
             return 0;
     }
