@@ -2155,44 +2155,10 @@ static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
         // by hwio_apply(). Runtime reconfiguration is no longer permitted — operate
         // the pins, don't reconfigure them. Always rejected.
         hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true;
-    // CMD_GPIO_WRITE / CMD_GPIO_READ are handled earlier by the unified
-    // node_cmd_dispatch (shared with the slave) — not here.
-    case CMD_PULSE_READ: {
-        uint8_t res[HIL_GPIO_COUNT * 4]; uint8_t n = 0;
-        irq_set_enabled(ADC_IRQ_FIFO, false);                     // coherent 32-bit snapshot
-        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
-            uint32_t v = g_pulse_count[i];
-            res[n++] = (uint8_t)v;         res[n++] = (uint8_t)(v >> 8);
-            res[n++] = (uint8_t)(v >> 16); res[n++] = (uint8_t)(v >> 24);
-        }
-        irq_set_enabled(ADC_IRQ_FIFO, true);
-        hil_reply(c->req_id, SHELL_OK, res, n); return true;
-    }
-    case CMD_PULSE_CLEAR: {
-        uint8_t mask = (c->alen >= 1) ? c->args[0] : 0xFFu;
-        irq_set_enabled(ADC_IRQ_FIFO, false);
-        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
-            if (mask & (1u << i)) g_pulse_count[i] = 0;
-        irq_set_enabled(ADC_IRQ_FIFO, true);
-        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
-    }
-    case CMD_SERVO_SET_ALL: {
-        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        uint8_t cnt = (uint8_t)(c->alen / 2);
-        if (cnt > g_servo_n) cnt = g_servo_n;            // operate only the hwio-armed servos
-        for (uint8_t i = 0; i < cnt; i++) {              // clamp each to the RC servo range
-            uint16_t us = (uint16_t)c->args[i*2] | ((uint16_t)c->args[i*2 + 1] << 8);
-            if (us < SERVO_MIN_US) us = SERVO_MIN_US;
-            if (us > SERVO_MAX_US) us = SERVO_MAX_US;
-            g_servo_us[i] = us;
-        }
-        servo_build();                                   // feeder picks up the new frame next cycle
-        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
-    }
-    case CMD_SERVO_STOP: {
-        servo_stop_all();
-        hil_reply(c->req_id, SHELL_OK, NULL, 0); return true;
-    }
+    // CMD_GPIO_WRITE / CMD_GPIO_READ / CMD_GPIO_ROLES / CMD_PULSE_READ / CMD_PULSE_CLEAR /
+    // CMD_SERVO_SET_ALL / CMD_SERVO_STOP are all handled by the unified node_cmd_dispatch
+    // (shared with the slave, so servo + pulse now work on any node over the bus) — the
+    // api-engine path tries node_cmd_dispatch first, so they never reach here.
     // CMD_PWM_SET / CMD_QUAD_READ / CMD_QUAD_CLEAR removed 2026-06-23 (moved to Pico2).
     case CMD_I2C_SCAN: {                              // -> i2c_service_task (async, off the engine)
         i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_SCAN };
@@ -2535,8 +2501,11 @@ void node_thread2_start(void) {
     adc_service_config();       // config only (core0, pre-scheduler); the ISR is
                                 // enabled + conversions started on core1 in
                                 // node_engine_task, so the FIFO can't outrun it.
-    hwio_apply(&g_hwio);
+    hwio_apply(&g_hwio);        // arms the servo bank (servo_set_n) if any SERVO roles
     interlock_thread2_start();
+    // Servo frame feeder — the master runs one in its bringup; the slave needs its own
+    // so SERVO_SET_ALL actually drives the PIO bank over the bus. Idles until g_servo_ready.
+    xTaskCreate(servo_feeder_task, "servo", configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL);
 }
 
 // Pack interlock status into out (<= cap bytes). Wire format v1:
@@ -2671,6 +2640,36 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         }
         *outlen = n; return SHELL_OK;
     }
+    case CMD_PULSE_READ: {         // PULSE_COUNT: running edge totals for GP2..GP9 -> [count u32]x8
+        if (cap < (uint8_t)(HIL_GPIO_COUNT * 4u)) return SHELL_BAD_ARGS;
+        uint8_t n = 0;
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
+            uint32_t v = g_pulse_count[i];       // volatile aligned u32 -> single-word atomic read
+            out[n++]=(uint8_t)v; out[n++]=(uint8_t)(v>>8); out[n++]=(uint8_t)(v>>16); out[n++]=(uint8_t)(v>>24);
+        }
+        *outlen = n; return SHELL_OK;
+    }
+    case CMD_PULSE_CLEAR: {        // PULSE_COUNT: [mask u8] bit i clears GP(2+i); default 0xFF = all
+        uint8_t mask = (alen >= 1) ? args[0] : 0xFFu;
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
+            if (mask & (1u << i)) g_pulse_count[i] = 0;
+        return SHELL_OK;
+    }
+    case CMD_SERVO_SET_ALL: {      // SERVO: [width_us u16 LE] x up to the hwio-armed servo count
+        if (alen < 2) return SHELL_BAD_ARGS;
+        uint8_t cnt = (uint8_t)(alen / 2);
+        if (cnt > g_servo_n) cnt = g_servo_n;            // operate only the armed servos
+        for (uint8_t i = 0; i < cnt; i++) {              // clamp each to the RC servo range
+            uint16_t us = (uint16_t)args[i*2] | ((uint16_t)args[i*2 + 1] << 8);
+            if (us < SERVO_MIN_US) us = SERVO_MIN_US;
+            if (us > SERVO_MAX_US) us = SERVO_MAX_US;
+            g_servo_us[i] = us;
+        }
+        servo_build();                                   // feeder picks up the new frame next cycle
+        return SHELL_OK;
+    }
+    case CMD_SERVO_STOP:           // SERVO: release the bank -> GP2.. back to GPIO input
+        servo_stop_all(); return SHELL_OK;
     default:
         return CMD_NOT_MINE;
     }
