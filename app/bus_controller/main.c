@@ -2133,11 +2133,15 @@ static void apply_pin_counter(uint8_t idx, uint8_t byte) {
     uint8_t pull = (uint8_t)((byte >> 1) & 0x03u), edge = (uint8_t)((byte >> 3) & 0x03u);
     gpio_init(pin); gpio_set_dir(pin, false);
     if (pull == 1u) gpio_pull_up(pin); else if (pull == 2u) gpio_pull_down(pin); else gpio_disable_pulls(pin);
-    irq_set_enabled(ADC_IRQ_FIFO, false);
+    // Coherent update vs the 1 kHz pulse sampler in the ADC ISR. Mask locally
+    // (PRIMASK) — NOT irq_set_enabled(ADC_IRQ_FIFO): this runs pre-scheduler on the
+    // slave's core0, and toggling the NVIC line would re-enable the ADC IRQ on core0,
+    // undoing the core1-only placement and re-freezing the ADC.
+    uint32_t isr = save_and_disable_interrupts();
     g_pulse_edge[idx] = (edge <= 2u) ? edge : 0u;
     g_pulse_last = (uint8_t)((g_pulse_last & ~bit) | (gpio_get(pin) ? bit : 0));
     g_pulse_mask |= bit;
-    irq_set_enabled(ADC_IRQ_FIFO, true);
+    restore_interrupts(isr);
 }
 
 // Apply the frozen hwio map ONCE at boot: the whole GP2..GP9 block takes one
