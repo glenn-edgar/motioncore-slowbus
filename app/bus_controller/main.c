@@ -136,6 +136,7 @@
 #define CMD_GPIO_CONFIG          0x0100u // [port u8][pin u8][mode u8][mode-args...]
 #define CMD_GPIO_WRITE           0x0101u // [port u8][pin u8][level u8]
 #define CMD_GPIO_READ            0x0102u // [port u8][pin u8] -> [level u8]
+#define CMD_GPIO_ROLES           0x0103u // [] -> [base u8][count u8][role u8 x count] effective hwio roles
 #define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
 #define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
 #define CMD_PWM_TEST             0x0109u // GP22 test source: [freq_hz u32][duty_pct u8]; 0 freq/duty = off (hi-Z)
@@ -2629,6 +2630,14 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
                          role == HWIO_ROLE_INPUT_PULLDOWN || role == HWIO_ROLE_OUTPUT);
         if (port != 0 || !readable) return SHELL_BAD_ARGS;
         out[0] = gpio_get(pin) ? 1u : 0u; *outlen = 1; return SHELL_OK;
+    }
+    case CMD_GPIO_ROLES: {         // discovery: effective (post-demotion) hwio role of GP2..GP9
+        if (cap < (uint8_t)(2u + HIL_GPIO_COUNT)) return SHELL_BAD_ARGS;
+        uint8_t n = 0;
+        out[n++] = HIL_GPIO_BASE;
+        out[n++] = HIL_GPIO_COUNT;
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) out[n++] = g_hwio_role[i];
+        *outlen = n; return SHELL_OK;
     }
     case CMD_INTERLOCK_CLEAR:
         interlock_request_global_clear(); return SHELL_OK;
