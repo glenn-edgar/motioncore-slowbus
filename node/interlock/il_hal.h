@@ -83,3 +83,6 @@ uint8_t  il_plat_adc_channel(uint8_t gpio);
 
 // Latest decimated reading (0..4095) for ADC channel `ch` from the shared area.
 uint16_t il_plat_adc_latest(uint8_t ch);
+// Window stat for the ADC-window interlock virtuals. stat: 0=latest, 1=min, 2=max,
+// 3=avg, 4=rms (10 Hz / 100 ms tier). Platforms without window stats may return 0.
+uint16_t il_plat_adc_stat(uint8_t ch, uint8_t stat);

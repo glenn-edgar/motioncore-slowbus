@@ -82,6 +82,10 @@ typedef enum {
 #define IL_VIRT_UPTIME       0xF1u   // seconds since boot
 #define IL_VIRT_STACK_HWM    0xF2u   // peak stack depth in bytes
 #define IL_VIRT_NODES_DEAD   0xF3u   // master: # enabled bus nodes currently DEAD (0 on a slave)
+// ADC-window operands: 0xE0 + ch*4 + stat (ch 0..2; stat 0=min/1=max/2=avg/3=rms),
+// read from the 10 Hz (100 ms) window via il_plat_adc_stat(). 12 ids: 0xE0..0xEB.
+#define IL_VIRT_ADC_BASE     0xE0u
+#define IL_VIRT_ADC_COUNT    12u
 
 typedef enum {
     IL_OP_EQ = 0,

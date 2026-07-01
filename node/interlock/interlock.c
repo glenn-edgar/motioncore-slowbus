@@ -144,6 +144,10 @@ static uint16_t read_virtual_input(uint8_t virt_id) {
         case IL_VIRT_NODES_DEAD:
             return g_il_nodes_dead;
         default:
+            if (virt_id >= IL_VIRT_ADC_BASE && virt_id < IL_VIRT_ADC_BASE + IL_VIRT_ADC_COUNT) {
+                uint8_t off = (uint8_t)(virt_id - IL_VIRT_ADC_BASE);
+                return il_plat_adc_stat((uint8_t)(off / 4u), (uint8_t)((off % 4u) + 1u)); // stat 1..4
+            }
             return 0;
     }
 }

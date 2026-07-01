@@ -183,6 +183,13 @@ static const il_virt_pin_t k_virt_pins[] = {
     { "_uptime",      IL_VIRT_UPTIME      },
     { "_stack_hwm",   IL_VIRT_STACK_HWM   },
     { "_nodesdead",   IL_VIRT_NODES_DEAD  },
+    // ADC-window operands (10 Hz / 100 ms tier): e.g. watch[_adc0rms gt 1800]
+    { "_adc0min", IL_VIRT_ADC_BASE + 0u  }, { "_adc0max", IL_VIRT_ADC_BASE + 1u  },
+    { "_adc0avg", IL_VIRT_ADC_BASE + 2u  }, { "_adc0rms", IL_VIRT_ADC_BASE + 3u  },
+    { "_adc1min", IL_VIRT_ADC_BASE + 4u  }, { "_adc1max", IL_VIRT_ADC_BASE + 5u  },
+    { "_adc1avg", IL_VIRT_ADC_BASE + 6u  }, { "_adc1rms", IL_VIRT_ADC_BASE + 7u  },
+    { "_adc2min", IL_VIRT_ADC_BASE + 8u  }, { "_adc2max", IL_VIRT_ADC_BASE + 9u  },
+    { "_adc2avg", IL_VIRT_ADC_BASE + 10u }, { "_adc2rms", IL_VIRT_ADC_BASE + 11u },
 };
 static const uint8_t k_virt_pin_count = sizeof(k_virt_pins) / sizeof(k_virt_pins[0]);
 

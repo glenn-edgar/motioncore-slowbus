@@ -2462,6 +2462,20 @@ uint16_t il_plat_adc_latest(uint8_t ch) {
     return (ch < ADC_NCH) ? g_adc_latest[ch] : 0u;   // 1 kHz decimated mean (lock-free read)
 }
 
+// Window stat for interlock ADC-window operands (the _adcNmin/max/avg/rms virtuals).
+// stat: 0=latest(1 kHz), 1=min, 2=max, 3=avg, 4=rms — from the 10 Hz (100 ms) tier.
+// Single u16 field read; the ADC ISR + the interlock tick both run on core1, so it's
+// coherent without a lock.
+uint16_t il_plat_adc_stat(uint8_t ch, uint8_t stat) {
+    if (ch >= ADC_NCH) return 0u;
+    if (stat == 0u) return g_adc_latest[ch];
+    volatile const adc_wstat_t *w = &g_win_stat[ch][ADC_WIN_10HZ];
+    switch (stat) {
+        case 1: return w->min; case 2: return w->max; case 3: return w->avg; case 4: return w->rms;
+        default: return 0u;
+    }
+}
+
 static void il_tick_task(void *arg) {
     (void)arg;
     for (;;) {
