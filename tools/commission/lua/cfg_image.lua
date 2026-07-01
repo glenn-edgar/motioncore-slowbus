@@ -90,7 +90,8 @@ while i <= #arg do
     elseif a == "--speed" or a == "--baud" then opt.baud = tonumber(nextval())  -- optional RS-485 bus speed -> idnt 'sp'
     elseif a == "--slvr"       then opt.slvr = nextval()
     elseif a == "--poll"       then opt.poll = nextval()
-    elseif a == "--io"         then opt.io = nextval()    -- hwio HIL roles: "r0,r1,..,r7" (GP2..GP9; HWIO_ROLE_* 0..6)
+    elseif a == "--mode"       then opt.mode = nextval()  -- hwio io_mode: gpio|counter|servo|idle or 0..6 (default gpio)
+    elseif a == "--io"         then opt.io = nextval()    -- hwio per-pin sub-config bytes "b0,..,b7" (GP2..GP9; meaning per io_mode)
     elseif a == "--adc"        then opt.adc = nextval()   -- hwio ADC annotation: "label:unit:num:den,..." (<=3 chans)
     elseif a == "--il"         then                       -- repeatable: "N:<dsl>" arms slot N (0..9)
         local v = nextval()
@@ -158,22 +159,33 @@ if opt.slvr then
     slvr_desc = (" + slvr{%d slaves, poll %s}"):format(#slaves, opt.poll)
 end
 
--- hwio (optional, frozen HIL pin-role map + ADC annotation) -----------------
--- --io  "r0,r1,..,r7"  : up to 8 role ints for GP2..GP9 (HWIO_ROLE_*: 0=unused,
---                        1=in, 2=in_pullup, 3=in_pulldown, 4=out, 5=servo, 6=pulse).
+-- hwio v2 (optional, frozen block io_mode + per-pin sub-config + ADC annotation) --
+-- See docs/io-mode-model.md. The whole GP2..GP9 block takes ONE io_mode:
+-- --mode gpio|counter|servo|idle (or 0..6; default gpio).
+-- --io  "b0,..,b7"     : up to 8 per-pin sub-config bytes (GP2..GP9). Meaning per mode:
+--                        GPIO    -> (debounce_depth<<4) | role  (role 0..6: 0 unused,
+--                                   1 in, 2 in_pu, 3 in_pd, 4 out, 5 oc, 6 oc_pu)
+--                        COUNTER -> bit0 enable | bits1-2 pull | bits3-4 edge
+--                        SERVO   -> bit0 enable (contiguous channels from GP2)
 -- --adc "L:U:N:D,.."   : up to 3 channels; each "label:unit:num:den" (any field
 --                        may be empty -> omitted; value = raw*num/den).
+local HWIO_MODES = { idle = 0, gpio = 1, adc = 2, mixed = 3, servo = 4, counter = 5, hiperf = 6 }
 local hwio_desc = ""
-if opt.io or opt.adc then
-    local hw = { v = 1 }
+if opt.mode or opt.io or opt.adc then
+    local mode = 1                                            -- default GPIO
+    if opt.mode then
+        mode = HWIO_MODES[opt.mode:lower()] or tonumber(opt.mode)
+        assert(mode and mode >= 0 and mode <= 6, "bad --mode: " .. opt.mode .. " (gpio|counter|servo|idle or 0..6)")
+    end
+    local hw = { v = 2, m = mode }
     if opt.io then
-        local roles = {}
+        local bytes = {}
         for _, t in ipairs(split(opt.io, ",")) do
-            local r = tonumber(t); assert(r and r >= 0 and r <= 6, "bad --io role: " .. t .. " (want 0..6)")
-            roles[#roles + 1] = r
+            local b = tonumber(t); assert(b and b >= 0 and b <= 255, "bad --io byte: " .. t .. " (want 0..255)")
+            bytes[#bytes + 1] = b
         end
-        assert(#roles <= 8, "--io has " .. #roles .. " roles (max 8, GP2..GP9)")
-        hw.io = roles
+        assert(#bytes <= 8, "--io has " .. #bytes .. " bytes (max 8, GP2..GP9)")
+        hw.io = bytes
     end
     if opt.adc then
         -- Split on ',' PRESERVING empties so channels stay positional (ADC0/1/2).
@@ -197,7 +209,7 @@ if opt.io or opt.adc then
     local hwio = cbor.encode(hw)
     assert(#hwio <= STORE_DATA_MAX, "hwio CBOR too big: " .. #hwio .. " B (>" .. STORE_DATA_MAX .. ")")
     entries[#entries + 1] = { name = "hwio", data = hwio }
-    hwio_desc = (" + hwio{io=%d,adc=%d}"):format(hw.io and #hw.io or 0, hw.ad and #hw.ad or 0)
+    hwio_desc = (" + hwio{m=%d,io=%d,adc=%d}"):format(mode, hw.io and #hw.io or 0, hw.ad and #hw.ad or 0)
 end
 
 -- ilcN (optional, Thread-2 interlock DSL per slot; ilc0..ilc9) ---------------
