@@ -14,7 +14,7 @@
 #include "cbor_min.h"
 #include <string.h>
 
-#define HWIO_SCHEMA_VER 1u
+#define HWIO_SCHEMA_VER 2u
 
 // Copy a CBOR text slice into a fixed NUL-terminated field, truncating to fit.
 static void copy_text(char *dst, uint32_t cap, const uint8_t *s, uint32_t n) {
@@ -48,11 +48,17 @@ static int parse_adc_entry(cbor_t *c, hwio_adc_t *a) {
 }
 
 int boot_read_hwio(hwio_t *out) {
-    // Fail-safe defaults first: every HIL pin UNUSED, every ADC channel unlabeled.
-    memset(out, 0, sizeof *out);   // HWIO_ROLE_UNUSED == 0; empty labels; 0/0 scale
+    // Fail-safe defaults first: GPIO mode, every HIL pin UNUSED (hi-Z), every ADC
+    // channel unlabeled. A missing/all-zero map -> a GPIO node with inert pins.
+    memset(out, 0, sizeof *out);   // pin[]=UNUSED; empty labels; 0/0 scale
+    out->io_mode = HWIO_MODE_GPIO;
 
     uint8_t buf[CFG_FILE_MAX]; uint32_t len;
     if (cfg_load("hwio", buf, sizeof buf, &len) < 0) return HWIO_ERR_MISSING;
+
+    // Parse into a temp; only commit to *out on full success, so a present-but-bad
+    // or stale-schema (v1) file leaves *out at the safe GPIO/all-UNUSED default.
+    hwio_t tmp; memset(&tmp, 0, sizeof tmp); tmp.io_mode = HWIO_MODE_GPIO;
 
     cbor_t c; cbor_init(&c, buf, len);
     uint64_t np; if (!cbor_open(&c, CBOR_MAP, &np)) return HWIO_ERR_FORMAT;
@@ -64,19 +70,23 @@ int boot_read_hwio(hwio_t *out) {
         if (CBOR_KEY(k, kn, "v")) {
             if (!cbor_uint(&c, &v)) return HWIO_ERR_FORMAT;
             seen_v = true;
+        } else if (CBOR_KEY(k, kn, "m")) {
+            uint64_t m; if (!cbor_uint(&c, &m)) return HWIO_ERR_FORMAT;
+            if (m >= HWIO_MODE__MAX) return HWIO_ERR_ROLE;
+            tmp.io_mode = (uint8_t)m;
         } else if (CBOR_KEY(k, kn, "io")) {
             uint64_t n; if (!cbor_open(&c, CBOR_ARRAY, &n)) return HWIO_ERR_FORMAT;
-            if (n > HIL_GPIO_COUNT) return HWIO_ERR_ROLE;     // too many roles for the block
-            for (uint64_t j = 0; j < n; j++) {
-                uint64_t r; if (!cbor_uint(&c, &r)) return HWIO_ERR_FORMAT;
-                if (r >= HWIO_ROLE__MAX) return HWIO_ERR_ROLE;
-                out->role[j] = (uint8_t)r;
+            if (n > HIL_GPIO_COUNT) return HWIO_ERR_ROLE;     // too many pins for the block
+            for (uint64_t j = 0; j < n; j++) {                // raw sub-config byte; meaning per io_mode
+                uint64_t b; if (!cbor_uint(&c, &b)) return HWIO_ERR_FORMAT;
+                if (b > 0xFFu) return HWIO_ERR_ROLE;
+                tmp.pin[j] = (uint8_t)b;
             }
         } else if (CBOR_KEY(k, kn, "ad")) {
             uint64_t n; if (!cbor_open(&c, CBOR_ARRAY, &n)) return HWIO_ERR_FORMAT;
             for (uint64_t j = 0; j < n; j++) {
                 if (j < HWIO_ADC_NCH) {                        // store the first 3...
-                    int rc = parse_adc_entry(&c, &out->adc[j]);
+                    int rc = parse_adc_entry(&c, &tmp.adc[j]);
                     if (rc != HWIO_OK) return rc;
                 } else if (!cbor_skip(&c)) {                   // ...consume any extras
                     return HWIO_ERR_FORMAT;
@@ -88,6 +98,7 @@ int boot_read_hwio(hwio_t *out) {
     }
 
     if (!seen_v)              return HWIO_ERR_FORMAT;
-    if (v != HWIO_SCHEMA_VER) return HWIO_ERR_SCHEMA;
+    if (v != HWIO_SCHEMA_VER) return HWIO_ERR_SCHEMA;   // e.g. a stale v1 map -> reject, keep default
+    *out = tmp;                                         // commit only on full success
     return HWIO_OK;
 }

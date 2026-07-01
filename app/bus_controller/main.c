@@ -137,7 +137,7 @@
 #define CMD_GPIO_CONFIG          0x0100u // [port u8][pin u8][mode u8][mode-args...]
 #define CMD_GPIO_WRITE           0x0101u // [port u8][pin u8][level u8]
 #define CMD_GPIO_READ            0x0102u // [port u8][pin u8] -> [level u8]
-#define CMD_GPIO_ROLES           0x0103u // [] -> [base u8][count u8][role u8 x count] effective hwio roles
+#define CMD_IO_MODE              0x0103u // [] -> [io_mode u8][count u8][pin subconfig u8 x count]
 #define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
 #define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
 #define CMD_PWM_TEST             0x0109u // GP22 test source: [freq_hz u32][duty_pct u8]; 0 freq/duty = off (hi-Z)
@@ -2101,49 +2101,74 @@ static void i2c_loopback_init(void) {
 // runtime reconfiguration (CMD_GPIO_CONFIG is retired). Default all-UNUSED until
 // hwio_apply runs, so a pre-config / missing-hwio unit is hi-Z and inert.
 static uint8_t g_hwio_role[HIL_GPIO_COUNT];
+static uint8_t g_io_mode = HWIO_MODE_GPIO;   // block I/O mode (from hwio; GPIO = default)
+static uint8_t g_hwio_pin[HIL_GPIO_COUNT];   // raw per-pin sub-config bytes (CMD_IO_MODE discovery)
 
-// Configure one HIL block pin for a NON-servo role (servos = the contiguous bank).
+// Configure one HIL block pin for a GPIO-mode role. OC/OC_PU come up RELEASED
+// (hi-Z input, +pull for OC_PU); the open-drain drive happens on GPIO_WRITE.
 static void apply_pin_gpio(uint8_t idx, uint8_t role) {
     uint8_t pin = (uint8_t)(HIL_GPIO_BASE + idx);
     switch (role) {
     case HWIO_ROLE_INPUT:
     case HWIO_ROLE_UNUSED:           // safe default: input, no pull
+    case HWIO_ROLE_OC:               // open-drain released == hi-Z until driven low
         gpio_init(pin); gpio_set_dir(pin, false); gpio_disable_pulls(pin); break;
     case HWIO_ROLE_INPUT_PULLUP:
+    case HWIO_ROLE_OC_PU:            // open-drain released, internal pull-up
         gpio_init(pin); gpio_set_dir(pin, false); gpio_pull_up(pin); break;
     case HWIO_ROLE_INPUT_PULLDOWN:
         gpio_init(pin); gpio_set_dir(pin, false); gpio_pull_down(pin); break;
     case HWIO_ROLE_OUTPUT:
-        gpio_init(pin); gpio_put(pin, 0); gpio_set_dir(pin, true); break;   // driven low
-    case HWIO_ROLE_PULSE_COUNT: {
-        uint8_t bit = (uint8_t)(1u << idx);
-        gpio_init(pin); gpio_set_dir(pin, false); gpio_disable_pulls(pin);
-        irq_set_enabled(ADC_IRQ_FIFO, false);
-        g_pulse_edge[idx] = 0;                                  // rising-edge default
-        g_pulse_last = (uint8_t)((g_pulse_last & ~bit) | (gpio_get(pin) ? bit : 0));
-        g_pulse_mask |= bit;
-        irq_set_enabled(ADC_IRQ_FIFO, true);
-        break;
-    }
-    default: break;   // SERVO is armed by the bank in hwio_apply, not here
+        gpio_init(pin); gpio_put(pin, 0); gpio_set_dir(pin, true); break;   // push-pull, driven low
+    default: break;
     }
 }
 
-// Apply the frozen hwio pin-role map ONCE at boot. The PIO servo bank is
-// contiguous by construction, so servos must be a run from GP2 (index 0); a
-// SERVO role past that run is a config error and is demoted to UNUSED (hi-Z)
-// rather than silently mis-armed.
+// Configure one HIL pin as a 1 kHz edge counter (COUNTER mode). byte = counter
+// sub-config: bit0 enable, bits1-2 pull (0 none/1 up/2 down), bits3-4 edge (0
+// rising/1 falling/2 both). A disabled channel comes up hi-Z.
+static void apply_pin_counter(uint8_t idx, uint8_t byte) {
+    uint8_t pin = (uint8_t)(HIL_GPIO_BASE + idx), bit = (uint8_t)(1u << idx);
+    if (!(byte & 0x01u)) { apply_pin_gpio(idx, HWIO_ROLE_UNUSED); return; }
+    uint8_t pull = (uint8_t)((byte >> 1) & 0x03u), edge = (uint8_t)((byte >> 3) & 0x03u);
+    gpio_init(pin); gpio_set_dir(pin, false);
+    if (pull == 1u) gpio_pull_up(pin); else if (pull == 2u) gpio_pull_down(pin); else gpio_disable_pulls(pin);
+    irq_set_enabled(ADC_IRQ_FIFO, false);
+    g_pulse_edge[idx] = (edge <= 2u) ? edge : 0u;
+    g_pulse_last = (uint8_t)((g_pulse_last & ~bit) | (gpio_get(pin) ? bit : 0));
+    g_pulse_mask |= bit;
+    irq_set_enabled(ADC_IRQ_FIFO, true);
+}
+
+// Apply the frozen hwio map ONCE at boot: the whole GP2..GP9 block takes one
+// io_mode (see docs/io-mode-model.md). GPIO -> per-pin role (low nibble; debounce
+// nibble applied in a later step); COUNTER -> per-pin counter byte; SERVO -> the
+// contiguous PIO bank (enabled channels from GP2). ADC + interlock are separate.
 static void hwio_apply(const hwio_t *hw) {
-    uint8_t servo_n = 0;
-    while (servo_n < HIL_GPIO_COUNT && hw->role[servo_n] == HWIO_ROLE_SERVO) servo_n++;
-    for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
-        if (i < servo_n) { g_hwio_role[i] = HWIO_ROLE_SERVO; continue; }   // bank owns it
-        uint8_t role = (hw->role[i] == HWIO_ROLE_SERVO) ? HWIO_ROLE_UNUSED  // non-contiguous -> demote
-                                                        : hw->role[i];
-        g_hwio_role[i] = role;
-        apply_pin_gpio(i, role);
+    g_io_mode = hw->io_mode;
+    for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) { g_hwio_pin[i] = hw->pin[i]; g_hwio_role[i] = HWIO_ROLE_UNUSED; }
+    switch (hw->io_mode) {
+    case HWIO_MODE_GPIO:
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
+            uint8_t role = (uint8_t)(hw->pin[i] & 0x0Fu);
+            if (role >= HWIO_ROLE__MAX) role = HWIO_ROLE_UNUSED;
+            g_hwio_role[i] = role;
+            apply_pin_gpio(i, role);
+        }
+        break;
+    case HWIO_MODE_COUNTER:
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) apply_pin_counter(i, hw->pin[i]);
+        break;
+    case HWIO_MODE_SERVO: {
+        uint8_t servo_n = 0;                                    // contiguous enabled channels from GP2
+        while (servo_n < HIL_GPIO_COUNT && (hw->pin[servo_n] & 0x01u)) servo_n++;
+        if (servo_n) servo_set_n(servo_n);
+        break;
     }
-    if (servo_n) servo_set_n(servo_n);   // arm the bank (idles until driven)
+    default:                                                    // IDLE / SAMD21-only -> all hi-Z
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) apply_pin_gpio(i, HWIO_ROLE_UNUSED);
+        break;
+    }
 }
 
 // Effective frozen role of any pin; UNUSED for non-HIL-block pins.
@@ -2590,12 +2615,14 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         memcpy(out, args, k); *outlen = k; return SHELL_OK;
     }
     case CMD_GPIO_WRITE: {
+        if (g_io_mode != HWIO_MODE_GPIO) return SHELL_BAD_ARGS;   // wrong io_mode
         if (alen < 3) return SHELL_BAD_ARGS;
         uint8_t port = args[0], pin = args[1], level = args[2];
         if (port != 0 || level > 1 || hil_role_of(pin) != HWIO_ROLE_OUTPUT) return SHELL_BAD_ARGS;
         gpio_put(pin, level); return SHELL_OK;
     }
     case CMD_GPIO_READ: {
+        if (g_io_mode != HWIO_MODE_GPIO) return SHELL_BAD_ARGS;   // wrong io_mode
         if (alen < 2 || cap < 1) return SHELL_BAD_ARGS;
         uint8_t port = args[0], pin = args[1], role = hil_role_of(pin);
         bool readable = (role == HWIO_ROLE_INPUT || role == HWIO_ROLE_INPUT_PULLUP ||
@@ -2603,12 +2630,12 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         if (port != 0 || !readable) return SHELL_BAD_ARGS;
         out[0] = gpio_get(pin) ? 1u : 0u; *outlen = 1; return SHELL_OK;
     }
-    case CMD_GPIO_ROLES: {         // discovery: effective (post-demotion) hwio role of GP2..GP9
+    case CMD_IO_MODE: {            // discovery: node io_mode + per-pin sub-config (data-driven bench)
         if (cap < (uint8_t)(2u + HIL_GPIO_COUNT)) return SHELL_BAD_ARGS;
         uint8_t n = 0;
-        out[n++] = HIL_GPIO_BASE;
+        out[n++] = g_io_mode;
         out[n++] = HIL_GPIO_COUNT;
-        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) out[n++] = g_hwio_role[i];
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) out[n++] = g_hwio_pin[i];
         *outlen = n; return SHELL_OK;
     }
     case CMD_INTERLOCK_CLEAR:
@@ -2664,7 +2691,8 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         }
         *outlen = n; return SHELL_OK;
     }
-    case CMD_PULSE_READ: {         // PULSE_COUNT: running edge totals for GP2..GP9 -> [count u32]x8
+    case CMD_PULSE_READ: {         // COUNTER mode: running edge totals for GP2..GP9 -> [count u32]x8
+        if (g_io_mode != HWIO_MODE_COUNTER) return SHELL_BAD_ARGS;
         if (cap < (uint8_t)(HIL_GPIO_COUNT * 4u)) return SHELL_BAD_ARGS;
         uint8_t n = 0;
         for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
@@ -2673,13 +2701,15 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         }
         *outlen = n; return SHELL_OK;
     }
-    case CMD_PULSE_CLEAR: {        // PULSE_COUNT: [mask u8] bit i clears GP(2+i); default 0xFF = all
+    case CMD_PULSE_CLEAR: {        // COUNTER mode: [mask u8] bit i clears GP(2+i); default 0xFF = all
+        if (g_io_mode != HWIO_MODE_COUNTER) return SHELL_BAD_ARGS;
         uint8_t mask = (alen >= 1) ? args[0] : 0xFFu;
         for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
             if (mask & (1u << i)) g_pulse_count[i] = 0;
         return SHELL_OK;
     }
-    case CMD_SERVO_SET_ALL: {      // SERVO: [width_us u16 LE] x up to the hwio-armed servo count
+    case CMD_SERVO_SET_ALL: {      // SERVO mode: [width_us u16 LE] x up to the armed servo count
+        if (g_io_mode != HWIO_MODE_SERVO) return SHELL_BAD_ARGS;
         if (alen < 2) return SHELL_BAD_ARGS;
         uint8_t cnt = (uint8_t)(alen / 2);
         if (cnt > g_servo_n) cnt = g_servo_n;            // operate only the armed servos
@@ -2692,7 +2722,8 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         servo_build();                                   // feeder picks up the new frame next cycle
         return SHELL_OK;
     }
-    case CMD_SERVO_STOP:           // SERVO: release the bank -> GP2.. back to GPIO input
+    case CMD_SERVO_STOP:           // SERVO mode: release the bank -> GP2.. back to GPIO input
+        if (g_io_mode != HWIO_MODE_SERVO) return SHELL_BAD_ARGS;
         servo_stop_all(); return SHELL_OK;
     default:
         return CMD_NOT_MINE;
