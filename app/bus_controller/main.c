@@ -118,11 +118,12 @@
 #define CMD_ADC_READ             0x0104u // KB1 (api/HIL): snapshot the 3 decimated ADC channels
 #define ADC_NCH                  3       // ADC0..2 = GP26/27/28
 #define ADC0_GPIO                26u     // ADC channel ch lives on GP(ADC0_GPIO+ch)
-#define ADC_BOXCAR               8       // raw samples averaged per channel per 1 kHz output
-#define ADC_CLKDIV               1999.0f // 24 kHz total -> 8 kHz/ch -> /8 boxcar = ~1 kHz/ch
+#define ADC_BOXCAR               16      // raw samples averaged per channel per 1 kHz decimated output
+#define ADC_CLKDIV               999.0f  // 48 kHz total -> 16 kHz/ch -> /16 boxcar = ~1 kHz/ch decimated
 #define ADC_FIFO_THRESH          4       // FIFO IRQ trigger level
-#define ADC_WIN_SAMPLES          100     // 1 kHz samples per 10 Hz window (100 ms)
-#define CMD_ADC_STATS            0x0105u // KB1/firmware: read the 10 Hz mean/max/rms streams
+#define ADC_NWIN                 3       // downsample window tiers (SAMD21 analog-mode parity)
+#define CMD_ADC_STATS            0x0105u // bench: per-ch [seq][min][max][avg][rms] for the WIN_SEL tier
+#define CMD_ADC_WIN_SEL          0x0113u // bench: select the tier CMD_ADC_STATS reports (0=1kHz/1=100Hz/2=10Hz)
 #define CMD_APP_ECHO             0x0300u // Thread 3 (kbapp): echo payload via the chain-tree engine
 #define CMD_APP_ECHO_TO          0x0301u // Thread 3 (kbapp): [addr u8][payload] — engine originates a
                                          // bus echo to node <addr>, master correlates the reply
@@ -1611,16 +1612,21 @@ static uint32_t adc_acc[ADC_NCH];                 // ISR-private accumulators
 static uint16_t adc_acc_n[ADC_NCH];
 static uint8_t  adc_phase;                         // round-robin position 0..ADC_NCH-1
 
-// --- 10 Hz window statistics (mean/max/rms over 100 ms of 1 kHz samples) -----
-// Second decimation tier for chain_tree. RMS is the AC component (std-dev with the
-// DC bias removed) — the meaningful figure for transformer-/CT-coupled AC current.
-// Stats run over the 1 kHz Stage-A outputs (100/window): sum of squares fits u32
-// (100 * 4095^2 < 2^32). Effective AC bandwidth ~440 Hz (Stage-A boxcar) — ample
-// for 50/60 Hz line current; switch accumulation to raw samples + u64 if wider.
-typedef struct { uint32_t sum, sumsq; uint16_t max, n; } adc_win_t;
-static adc_win_t          g_win_acc[ADC_NCH];      // ISR-private: current window
-static volatile adc_win_t g_win_done[ADC_NCH];     // ISR-published: last completed window
-static volatile uint32_t  g_adc_win_count;         // completed windows (liveness)
+// --- multi-tier window statistics (SAMD21 analog-mode parity) ----------------
+// Three tumbling windows PER channel accumulate the RAW 16 kHz/ch samples (NOT the
+// decimated 1 kHz stream — raw is required for correct AC-rms; the Stage-A boxcar
+// low-passes the AC away). Lengths {16,160,1600} @16 kHz/ch -> 1 kHz / 100 Hz /
+// 10 Hz output rates. On fill each window snapshots {min,max,avg,AC-rms} and bumps a
+// per-window seq (freshness + a seqlock for lock-free cross-core reads). sumsq is u64
+// (1600 * 4095^2 > 2^32). AC-rms is the std-dev (DC removed).
+static const uint16_t g_adc_win_len[ADC_NWIN] = { 16u, 160u, 1600u };
+#define ADC_WIN_10HZ  2u                            // the 1600-sample tier == 10 Hz == chain_tree stream
+typedef struct { uint16_t min, max; uint32_t sum; uint64_t sumsq; uint16_t count; } adc_accum_t;
+typedef struct { uint16_t min, max, avg, rms; } adc_wstat_t;
+static adc_accum_t          g_win_acc[ADC_NCH][ADC_NWIN];    // ISR-private accumulators
+static volatile adc_wstat_t g_win_stat[ADC_NCH][ADC_NWIN];   // ISR-published snapshots
+static volatile uint16_t    g_win_seq[ADC_NWIN];             // per-window freshness / seqlock
+static uint8_t              g_adc_win_sel;                    // tier reported by CMD_ADC_STATS
 
 // Integer sqrt (no FPU/libm in the ISR path) for the RMS finalize.
 static uint16_t isqrt32(uint32_t v) {
@@ -1635,9 +1641,6 @@ static uint16_t isqrt32(uint32_t v) {
 
 // Cached blackboard slot pointers (chain_tree-facing 10 Hz streams), bound once.
 static int32_t *g_bb_mean[ADC_NCH], *g_bb_max[ADC_NCH], *g_bb_rms[ADC_NCH];
-// Mirror of the finalized stats for the CMD_ADC_STATS reply.
-typedef struct { uint16_t mean, max, rms; } adc_stat_t;
-static adc_stat_t g_adc_stats[ADC_NCH];
 
 // ---- pulse-count service (1 kHz software edge counter, GP2..GP9, zero PIO) --
 // Counts are running totals exposed as globals (like g_adc_latest), cleared only
@@ -1677,6 +1680,27 @@ __attribute__((weak)) void kb0_on_fast_tick(void) {}
 __attribute__((weak)) void kb1_on_fast_tick(void) {}
 __attribute__((weak)) void kb2_on_fast_tick(void) {}
 
+// Close window w: finalize {min,max,avg,AC-rms} per channel, reset, bump seq. AC-rms
+// via variance in u64 — (n*sumsq - sum^2)/n^2 — so avg truncation can't pollute it
+// (mirrors the SAMD21 analog mode). Called from the ISR when a tier fills.
+static void adc_win_close(uint8_t w) {
+    for (uint8_t ch = 0; ch < ADC_NCH; ch++) {
+        adc_accum_t *a = &g_win_acc[ch][w];
+        uint16_t n = a->count;
+        uint32_t avg = n ? (uint32_t)(a->sum / n) : 0u;
+        uint32_t var = 0u;
+        if (n) {
+            uint64_t nss = (uint64_t)n * a->sumsq;
+            uint64_t ss  = (uint64_t)a->sum * a->sum;
+            if (nss > ss) var = (uint32_t)((nss - ss) / ((uint64_t)n * n));
+        }
+        g_win_stat[ch][w].min = a->min;          g_win_stat[ch][w].max = a->max;
+        g_win_stat[ch][w].avg = (uint16_t)avg;   g_win_stat[ch][w].rms = (uint16_t)isqrt32(var);
+        a->min = 0; a->max = 0; a->sum = 0; a->sumsq = 0; a->count = 0;
+    }
+    g_win_seq[w]++;                               // publish (seqlock even-after-write)
+}
+
 static void adc_fifo_isr(void) {
     // Drain whatever the FIFO holds FIRST, so the decimation tiers keep advancing
     // even while recovering from an overrun. (The old code early-returned on OVER
@@ -1687,10 +1711,10 @@ static void adc_fifo_isr(void) {
     while (!adc_fifo_is_empty()) {
         uint16_t raw = adc_fifo_get() & 0x0FFFu;       // 12-bit sample
         uint8_t ch = adc_phase;
+        // Stage A: boxcar -> 1 kHz decimated (g_adc_latest for CMD_ADC_READ + interlocks).
         adc_acc[ch] += raw;
         if (++adc_acc_n[ch] >= ADC_BOXCAR) {
-            uint16_t s = (uint16_t)(adc_acc[ch] / ADC_BOXCAR);
-            g_adc_latest[ch] = s;                        // 1 kHz tier (interlock callbacks)
+            g_adc_latest[ch] = (uint16_t)(adc_acc[ch] / ADC_BOXCAR);
             adc_acc[ch] = 0; adc_acc_n[ch] = 0;
             if (ch == ADC_NCH - 1) {     // 1 kHz anchor: all channels fresh this cycle
                 g_adc_decim_count++;
@@ -1699,22 +1723,20 @@ static void adc_fifo_isr(void) {
                 kb1_on_fast_tick();
                 kb2_on_fast_tick();
             }
-
-            // 10 Hz tier: accumulate this 1 kHz sample into the window stats.
-            g_win_acc[ch].sum   += s;
-            g_win_acc[ch].sumsq += (uint32_t)s * s;
-            if (s > g_win_acc[ch].max) g_win_acc[ch].max = s;
-            if (++g_win_acc[ch].n >= ADC_WIN_SAMPLES) {  // window complete -> publish
-                g_win_done[ch].sum   = g_win_acc[ch].sum;
-                g_win_done[ch].sumsq = g_win_acc[ch].sumsq;
-                g_win_done[ch].max   = g_win_acc[ch].max;
-                g_win_done[ch].n     = g_win_acc[ch].n;
-                if (ch == ADC_NCH - 1) g_adc_win_count++;
-                g_win_acc[ch].sum = 0; g_win_acc[ch].sumsq = 0;
-                g_win_acc[ch].max = 0; g_win_acc[ch].n = 0;
-            }
         }
-        if (++adc_phase >= ADC_NCH) adc_phase = 0;
+        // Stage B: fold the RAW sample into every window tier (raw -> correct AC-rms).
+        for (uint8_t w = 0; w < ADC_NWIN; w++) {
+            adc_accum_t *a = &g_win_acc[ch][w];
+            if (a->count == 0u) { a->min = raw; a->max = raw; }
+            else { if (raw < a->min) a->min = raw; if (raw > a->max) a->max = raw; }
+            a->sum += raw; a->sumsq += (uint32_t)raw * raw; a->count++;
+        }
+        // Round complete -> close any full window (all channels now hold equal counts).
+        if (++adc_phase >= ADC_NCH) {
+            adc_phase = 0;
+            for (uint8_t w = 0; w < ADC_NWIN; w++)
+                if (g_win_acc[0][w].count >= g_adc_win_len[w]) adc_win_close(w);
+        }
     }
     // Overrun/underrun are sticky (W1C). If the ISR ran late the FIFO overflowed:
     // samples were dropped so the round-robin phase has slipped. Clear the flags and
@@ -1890,23 +1912,17 @@ void kbapp_on_echo_to(void *handle, unsigned node_index) {
 // it to g_adc_stats + the chain_tree blackboard streams. Engine-thread context;
 // masks ADC_IRQ briefly (same core) for a coherent copy of g_win_done.
 static void adc_publish_10hz(void) {
-    adc_win_t w[ADC_NCH];
+    // Mirror the 10 Hz tier (the 1600-sample window) into the chain_tree streams. The
+    // ISR already finalized avg/max/rms, so this just copies. Runs on core1 — same core
+    // as the ADC ISR — so masking gives a coherent snapshot.
+    adc_wstat_t s[ADC_NCH];
     irq_set_enabled(ADC_IRQ_FIFO, false);
-    for (int ch = 0; ch < ADC_NCH; ch++) {
-        w[ch].sum = g_win_done[ch].sum; w[ch].sumsq = g_win_done[ch].sumsq;
-        w[ch].max = g_win_done[ch].max; w[ch].n     = g_win_done[ch].n;
-    }
+    for (int ch = 0; ch < ADC_NCH; ch++) s[ch] = g_win_stat[ch][ADC_WIN_10HZ];
     irq_set_enabled(ADC_IRQ_FIFO, true);
     for (int ch = 0; ch < ADC_NCH; ch++) {
-        if (w[ch].n == 0) continue;                          // no window completed yet
-        uint16_t mean = (uint16_t)(w[ch].sum / w[ch].n);
-        uint32_t msq  = w[ch].sumsq / w[ch].n;
-        uint32_t m2   = (uint32_t)mean * mean;
-        uint16_t rms  = (msq > m2) ? isqrt32(msq - m2) : 0;   // AC RMS = std-dev (DC removed)
-        g_adc_stats[ch].mean = mean; g_adc_stats[ch].max = w[ch].max; g_adc_stats[ch].rms = rms;
-        if (g_bb_mean[ch]) *g_bb_mean[ch] = mean;            // publish chain_tree streams
-        if (g_bb_max[ch])  *g_bb_max[ch]  = (int32_t)w[ch].max;
-        if (g_bb_rms[ch])  *g_bb_rms[ch]  = rms;
+        if (g_bb_mean[ch]) *g_bb_mean[ch] = (int32_t)s[ch].avg;   // "mean" stream = window avg
+        if (g_bb_max[ch])  *g_bb_max[ch]  = (int32_t)s[ch].max;
+        if (g_bb_rms[ch])  *g_bb_rms[ch]  = (int32_t)s[ch].rms;
     }
 }
 
@@ -2280,19 +2296,6 @@ void cfl_embed_pre_tick(void) {
             q->req_id = c.req_id; q->route = c.route; q->bus_src = c.bus_src; q->addr = 0; q->len = 0;
             cfl_send_data_event(g_rt->event_queue, CFL_EVENT_PRIORITY_LOW,
                                 g_kbapp_node, false, EVENT_CMD_APP_IL_CLEAR, q);
-        } else if (c.cmd == CMD_ADC_STATS) {     // read the 10 Hz streams from the blackboard
-            appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
-            uint8_t *p = r.payload; uint8_t n = 0;
-            p[n++] = (uint8_t)c.req_id; p[n++] = (uint8_t)(c.req_id >> 8); p[n++] = SHELL_OK;
-            for (int ch = 0; ch < ADC_NCH; ch++) {           // [mean][max][rms] per channel, from bb
-                int32_t mn = g_bb_mean[ch] ? *g_bb_mean[ch] : 0;
-                int32_t mx = g_bb_max[ch]  ? *g_bb_max[ch]  : 0;
-                int32_t rm = g_bb_rms[ch]  ? *g_bb_rms[ch]  : 0;
-                p[n++]=(uint8_t)mn; p[n++]=(uint8_t)(mn>>8);
-                p[n++]=(uint8_t)mx; p[n++]=(uint8_t)(mx>>8);
-                p[n++]=(uint8_t)rm; p[n++]=(uint8_t)(rm>>8);
-            }
-            r.len = n; (void)xQueueSend(g_up_q, &r, 0);
         } else if (c.cmd == CMD_MON_STREAM) {   // [enable u8][period_ms u16][mask u16]
             if (c.alen >= 3) {
                 g_stream_on = c.args[0];
@@ -2637,6 +2640,27 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
             uint32_t dc = g_adc_decim_count, rs = g_adc_resyncs;
             out[n++]=(uint8_t)dc; out[n++]=(uint8_t)(dc>>8); out[n++]=(uint8_t)(dc>>16); out[n++]=(uint8_t)(dc>>24);
             out[n++]=(uint8_t)rs; out[n++]=(uint8_t)(rs>>8); out[n++]=(uint8_t)(rs>>16); out[n++]=(uint8_t)(rs>>24);
+        }
+        *outlen = n; return SHELL_OK;
+    }
+    case CMD_ADC_WIN_SEL: {        // select the tier CMD_ADC_STATS reports (0=1kHz/1=100Hz/2=10Hz)
+        if (alen >= 1 && args[0] < ADC_NWIN) g_adc_win_sel = args[0];
+        if (cap >= 1) { out[0] = g_adc_win_sel; *outlen = 1; }
+        return SHELL_OK;
+    }
+    case CMD_ADC_STATS: {          // SAMD21-parity: per ch [seq][min][max][avg][rms] for the WIN_SEL tier
+        uint8_t w = g_adc_win_sel; if (w >= ADC_NWIN) w = 0;
+        if (cap < (uint8_t)(ADC_NCH * 10u)) return SHELL_BAD_ARGS;
+        adc_wstat_t st[ADC_NCH]; uint16_t seq;
+        for (uint8_t tries = 0; ; tries++) {         // seqlock: coherent all-channel snapshot
+            seq = g_win_seq[w];
+            for (uint8_t ch = 0; ch < ADC_NCH; ch++) st[ch] = g_win_stat[ch][w];
+            if (g_win_seq[w] == seq || tries >= 3u) break;
+        }
+        uint8_t n = 0;
+        for (uint8_t ch = 0; ch < ADC_NCH; ch++) {   // seq is per-window (same for every channel)
+            uint16_t f[5] = { seq, st[ch].min, st[ch].max, st[ch].avg, st[ch].rms };
+            for (uint8_t k = 0; k < 5; k++) { out[n++]=(uint8_t)f[k]; out[n++]=(uint8_t)(f[k]>>8); }
         }
         *outlen = n; return SHELL_OK;
     }
