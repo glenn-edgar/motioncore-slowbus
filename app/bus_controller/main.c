@@ -138,6 +138,7 @@
 #define CMD_GPIO_WRITE           0x0101u // [port u8][pin u8][level u8]
 #define CMD_GPIO_READ            0x0102u // [port u8][pin u8] -> [level u8]
 #define CMD_IO_MODE              0x0103u // [] -> [io_mode u8][count u8][pin subconfig u8 x count]
+#define CMD_GPIO_READ_ALL        0x0111u // GPIO mode: [] -> [raw u8][deb u8] (bit i = GP(2+i))
 #define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
 #define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
 #define CMD_PWM_TEST             0x0109u // GP22 test source: [freq_hz u32][duty_pct u8]; 0 freq/duty = off (hi-Z)
@@ -1652,6 +1653,15 @@ static uint8_t  g_pulse_mask;                           // bit i set -> GP(base+
 static uint8_t  g_pulse_edge[HIL_GPIO_COUNT];           // 0=rising 1=falling 2=both
 static uint8_t  g_pulse_last;                           // last sampled levels, bit i = GP(base+i)
 
+static uint8_t  g_io_mode = HWIO_MODE_GPIO;             // block I/O mode (from hwio; GPIO = default)
+
+// GPIO-mode input debounce (same N-consecutive integrator as the interlock/SAMD21).
+// Sampled at 1 kHz in gpio_sample_1khz; raw + debounced bitmaps via CMD_GPIO_READ_ALL.
+static uint8_t  g_gpio_deb_depth[HIL_GPIO_COUNT];       // per-pin depth (0/1 passthrough, else 2..15)
+static uint16_t g_gpio_sr[HIL_GPIO_COUNT];             // per-pin shift register
+static volatile uint8_t g_gpio_raw;                    // raw sampled levels, bit i = GP(base+i)
+static volatile uint8_t g_gpio_deb;                    // debounced levels
+
 // Called at the 1 kHz decimation anchor (ISR context). Bounded loop of 8.
 static void pulse_sample_1khz(void) {
     if (!g_pulse_mask) return;
@@ -1671,6 +1681,31 @@ static void pulse_sample_1khz(void) {
             g_pulse_count[i]++;
     }
     g_pulse_last = now;
+}
+
+// Called at the 1 kHz decimation anchor (ISR context), GPIO mode only. Samples the
+// HIL block into g_gpio_raw and runs each pin's debounce integrator into g_gpio_deb:
+// depth<2 = passthrough; else flip only after `depth` consecutive same samples.
+static void gpio_sample_1khz(void) {
+    if (g_io_mode != HWIO_MODE_GPIO) return;
+    uint32_t in = sio_hw->gpio_in;
+    uint8_t raw = 0;
+    for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
+        if (in & (1u << (HIL_GPIO_BASE + i))) raw |= (uint8_t)(1u << i);
+    uint8_t deb = g_gpio_deb;
+    for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
+        uint8_t bit = (uint8_t)(1u << i), rawbit = (raw & bit) ? 1u : 0u, depth = g_gpio_deb_depth[i];
+        if (depth < 2u) {                                  // passthrough
+            if (rawbit) deb |= bit; else deb &= (uint8_t)~bit;
+        } else {
+            uint16_t mask = (uint16_t)((1u << depth) - 1u);
+            uint16_t sr = (uint16_t)(((g_gpio_sr[i] << 1) | rawbit) & mask);
+            g_gpio_sr[i] = sr;
+            if (sr == mask)    deb |= bit;                 // depth consecutive 1s
+            else if (sr == 0u) deb &= (uint8_t)~bit;       // depth consecutive 0s
+        }                                                  // else hold
+    }
+    g_gpio_raw = raw; g_gpio_deb = deb;
 }
 
 // Per-KB 1 kHz fast-tick hooks (ISR context, bounded, pure C — NOT the chain
@@ -1718,7 +1753,8 @@ static void adc_fifo_isr(void) {
             adc_acc[ch] = 0; adc_acc_n[ch] = 0;
             if (ch == ADC_NCH - 1) {     // 1 kHz anchor: all channels fresh this cycle
                 g_adc_decim_count++;
-                pulse_sample_1khz();     // software pulse edge counting (zero PIO)
+                pulse_sample_1khz();     // COUNTER mode: software edge counting (zero PIO)
+                gpio_sample_1khz();      // GPIO mode: raw + debounced input bitmaps
                 kb0_on_fast_tick();      // per-KB 1 kHz fast tier (monitors / interlock veto)
                 kb1_on_fast_tick();
                 kb2_on_fast_tick();
@@ -2101,7 +2137,6 @@ static void i2c_loopback_init(void) {
 // runtime reconfiguration (CMD_GPIO_CONFIG is retired). Default all-UNUSED until
 // hwio_apply runs, so a pre-config / missing-hwio unit is hi-Z and inert.
 static uint8_t g_hwio_role[HIL_GPIO_COUNT];
-static uint8_t g_io_mode = HWIO_MODE_GPIO;   // block I/O mode (from hwio; GPIO = default)
 static uint8_t g_hwio_pin[HIL_GPIO_COUNT];   // raw per-pin sub-config bytes (CMD_IO_MODE discovery)
 
 // Configure one HIL block pin for a GPIO-mode role. OC/OC_PU come up RELEASED
@@ -2157,6 +2192,8 @@ static void hwio_apply(const hwio_t *hw) {
             uint8_t role = (uint8_t)(hw->pin[i] & 0x0Fu);
             if (role >= HWIO_ROLE__MAX) role = HWIO_ROLE_UNUSED;
             g_hwio_role[i] = role;
+            g_gpio_deb_depth[i] = (uint8_t)((hw->pin[i] >> 4) & 0x0Fu);   // per-pin debounce depth
+            g_gpio_sr[i] = 0;
             apply_pin_gpio(i, role);
         }
         break;
@@ -2625,14 +2662,17 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         if (port != 0 || level > 1 || hil_role_of(pin) != HWIO_ROLE_OUTPUT) return SHELL_BAD_ARGS;
         gpio_put(pin, level); return SHELL_OK;
     }
-    case CMD_GPIO_READ: {
+    case CMD_GPIO_READ: {          // any HIL-block pin is readable in GPIO mode (incl UNUSED)
         if (g_io_mode != HWIO_MODE_GPIO) return SHELL_BAD_ARGS;   // wrong io_mode
         if (alen < 2 || cap < 1) return SHELL_BAD_ARGS;
-        uint8_t port = args[0], pin = args[1], role = hil_role_of(pin);
-        bool readable = (role == HWIO_ROLE_INPUT || role == HWIO_ROLE_INPUT_PULLUP ||
-                         role == HWIO_ROLE_INPUT_PULLDOWN || role == HWIO_ROLE_OUTPUT);
-        if (port != 0 || !readable) return SHELL_BAD_ARGS;
+        uint8_t port = args[0], pin = args[1];
+        if (port != 0 || pin < HIL_GPIO_BASE || pin >= HIL_GPIO_BASE + HIL_GPIO_COUNT) return SHELL_BAD_ARGS;
         out[0] = gpio_get(pin) ? 1u : 0u; *outlen = 1; return SHELL_OK;
+    }
+    case CMD_GPIO_READ_ALL: {      // GPIO mode: raw + debounced input bitmaps (bit i = GP(2+i))
+        if (g_io_mode != HWIO_MODE_GPIO) return SHELL_BAD_ARGS;
+        if (cap < 2) return SHELL_BAD_ARGS;
+        out[0] = g_gpio_raw; out[1] = g_gpio_deb; *outlen = 2; return SHELL_OK;
     }
     case CMD_IO_MODE: {            // discovery: node io_mode + per-pin sub-config (data-driven bench)
         if (cap < (uint8_t)(2u + HIL_GPIO_COUNT)) return SHELL_BAD_ARGS;
