@@ -2,12 +2,20 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-06-30 (base interlock complete)**. Branch: **`master`** (clean; commit `9924c37`).
-**★RESUME HERE: BASE INTERLOCK DONE + HW-verified on TWO nodes (2026-06-30) — GP1 safety-in + open-drain
-oc:up wired-OR GP0 veto, clear/boot grace, #1 dead-node→veto, gp1 debounce. 6 commits 885b46f→9924c37; full
-detail in memory [[interlock-base-wired-or]]. No task in flight.** NEXT = the PLAN section below: ADC bench
-commands on the base chips (+ interlock #2/#3), then polled I2C. Prior days: grace-redrain low-baud fix
-(`f1c3045`); dual-transport + multi-cred + python-free build. Older sections are history/reference.★
+Last updated **2026-07-01 (I/O-mode restructure)**. Branch: **`master`** (clean; commit `eb22386`).
+**★RESUME HERE: I/O-MODE RESTRUCTURE — Steps 1, 3(GPIO+COUNTER), 4 DONE + HW-verified (2026-07-01).**
+Node model = ADC(always) + ONE io_mode {GPIO(+debounce) | COUNTER | SERVO} frozen@commission + interlock
+(10 eq) + chain-tree. Design doc `docs/io-mode-model.md`; detail in memory [[pico-io-mode-model]]. Done:
+RP2350 ADC frozen-ISR fix→core1 + analog bench (33474ad); ADC stats→SAMD21 model 48kHz/WIN_SEL/AC-rms
+(0045904); io_mode + hwio v2 + IO_MODE discovery + mode-gating (e6ccf44); commission tool v2 (1581b0f);
+GPIO mode complete — debounce/raw-deb/READ_ALL/UNUSED-read/OC-OC_PU-write/IPOL (7cfbcca,a3414fc); COUNTER
+mode complete — config-byte + read-clear (5cbe2cc,fa820ce); ADC-window interlock operands _adcN{min,max,
+avg,rms} (eb22386). End-to-end commission (CAF4→counter→GPIO→ADC-rms-trip) all HW-verified.
+**NEXT = Step 2 (operate layer + reply-sink dispatch) → Step 5 (I2C unified + slave i2c_service_task +
+engine route) → Step 6 (chain-tree bench bridge); SERVO mode deferred.** No task in flight.★
+★GOTCHAS: hwio is now schema v2 (idnt+hwio+ilcN via `cfg_image.lua --mode/--io/--il`); NEVER toggle
+ADC_IRQ_FIFO off-core (use save/restore_interrupts) — it re-freezes the ADC. Prior: base interlock
+(9924c37); grace-redrain (`f1c3045`). Older sections are history/reference.★
 
 ---
 
