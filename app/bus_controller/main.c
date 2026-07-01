@@ -141,6 +141,7 @@
 #define CMD_GPIO_READ_ALL        0x0111u // GPIO mode: [] -> [raw u8][deb u8] (bit i = GP(2+i))
 #define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
 #define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
+#define CMD_PULSE_READCLR        0x0114u // COUNTER: read-and-clear all 8 counts atomically -> [count u32]x8
 #define CMD_PWM_TEST             0x0109u // GP22 test source: [freq_hz u32][duty_pct u8]; 0 freq/duty = off (hi-Z)
 // 0x0109 (PWM) / 0x010A-0x010B (quad) RETIRED 2026-06-23 — PWM + quad moved to Pico2.
 #define CMD_I2C_SCAN             0x010Cu // [] -> [addr u8]... (7-bit ACKing devices)
@@ -2751,6 +2752,20 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
             if (mask & (1u << i)) g_pulse_count[i] = 0;
         return SHELL_OK;
+    }
+    case CMD_PULSE_READCLR: {      // COUNTER mode: atomic read-and-clear of all 8 counts
+        if (g_io_mode != HWIO_MODE_COUNTER) return SHELL_BAD_ARGS;
+        if (cap < (uint8_t)(HIL_GPIO_COUNT * 4u)) return SHELL_BAD_ARGS;
+        uint32_t snap[HIL_GPIO_COUNT];
+        uint32_t isr = save_and_disable_interrupts();      // coherent vs the 1 kHz sampler
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) { snap[i] = g_pulse_count[i]; g_pulse_count[i] = 0; }
+        restore_interrupts(isr);
+        uint8_t n = 0;
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
+            uint32_t v = snap[i];
+            out[n++]=(uint8_t)v; out[n++]=(uint8_t)(v>>8); out[n++]=(uint8_t)(v>>16); out[n++]=(uint8_t)(v>>24);
+        }
+        *outlen = n; return SHELL_OK;
     }
     case CMD_SERVO_SET_ALL: {      // SERVO mode: [width_us u16 LE] x up to the armed servo count
         if (g_io_mode != HWIO_MODE_SERVO) return SHELL_BAD_ARGS;
