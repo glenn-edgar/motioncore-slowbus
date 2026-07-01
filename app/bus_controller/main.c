@@ -38,6 +38,7 @@
 #include "hardware/clocks.h"        // clock_get_hz (servo 1 us/tick)
 #include "hardware/i2c.h"           // HIL I2C manager on GP10/11
 #include "hardware/timer.h"         // hardware_alarm_* (liveness-slot idle-gap alarm)
+#include "hardware/pwm.h"           // GP22 PWM test source (CMD_PWM_TEST)
 #include "pico/critical_section.h"   // hw spinlock + IRQ-save (TX buffer pool, §17)
 #ifdef I2C_SELFTEST
 #include "pico/i2c_slave.h"         // i2c0 loopback self-test fixture (opt-in)
@@ -137,6 +138,7 @@
 #define CMD_GPIO_READ            0x0102u // [port u8][pin u8] -> [level u8]
 #define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
 #define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
+#define CMD_PWM_TEST             0x0109u // GP22 test source: [freq_hz u32][duty_pct u8]; 0 freq/duty = off (hi-Z)
 // 0x0109 (PWM) / 0x010A-0x010B (quad) RETIRED 2026-06-23 — PWM + quad moved to Pico2.
 #define CMD_I2C_SCAN             0x010Cu // [] -> [addr u8]... (7-bit ACKing devices)
 #define CMD_I2C_WRITE            0x010Du // [addr u8][data...] -> []
@@ -1675,18 +1677,12 @@ __attribute__((weak)) void kb1_on_fast_tick(void) {}
 __attribute__((weak)) void kb2_on_fast_tick(void) {}
 
 static void adc_fifo_isr(void) {
-    // Overflow desyncs the round-robin phase (dropped samples). Rare in this
-    // system (FIFO 8 deep, drained every IRQ), but if it ever happens, restart
-    // cleanly so phase realigns to channel 0.
-    if (adc_hw->fcs & ADC_FCS_OVER_BITS) {
-        adc_run(false);
-        adc_fifo_drain();
-        hw_set_bits(&adc_hw->fcs, ADC_FCS_OVER_BITS | ADC_FCS_UNDER_BITS);
-        for (uint8_t i = 0; i < ADC_NCH; i++) { adc_acc[i] = 0; adc_acc_n[i] = 0; }
-        adc_phase = 0; adc_select_input(0); g_adc_resyncs++;
-        adc_run(true);
-        return;
-    }
+    // Drain whatever the FIFO holds FIRST, so the decimation tiers keep advancing
+    // even while recovering from an overrun. (The old code early-returned on OVER
+    // WITHOUT draining and did an adc_run stop/start: on the busier slave core the
+    // FIFO can outrun the ISR, and once OVER latched, every IRQ just resynced and
+    // bailed — the FIFO never drained and the ADC froze forever. Drain-then-clear
+    // recovers in place with no stop/start churn and can never freeze.)
     while (!adc_fifo_is_empty()) {
         uint16_t raw = adc_fifo_get() & 0x0FFFu;       // 12-bit sample
         uint8_t ch = adc_phase;
@@ -1719,11 +1715,24 @@ static void adc_fifo_isr(void) {
         }
         if (++adc_phase >= ADC_NCH) adc_phase = 0;
     }
+    // Overrun/underrun are sticky (W1C). If the ISR ran late the FIFO overflowed:
+    // samples were dropped so the round-robin phase has slipped. Clear the flags and
+    // realign to channel 0 AFTER draining, so the decimator already advanced this IRQ.
+    if (adc_hw->fcs & (ADC_FCS_OVER_BITS | ADC_FCS_UNDER_BITS)) {
+        hw_set_bits(&adc_hw->fcs, ADC_FCS_OVER_BITS | ADC_FCS_UNDER_BITS);
+        for (uint8_t i = 0; i < ADC_NCH; i++) { adc_acc[i] = 0; adc_acc_n[i] = 0; }
+        adc_phase = 0; adc_select_input(0); g_adc_resyncs++;
+    }
 }
 
-// Bring up the ADC service. MUST be called from core1 so ADC_IRQ_FIFO is enabled
-// on core1's NVIC — ISR, interlock callbacks, and consuming KBs all same-core.
-static void adc_service_init(void) {
+// ADC config (peripheral + FIFO + handler registration). Global state — safe from
+// any core, pre- or post-scheduler. Does NOT enable the NVIC line or start
+// conversions: that is adc_service_start_on_core(), which MUST run on the core that
+// will service the ISR (irq_set_enabled is per-core). Splitting the two lets the
+// slave configure pre-scheduler on core0 but service the ISR on core1 (the master
+// already runs both on core1). Running conversions on the busier core0 let the
+// 8-deep FIFO outrun the ISR -> stuck OVER flag -> frozen ADC.
+static void adc_service_config(void) {
     adc_init();
     for (uint8_t i = 0; i < ADC_NCH; i++) adc_gpio_init(ADC0_GPIO + i);
     adc_set_round_robin((1u << ADC_NCH) - 1);          // channels 0..ADC_NCH-1
@@ -1733,8 +1742,20 @@ static void adc_service_init(void) {
     adc_set_clkdiv(ADC_CLKDIV);
     irq_set_exclusive_handler(ADC_IRQ_FIFO, adc_fifo_isr);
     adc_irq_set_enabled(true);
+}
+
+// Enable the ADC FIFO IRQ on THIS core's NVIC and start free-running conversions.
+// Call from the core that will own the ISR (core1). adc_run last so the FIFO can't
+// overflow before the ISR is live.
+static void adc_service_start_on_core(void) {
     irq_set_enabled(ADC_IRQ_FIFO, true);
     adc_run(true);
+}
+
+// Master: config + start both on core1 (app_engine_task). Kept as one call.
+static void adc_service_init(void) {
+    adc_service_config();
+    adc_service_start_on_core();
 }
 
 // KB1 (api/HIL): CMD_ADC_READ -> snapshot the 3 decimated channels from the
@@ -2510,7 +2531,9 @@ static void interlock_thread2_start(void) {
 // interlocks now work on the slave too.
 void node_thread2_start(void) {
     interlock_boot_decide();
-    adc_service_init();
+    adc_service_config();       // config only (core0, pre-scheduler); the ISR is
+                                // enabled + conversions started on core1 in
+                                // node_engine_task, so the FIFO can't outrun it.
     hwio_apply(&g_hwio);
     interlock_thread2_start();
 }
@@ -2554,6 +2577,36 @@ static uint8_t il_status_pack(uint8_t *out, uint8_t cap) {
 // caller owns the reply transport (USB up-queue vs bus window), so the same dispatch
 // serves both roles. Replaces the duplicated node_hil_gpio + per-side handlers.
 #define NODE_CMD_ECHO  0x0001u   // host/peer echo (now handled on both roles)
+
+// GP22 PWM test source. A settable-frequency/duty square wave for bench testing —
+// loop it into an ADC pin (raw for AC/known-freq, or via an RC for a DC level) or a
+// counter/edge input. freq_hz==0 or duty==0 releases the pin to hi-Z (off). The clk
+// divider is chosen so TOP fits 16 bits across the chip's sys clock (125/150 MHz).
+static void pwm_test_set(uint32_t freq_hz, uint8_t duty_pct) {
+    const uint slice = pwm_gpio_to_slice_num(PWM_TEST_PIN);
+    const uint chan  = pwm_gpio_to_channel(PWM_TEST_PIN);
+    if (freq_hz == 0u || duty_pct == 0u) {                 // OFF -> hi-Z (no drive)
+        pwm_set_enabled(slice, false);
+        gpio_set_function(PWM_TEST_PIN, GPIO_FUNC_SIO);
+        gpio_set_dir(PWM_TEST_PIN, false);
+        return;
+    }
+    if (duty_pct > 100u) duty_pct = 100u;
+    uint32_t fsys = clock_get_hz(clk_sys);
+    uint32_t div  = (fsys / (freq_hz * 65536u)) + 1u;      // integer clkdiv so TOP <= 65535
+    if (div > 255u) div = 255u;
+    uint32_t top  = fsys / (div * freq_hz);                // counts per period
+    if (top < 2u)     top = 2u;
+    if (top > 65536u) top = 65536u;
+    uint16_t wrap = (uint16_t)(top - 1u);
+    uint16_t level = (uint16_t)(((uint32_t)top * duty_pct) / 100u);
+    gpio_set_function(PWM_TEST_PIN, GPIO_FUNC_PWM);
+    pwm_set_clkdiv_int_frac(slice, (uint8_t)div, 0);
+    pwm_set_wrap(slice, wrap);
+    pwm_set_chan_level(slice, chan, level);
+    pwm_set_enabled(slice, true);
+}
+
 // (CMD_NOT_MINE sentinel is defined in node_role.h — shared with the slave.)
 uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
                           uint8_t *out, uint8_t cap, uint8_t *outlen) {
@@ -2581,6 +2634,34 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         interlock_request_global_clear(); return SHELL_OK;
     case CMD_INTERLOCK_STATUS:
         *outlen = il_status_pack(out, cap); return SHELL_OK;
+    case CMD_PWM_TEST: {           // GP22 test source: [freq_hz u32][duty_pct u8]
+        if (alen < 5) return SHELL_BAD_ARGS;
+        uint32_t f = (uint32_t)args[0] | ((uint32_t)args[1] << 8) |
+                     ((uint32_t)args[2] << 16) | ((uint32_t)args[3] << 24);
+        pwm_test_set(f, args[4]);
+        if (cap >= 4) {            // readback: pin / function / instantaneous level / slice
+            out[0] = PWM_TEST_PIN;                              // 22
+            out[1] = (uint8_t)gpio_get_function(PWM_TEST_PIN);  // GPIO_FUNC_PWM = 4
+            out[2] = (uint8_t)gpio_get(PWM_TEST_PIN);           // instantaneous pin level
+            out[3] = (uint8_t)pwm_gpio_to_slice_num(PWM_TEST_PIN);
+            *outlen = 4;
+        }
+        return SHELL_OK;
+    }
+    case CMD_ADC_READ: {           // bench: 3-ch decimated ADC snapshot -> [ch u16]*ADC_NCH
+        if (cap < (uint8_t)(2u * ADC_NCH)) return SHELL_BAD_ARGS;
+        uint8_t n = 0;
+        for (uint8_t i = 0; i < ADC_NCH; i++) {
+            uint16_t v = g_adc_latest[i];
+            out[n++] = (uint8_t)v; out[n++] = (uint8_t)(v >> 8);
+        }
+        if (cap >= (uint8_t)(2u * ADC_NCH + 8u)) {   // liveness: decimated-set count + FIFO resyncs
+            uint32_t dc = g_adc_decim_count, rs = g_adc_resyncs;
+            out[n++]=(uint8_t)dc; out[n++]=(uint8_t)(dc>>8); out[n++]=(uint8_t)(dc>>16); out[n++]=(uint8_t)(dc>>24);
+            out[n++]=(uint8_t)rs; out[n++]=(uint8_t)(rs>>8); out[n++]=(uint8_t)(rs>>16); out[n++]=(uint8_t)(rs>>24);
+        }
+        *outlen = n; return SHELL_OK;
+    }
     default:
         return CMD_NOT_MINE;
     }
@@ -2699,6 +2780,9 @@ static void node_reply_pump_task(void *arg) {
 
 static void node_engine_task(void *arg) {
     (void)arg;
+    adc_service_start_on_core();  // own the ADC FIFO ISR on core1 (config done in
+                                  // node_thread2_start) — matches the master, keeps
+                                  // the ISR off the contended core0.
     engine_runtime_bringup();   // peripherals already up via node_thread2_start
     g_hb[HB_APP]++; g_hb_us[HB_APP] = time_us_32();
     cfl_runtime_run(g_rt);
