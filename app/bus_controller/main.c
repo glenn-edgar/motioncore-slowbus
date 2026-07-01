@@ -139,6 +139,7 @@
 #define CMD_GPIO_READ            0x0102u // [port u8][pin u8] -> [level u8]
 #define CMD_IO_MODE              0x0103u // [] -> [io_mode u8][count u8][pin subconfig u8 x count]
 #define CMD_GPIO_READ_ALL        0x0111u // GPIO mode: [] -> [raw u8][deb u8] (bit i = GP(2+i))
+#define CMD_GPIO_IPOL            0x0115u // GPIO mode: [mask u8] set input-invert bitmap -> [ipol u8] (rw)
 #define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
 #define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
 #define CMD_PULSE_READCLR        0x0114u // COUNTER: read-and-clear all 8 counts atomically -> [count u32]x8
@@ -1660,8 +1661,9 @@ static uint8_t  g_io_mode = HWIO_MODE_GPIO;             // block I/O mode (from 
 // Sampled at 1 kHz in gpio_sample_1khz; raw + debounced bitmaps via CMD_GPIO_READ_ALL.
 static uint8_t  g_gpio_deb_depth[HIL_GPIO_COUNT];       // per-pin depth (0/1 passthrough, else 2..15)
 static uint16_t g_gpio_sr[HIL_GPIO_COUNT];             // per-pin shift register
-static volatile uint8_t g_gpio_raw;                    // raw sampled levels, bit i = GP(base+i)
+static volatile uint8_t g_gpio_raw;                    // raw sampled levels (post-IPOL), bit i = GP(base+i)
 static volatile uint8_t g_gpio_deb;                    // debounced levels
+static uint8_t  g_gpio_ipol;                            // input polarity invert bitmap (runtime, rw)
 
 // Called at the 1 kHz decimation anchor (ISR context). Bounded loop of 8.
 static void pulse_sample_1khz(void) {
@@ -1693,6 +1695,7 @@ static void gpio_sample_1khz(void) {
     uint8_t raw = 0;
     for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++)
         if (in & (1u << (HIL_GPIO_BASE + i))) raw |= (uint8_t)(1u << i);
+    raw ^= g_gpio_ipol;                                 // input polarity invert
     uint8_t deb = g_gpio_deb;
     for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
         uint8_t bit = (uint8_t)(1u << i), rawbit = (raw & bit) ? 1u : 0u, depth = g_gpio_deb_depth[i];
@@ -2656,19 +2659,35 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         uint8_t k = (alen > cap) ? cap : alen;
         memcpy(out, args, k); *outlen = k; return SHELL_OK;
     }
-    case CMD_GPIO_WRITE: {
+    case CMD_GPIO_WRITE: {         // OUTPUT = push-pull; OC/OC_PU = open-drain (0 drives low, 1 releases)
         if (g_io_mode != HWIO_MODE_GPIO) return SHELL_BAD_ARGS;   // wrong io_mode
         if (alen < 3) return SHELL_BAD_ARGS;
-        uint8_t port = args[0], pin = args[1], level = args[2];
-        if (port != 0 || level > 1 || hil_role_of(pin) != HWIO_ROLE_OUTPUT) return SHELL_BAD_ARGS;
-        gpio_put(pin, level); return SHELL_OK;
+        uint8_t port = args[0], pin = args[1], level = args[2], role = hil_role_of(pin);
+        if (port != 0 || level > 1) return SHELL_BAD_ARGS;
+        if (role == HWIO_ROLE_OUTPUT) {
+            gpio_put(pin, level);                                // push-pull
+        } else if (role == HWIO_ROLE_OC || role == HWIO_ROLE_OC_PU) {
+            if (level == 0) { gpio_put(pin, 0); gpio_set_dir(pin, true); }   // drive low
+            else {                                               // release -> hi-Z (+ pull-up for OC_PU)
+                gpio_set_dir(pin, false);
+                if (role == HWIO_ROLE_OC_PU) gpio_pull_up(pin); else gpio_disable_pulls(pin);
+            }
+        } else return SHELL_BAD_ARGS;
+        return SHELL_OK;
     }
-    case CMD_GPIO_READ: {          // any HIL-block pin is readable in GPIO mode (incl UNUSED)
+    case CMD_GPIO_READ: {          // any HIL-block pin is readable in GPIO mode (incl UNUSED); IPOL applied
         if (g_io_mode != HWIO_MODE_GPIO) return SHELL_BAD_ARGS;   // wrong io_mode
         if (alen < 2 || cap < 1) return SHELL_BAD_ARGS;
         uint8_t port = args[0], pin = args[1];
         if (port != 0 || pin < HIL_GPIO_BASE || pin >= HIL_GPIO_BASE + HIL_GPIO_COUNT) return SHELL_BAD_ARGS;
-        out[0] = gpio_get(pin) ? 1u : 0u; *outlen = 1; return SHELL_OK;
+        uint8_t inv = (uint8_t)((g_gpio_ipol >> (pin - HIL_GPIO_BASE)) & 1u);
+        out[0] = (gpio_get(pin) ? 1u : 0u) ^ inv; *outlen = 1; return SHELL_OK;
+    }
+    case CMD_GPIO_IPOL: {          // GPIO mode: set the input-invert bitmap (runtime); reply current
+        if (g_io_mode != HWIO_MODE_GPIO) return SHELL_BAD_ARGS;
+        if (alen >= 1) g_gpio_ipol = args[0];
+        if (cap >= 1) { out[0] = g_gpio_ipol; *outlen = 1; }
+        return SHELL_OK;
     }
     case CMD_GPIO_READ_ALL: {      // GPIO mode: raw + debounced input bitmaps (bit i = GP(2+i))
         if (g_io_mode != HWIO_MODE_GPIO) return SHELL_BAD_ARGS;
