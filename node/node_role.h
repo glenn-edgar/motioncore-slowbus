@@ -33,10 +33,26 @@ void    node_engine_start(void);
 bool    node_engine_try_route(uint8_t src, uint16_t req, uint16_t cmd,
                               const uint8_t *args, uint8_t alen);
 
+// Reply sink (Step 2): where a command's reply is delivered. Lets one operate layer
+// serve all three issuers — host (USB up-queue), bus (slave reply window), and the
+// chain-tree engine (event/blackboard). Sync ops fill the caller's buffer and the
+// caller ships it; ASYNC ops (I2C) carry the sink into the service queue so the
+// service task ships the reply later via reply_sink_send() (defined in main.c).
+typedef enum { SINK_USB = 0u, SINK_BUS = 1u, SINK_ENGINE = 2u } reply_sink_kind_t;
+typedef struct {
+    uint8_t  kind;     // reply_sink_kind_t
+    uint8_t  dest;     // SINK_BUS: the node addr to answer (the requester's src)
+    uint16_t req_id;   // correlation id echoed in the reply
+} reply_sink_t;
+
 // Thread-1 unified operate-command dispatch (B1), shared by the master appcore drain
 // and the slave bus responder. Handles echo / GPIO read-write / interlock clear-
-// status into out (<= cap) + *outlen, returns a SHELL_* status, or CMD_NOT_MINE
-// (0xFF) if cmd isn't one of these. The caller owns the reply transport.
+// status into out (<= cap) + *outlen, returns a SHELL_* status, CMD_NOT_MINE (0xFF)
+// if cmd isn't one of these, or SHELL_ASYNC (0xFE) if the command was queued for
+// asynchronous completion (I2C) — the reply then ships later via `sink`, so the
+// caller must NOT send an immediate reply. The caller owns the sync reply transport.
 #define CMD_NOT_MINE 0xFFu
+#define SHELL_ASYNC  0xFEu
 uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
-                          uint8_t *out, uint8_t cap, uint8_t *outlen);
+                          uint8_t *out, uint8_t cap, uint8_t *outlen,
+                          const reply_sink_t *sink);

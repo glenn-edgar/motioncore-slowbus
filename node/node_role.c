@@ -47,10 +47,14 @@ void bus_node_on_data(uint8_t src, const uint8_t *payload, uint8_t len) {
     r[n++] = (uint8_t)(OP_SHELL_REPLY & 0xFF); r[n++] = (uint8_t)(OP_SHELL_REPLY >> 8);
     r[n++] = (uint8_t)(req & 0xFF);            r[n++] = (uint8_t)(req >> 8);
 
-    // Thread-1 unified operate dispatch (shared with the master). The slave has no
-    // engine-routed / async extras, so anything not handled here is UNKNOWN.
+    // Thread-1 unified operate dispatch (shared with the master). A SINK_BUS reply sink
+    // lets async ops (I2C, once the slave gains an i2c_service_task in Step 5) ship their
+    // reply back to this node's bus window later; today the slave has no async service, so
+    // node_cmd_dispatch returns CMD_NOT_MINE for those and anything unhandled is UNKNOWN.
+    reply_sink_t sink = { .kind = SINK_BUS, .dest = src, .req_id = req };
     uint8_t out[BUS_PAYLOAD_MAX]; uint8_t outlen = 0;
-    uint8_t st = node_cmd_dispatch(cmd, args, alen, out, (uint8_t)(BUS_PAYLOAD_MAX - n), &outlen);
+    uint8_t st = node_cmd_dispatch(cmd, args, alen, out, (uint8_t)(BUS_PAYLOAD_MAX - n), &outlen, &sink);
+    if (st == SHELL_ASYNC) return;   // async op: the service task replies later via the sink
     if (st == CMD_NOT_MINE) {
         r[n++] = NODE_SHELL_UNKNOWN;
     } else {

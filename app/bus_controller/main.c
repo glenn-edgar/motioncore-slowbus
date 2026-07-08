@@ -658,7 +658,9 @@ static void on_local_shell(void *u, uint16_t req_id, uint16_t cmd, const uint8_t
         // the MASTER exposes the same operate commands over its USB shell that a slave
         // answers over the bus — e.g. CMD_INTERLOCK_STATUS for its own Thread-2 interlock.
         uint8_t out[64]; uint8_t outlen = 0;
-        uint8_t st = node_cmd_dispatch(cmd, args, alen, out, sizeof out, &outlen);
+        reply_sink_t s = { .kind = SINK_USB, .dest = 0, .req_id = req_id };
+        uint8_t st = node_cmd_dispatch(cmd, args, alen, out, sizeof out, &outlen, &s);
+        if (st == SHELL_ASYNC) break;   // async op (I2C): reply ships later via the sink (g_up_q)
         if (st != CMD_NOT_MINE) host_link_shell_reply(&g_hl, req_id, st, out, outlen);
         else                    host_link_shell_reply(&g_hl, req_id, SHELL_UNKNOWN_CMD, NULL, 0);
         break;
@@ -2091,7 +2093,7 @@ static uint i2c_to_us(uint len) { return 2000u + len * 200u; }
 // interface (enqueue / read blackboard) is fixed.
 typedef enum { I2C_OP_SCAN = 0, I2C_OP_WRITE, I2C_OP_READ, I2C_OP_WRITE_READ } i2c_op_t;
 typedef struct {
-    uint16_t req_id;                  // OP_SHELL_REPLY correlation
+    reply_sink_t sink;                // where the completion reply goes (Step 2)
     uint8_t  op;                      // i2c_op_t
     uint8_t  addr;                    // 7-bit device address
     uint8_t  wlen, rlen;              // write / read byte counts
@@ -2224,59 +2226,36 @@ static inline uint8_t hil_role_of(uint8_t pin) {
 }
 
 // ---- GPIO + pulse-count command surface (handled inline on core1) -----------
-static void hil_reply(uint16_t req_id, uint8_t status, const uint8_t *res, uint8_t rlen) {
-    appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
-    uint8_t n = 0;
-    r.payload[n++] = (uint8_t)req_id; r.payload[n++] = (uint8_t)(req_id >> 8);
-    r.payload[n++] = status;
-    for (uint8_t i = 0; i < rlen && n < APPCORE_PAY_MAX; i++) r.payload[n++] = res[i];
-    r.len = n; (void)xQueueSend(g_up_q, &r, 0);
-}
-
-// Returns true if cmd was a GPIO/pulse command (reply already sent), false otherwise.
-static bool hil_gpio_dispatch(const appcore_cmd_t *c) {
-    switch (c->cmd) {
-    case CMD_GPIO_CONFIG:
-        // RETIRED: pin roles are FROZEN at config time (hwio), applied once at boot
-        // by hwio_apply(). Runtime reconfiguration is no longer permitted — operate
-        // the pins, don't reconfigure them. Always rejected.
-        hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true;
-    // CMD_GPIO_WRITE / CMD_GPIO_READ / CMD_GPIO_ROLES / CMD_PULSE_READ / CMD_PULSE_CLEAR /
-    // CMD_SERVO_SET_ALL / CMD_SERVO_STOP are all handled by the unified node_cmd_dispatch
-    // (shared with the slave, so servo + pulse now work on any node over the bus) — the
-    // api-engine path tries node_cmd_dispatch first, so they never reach here.
-    // CMD_PWM_SET / CMD_QUAD_READ / CMD_QUAD_CLEAR removed 2026-06-23 (moved to Pico2).
-    case CMD_I2C_SCAN: {                              // -> i2c_service_task (async, off the engine)
-        i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_SCAN };
-        (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
+// Reply-sink dispatch (Step 2): ship one operate-command reply to the sink the
+// issuer chose. SINK_USB -> the core1->core0 up-queue (usb_pump relays to the host);
+// SINK_BUS -> the slave's bus reply window (used by the slave's async service task,
+// Step 5); SINK_ENGINE -> the chain-tree (Step 6, not yet wired -> drop).
+static void reply_sink_send(const reply_sink_t *s, uint8_t status,
+                            const uint8_t *res, uint8_t rlen) {
+    switch (s->kind) {
+    case SINK_BUS: {
+        uint8_t r[BUS_PAYLOAD_MAX]; uint8_t n = 0;
+        r[n++] = (uint8_t)(OP_SHELL_REPLY & 0xFF); r[n++] = (uint8_t)(OP_SHELL_REPLY >> 8);
+        r[n++] = (uint8_t)s->req_id;               r[n++] = (uint8_t)(s->req_id >> 8);
+        r[n++] = status;
+        for (uint8_t i = 0; i < rlen && n < BUS_PAYLOAD_MAX; i++) r[n++] = res[i];
+        (void)bus_node_queue(s->dest, BUS_FT_DATA, r, n);
+        return;
     }
-    case CMD_I2C_WRITE: {
-        if (c->alen < 1) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_WRITE, .addr = c->args[0],
-                        .wlen = (uint8_t)(c->alen - 1) };
-        if (q.wlen > HIL_I2C_MAX_LEN) q.wlen = HIL_I2C_MAX_LEN;
-        memcpy(q.data, &c->args[1], q.wlen);
-        (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
+    case SINK_ENGINE:
+        return;   // Step 6: route into the chain-tree; no engine-async issuer yet -> drop
+    case SINK_USB:
+    default: {
+        appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
+        uint8_t n = 0;
+        r.payload[n++] = (uint8_t)s->req_id; r.payload[n++] = (uint8_t)(s->req_id >> 8);
+        r.payload[n++] = status;
+        for (uint8_t i = 0; i < rlen && n < APPCORE_PAY_MAX; i++) r.payload[n++] = res[i];
+        r.len = n; (void)xQueueSend(g_up_q, &r, 0);
+        return;
     }
-    case CMD_I2C_READ: {
-        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_READ, .addr = c->args[0], .rlen = c->args[1] };
-        if (q.rlen > HIL_I2C_MAX_LEN) q.rlen = HIL_I2C_MAX_LEN;
-        (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
-    }
-    case CMD_I2C_WRITE_READ: {
-        if (c->alen < 2) { hil_reply(c->req_id, SHELL_BAD_ARGS, NULL, 0); return true; }
-        i2c_req_t q = { .req_id = c->req_id, .op = I2C_OP_WRITE_READ, .addr = c->args[0],
-                        .rlen = c->args[1], .wlen = (uint8_t)(c->alen - 2) };
-        if (q.rlen > HIL_I2C_MAX_LEN) q.rlen = HIL_I2C_MAX_LEN;
-        if (q.wlen > HIL_I2C_MAX_LEN) q.wlen = HIL_I2C_MAX_LEN;
-        memcpy(q.data, &c->args[2], q.wlen);
-        (void)xQueueSend(g_i2c_req_q, &q, 0); return true;
-    }
-    default: return false;
     }
 }
-
 // Execute one queued request on the bus (blocking) + post its reply. Runs on the
 // i2c_service_task — the only context that touches i2c1, so no locking needed.
 static void i2c_exec(const i2c_req_t *q) {
@@ -2288,28 +2267,28 @@ static void i2c_exec(const i2c_req_t *q) {
             uint8_t d;
             if (i2c_read_timeout_us(HIL_I2C_INST, a, &d, 1, false, i2c_to_us(1)) >= 0) found[n++] = a;
         }
-        hil_reply(q->req_id, SHELL_OK, found, n); return;
+        reply_sink_send(&q->sink, SHELL_OK, found, n); return;
     }
     case I2C_OP_WRITE: {
         int ret = i2c_write_timeout_us(HIL_I2C_INST, q->addr, q->data, q->wlen, false, i2c_to_us(q->wlen));
-        hil_reply(q->req_id, (ret == (int)q->wlen || (q->wlen == 0 && ret == 0)) ? SHELL_OK : SHELL_IO_ERROR, NULL, 0);
+        reply_sink_send(&q->sink, (ret == (int)q->wlen || (q->wlen == 0 && ret == 0)) ? SHELL_OK : SHELL_IO_ERROR, NULL, 0);
         return;
     }
     case I2C_OP_READ: {
         int ret = i2c_read_timeout_us(HIL_I2C_INST, q->addr, buf, q->rlen, false, i2c_to_us(q->rlen));
-        if (ret == (int)q->rlen) hil_reply(q->req_id, SHELL_OK, buf, q->rlen);
-        else                     hil_reply(q->req_id, SHELL_IO_ERROR, NULL, 0);
+        if (ret == (int)q->rlen) reply_sink_send(&q->sink, SHELL_OK, buf, q->rlen);
+        else                     reply_sink_send(&q->sink, SHELL_IO_ERROR, NULL, 0);
         return;
     }
     case I2C_OP_WRITE_READ: {
         int w = i2c_write_timeout_us(HIL_I2C_INST, q->addr, q->data, q->wlen, true, i2c_to_us(q->wlen));
-        if (w != (int)q->wlen) { hil_reply(q->req_id, SHELL_IO_ERROR, NULL, 0); return; }
+        if (w != (int)q->wlen) { reply_sink_send(&q->sink, SHELL_IO_ERROR, NULL, 0); return; }
         int r = i2c_read_timeout_us(HIL_I2C_INST, q->addr, buf, q->rlen, false, i2c_to_us(q->rlen));
-        if (r == (int)q->rlen) hil_reply(q->req_id, SHELL_OK, buf, q->rlen);
-        else                   hil_reply(q->req_id, SHELL_IO_ERROR, NULL, 0);
+        if (r == (int)q->rlen) reply_sink_send(&q->sink, SHELL_OK, buf, q->rlen);
+        else                   reply_sink_send(&q->sink, SHELL_IO_ERROR, NULL, 0);
         return;
     }
-    default: hil_reply(q->req_id, SHELL_BAD_ARGS, NULL, 0); return;
+    default: reply_sink_send(&q->sink, SHELL_BAD_ARGS, NULL, 0); return;
     }
 }
 
@@ -2378,20 +2357,19 @@ void cfl_embed_pre_tick(void) {
             r.payload[2] = SHELL_OK; r.len = 3;
             (void)xQueueSend(g_up_q, &r, 0);
         } else {
-            // Thread-1 unified operate dispatch (echo / GPIO / interlock), shared
-            // with the slave responder. Then the master's own extras (servo / pulse
-            // / I2C via hil_gpio_dispatch), else UNKNOWN.
+            // Thread-1 unified operate dispatch (echo / GPIO / interlock / servo /
+            // pulse / async-I2C), shared with the slave responder. Sync ops reply
+            // inline; SHELL_ASYNC (I2C) ships its reply later via the sink; else UNKNOWN.
             uint8_t out[APPCORE_PAY_MAX], outlen;
-            uint8_t st = node_cmd_dispatch(c.cmd, c.args, c.alen, out, sizeof out, &outlen);
-            if (st != CMD_NOT_MINE) {
-                hil_reply(c.req_id, st, out, outlen);
-            } else if (hil_gpio_dispatch(&c)) {
-                // servo / pulse / I2C / (frozen) config handled inline (reply sent within)
-            } else {   // unknown command -> direct UNKNOWN_CMD reply (no chain handler)
-                appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
-                r.payload[0] = (uint8_t)c.req_id; r.payload[1] = (uint8_t)(c.req_id >> 8);
-                r.payload[2] = SHELL_UNKNOWN_CMD; r.len = 3;
-                (void)xQueueSend(g_up_q, &r, 0);
+            reply_sink_t sink = { .kind = (c.route == ROUTE_BUS) ? SINK_BUS : SINK_USB,
+                                  .dest = c.bus_src, .req_id = c.req_id };
+            uint8_t st = node_cmd_dispatch(c.cmd, c.args, c.alen, out, sizeof out, &outlen, &sink);
+            if (st == SHELL_ASYNC) {
+                // async op (I2C): the service task replies via `sink`
+            } else if (st != CMD_NOT_MINE) {
+                reply_sink_send(&sink, st, out, outlen);
+            } else {   // unknown command
+                reply_sink_send(&sink, SHELL_UNKNOWN_CMD, NULL, 0);
             }
         }
     }
@@ -2666,7 +2644,8 @@ static void pwm_test_set(uint32_t freq_hz, uint8_t duty_pct) {
 
 // (CMD_NOT_MINE sentinel is defined in node_role.h — shared with the slave.)
 uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
-                          uint8_t *out, uint8_t cap, uint8_t *outlen) {
+                          uint8_t *out, uint8_t cap, uint8_t *outlen,
+                          const reply_sink_t *sink) {
     *outlen = 0;
     switch (cmd) {
     case NODE_CMD_ECHO: {
@@ -2817,6 +2796,46 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
     case CMD_SERVO_STOP:           // SERVO mode: release the bank -> GP2.. back to GPIO input
         if (g_io_mode != HWIO_MODE_SERVO) return SHELL_BAD_ARGS;
         servo_stop_all(); return SHELL_OK;
+    case CMD_GPIO_CONFIG:
+        // RETIRED: pin roles are FROZEN at commission (hwio), applied once at boot by
+        // hwio_apply(). Runtime reconfiguration is not permitted — operate, don't reconfigure.
+        return SHELL_BAD_ARGS;
+    // ---- async I2C: enqueue with the reply sink; the i2c_service_task ships the reply
+    // later via reply_sink_send(). g_i2c_req_q is NULL on a node with no I2C service
+    // (slave, pre-Step-5) -> fall through to CMD_NOT_MINE (UNKNOWN), unchanged behavior.
+    case CMD_I2C_SCAN: {
+        if (!g_i2c_req_q) return CMD_NOT_MINE;
+        i2c_req_t q; memset(&q, 0, sizeof q); q.sink = *sink; q.op = I2C_OP_SCAN;
+        (void)xQueueSend(g_i2c_req_q, &q, 0); return SHELL_ASYNC;
+    }
+    case CMD_I2C_WRITE: {
+        if (!g_i2c_req_q) return CMD_NOT_MINE;
+        if (alen < 1) return SHELL_BAD_ARGS;
+        i2c_req_t q; memset(&q, 0, sizeof q);
+        q.sink = *sink; q.op = I2C_OP_WRITE; q.addr = args[0];
+        q.wlen = (uint8_t)(alen - 1); if (q.wlen > HIL_I2C_MAX_LEN) q.wlen = HIL_I2C_MAX_LEN;
+        memcpy(q.data, &args[1], q.wlen);
+        (void)xQueueSend(g_i2c_req_q, &q, 0); return SHELL_ASYNC;
+    }
+    case CMD_I2C_READ: {
+        if (!g_i2c_req_q) return CMD_NOT_MINE;
+        if (alen < 2) return SHELL_BAD_ARGS;
+        i2c_req_t q; memset(&q, 0, sizeof q);
+        q.sink = *sink; q.op = I2C_OP_READ; q.addr = args[0]; q.rlen = args[1];
+        if (q.rlen > HIL_I2C_MAX_LEN) q.rlen = HIL_I2C_MAX_LEN;
+        (void)xQueueSend(g_i2c_req_q, &q, 0); return SHELL_ASYNC;
+    }
+    case CMD_I2C_WRITE_READ: {
+        if (!g_i2c_req_q) return CMD_NOT_MINE;
+        if (alen < 2) return SHELL_BAD_ARGS;
+        i2c_req_t q; memset(&q, 0, sizeof q);
+        q.sink = *sink; q.op = I2C_OP_WRITE_READ; q.addr = args[0]; q.rlen = args[1];
+        q.wlen = (uint8_t)(alen - 2);
+        if (q.rlen > HIL_I2C_MAX_LEN) q.rlen = HIL_I2C_MAX_LEN;
+        if (q.wlen > HIL_I2C_MAX_LEN) q.wlen = HIL_I2C_MAX_LEN;
+        memcpy(q.data, &args[2], q.wlen);
+        (void)xQueueSend(g_i2c_req_q, &q, 0); return SHELL_ASYNC;
+    }
     default:
         return CMD_NOT_MINE;
     }
