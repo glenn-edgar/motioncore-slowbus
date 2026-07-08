@@ -62,11 +62,15 @@ end
 --       node and the master correlates the reply (node-to-node, master-initiated).
 --   IL: CMD_APP_IL_CLEAR (event 25) — the engine (Thread 3) clears Thread 2's latched
 --       interlock trips (interlock_request_global_clear); fail-safe re-latch if still violated.
+--   OP: CMD_APP_OP (event 26) — the engine (a KB action leaf) issues an operate
+--       command (GPIO/ADC/counter/servo/I2C) via the shared node_cmd_dispatch and the
+--       reply routes back to whoever asked (Step 6 chain-tree<->bench bridge).
 local function build_kbapp(ct)
     ct:start_test("kbapp")
     command_column(ct, "app_", "CMD_APP_ECHO",     "APP_ECHO")
     command_column(ct, "app_", "CMD_APP_ECHO_TO",  "APP_ECHO_TO")
     command_column(ct, "app_", "CMD_APP_IL_CLEAR", "APP_IL_CLEAR")
+    command_column(ct, "app_", "CMD_APP_OP",       "APP_OP")
     ct:end_test()
 end
 

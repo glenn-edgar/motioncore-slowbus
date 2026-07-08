@@ -131,6 +131,8 @@
 #define CMD_APP_PP_START         0x0303u // ping-pong bench: [addr] start free-running master<->slave chain-flow loop
 #define CMD_APP_PP_STOP          0x0304u // ping-pong bench: stop the loop
 #define CMD_APP_PP_READ          0x0305u // ping-pong bench: -> [master_cnt u32][slave_cnt u32] (read out-of-band)
+#define CMD_APP_OP               0x0306u // Thread 3 (kbapp) Step 6: engine issues an operate cmd
+                                         // [op u16 LE][operate args...] via node_cmd_dispatch; reply routes to the asker
 #define KBAPP_VER                1u
 
 // ---- GPIO + pulse-count HIL (KB1 api; pin map per board.h) ------------------
@@ -1853,6 +1855,9 @@ typedef struct { uint16_t req_id; uint8_t addr; uint8_t route; uint8_t bus_src; 
 static app_req_t g_app_req[APP_REQ_SLOTS];
 static uint8_t   g_app_req_head;
 
+static void reply_sink_send(const reply_sink_t *s, uint8_t status,
+                            const uint8_t *res, uint8_t rlen);   // fwd: defined below
+
 // Route a kbapp reply by the request's tag: the reply always rides g_up_q, and the
 // role-specific drain delivers it (master uplink -> USB; slave pump -> bus window).
 // `body` is the OP_SHELL_REPLY payload (typically [req][status]...). dest = appcore on
@@ -1906,6 +1911,29 @@ void kbapp_on_il_clear(void *handle, unsigned node_index) {
     p[n++] = (uint8_t)q->req_id; p[n++] = (uint8_t)(q->req_id >> 8);
     p[n++] = SHELL_OK; p[n++] = 1u;           // 1 = global clear requested
     kbapp_reply(q, p, n);
+}
+
+// Step 6 (chain-tree <-> bench bridge): a kbapp ACTION LEAF issues an operate command
+// through the shared operate layer (node_cmd_dispatch). Payload = [op u16 LE][args...].
+// The reply routes back to whoever asked (USB host or bus node) via that requester's
+// reply sink; an async op (I2C) returns SHELL_ASYNC and the i2c_service_task ships the
+// reply via the SAME sink later — the engine tick never blocks on the transfer. This is
+// the generic mechanism an autonomous KB tree uses to drive/read the bench surface.
+void kbapp_on_op(void *handle, unsigned node_index) {
+    (void)node_index;
+    cfl_runtime_handle_t *rt = (cfl_runtime_handle_t *)handle;
+    const app_req_t *q = (const app_req_t *)rt->event_data_ptr->data.ptr;
+    if (!q) return;
+    reply_sink_t sink = { .kind = (q->route == ROUTE_BUS) ? SINK_BUS : SINK_USB,
+                          .dest = q->bus_src, .req_id = q->req_id };
+    if (q->len < 2) { reply_sink_send(&sink, SHELL_BAD_ARGS, NULL, 0); return; }
+    uint16_t op = (uint16_t)q->bytes[0] | ((uint16_t)q->bytes[1] << 8);
+    uint8_t out[APPCORE_PAY_MAX]; uint8_t outlen = 0;
+    uint8_t st = node_cmd_dispatch(op, &q->bytes[2], (uint8_t)(q->len - 2),
+                                   out, sizeof out, &outlen, &sink);
+    if (st == SHELL_ASYNC) return;             // async (I2C): reply ships later via the sink
+    if (st == CMD_NOT_MINE) st = SHELL_UNKNOWN_CMD;
+    reply_sink_send(&sink, st, out, outlen);
 }
 
 // kbapp (C2): CMD_APP_ECHO_TO — the engine ORIGINATES a bus echo to a slave node.
@@ -2334,6 +2362,15 @@ void cfl_embed_pre_tick(void) {
             q->req_id = c.req_id; q->route = c.route; q->bus_src = c.bus_src; q->addr = 0; q->len = 0;
             cfl_send_data_event(g_rt->event_queue, CFL_EVENT_PRIORITY_LOW,
                                 g_kbapp_node, false, EVENT_CMD_APP_IL_CLEAR, q);
+        } else if (c.cmd == CMD_APP_OP) {        // Step 6: engine-issued operate command via a kbapp leaf
+            app_req_t *q = &g_app_req[g_app_req_head];
+            g_app_req_head = (uint8_t)((g_app_req_head + 1u) % APP_REQ_SLOTS);
+            q->req_id = c.req_id; q->addr = 0; q->route = c.route; q->bus_src = c.bus_src;
+            uint8_t m = c.alen; if (m > APP_REQ_MAX) m = APP_REQ_MAX;
+            q->len = m;
+            for (uint8_t i = 0; i < m; i++) q->bytes[i] = c.args[i];   // [op u16][operate args]
+            cfl_send_data_event(g_rt->event_queue, CFL_EVENT_PRIORITY_LOW,
+                                g_kbapp_node, false, EVENT_CMD_APP_OP, q);
         } else if (c.cmd == CMD_MON_STREAM) {   // [enable u8][period_ms u16][mask u16]
             if (c.alen >= 3) {
                 g_stream_on = c.args[0];
