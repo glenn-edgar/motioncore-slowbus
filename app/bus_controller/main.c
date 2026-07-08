@@ -142,6 +142,8 @@
 #define CMD_IO_MODE              0x0103u // [] -> [io_mode u8][count u8][pin subconfig u8 x count]
 #define CMD_GPIO_READ_ALL        0x0111u // GPIO mode: [] -> [raw u8][deb u8] (bit i = GP(2+i))
 #define CMD_GPIO_IPOL            0x0115u // GPIO mode: [mask u8] set input-invert bitmap -> [ipol u8] (rw)
+#define CMD_BENCH_BB             0x0116u // Step 6b: read the engine's bench blackboard view ->
+                                         // [bound u8][gpio_raw u8][gpio_deb u8][cnt u32 x8] (as republished each tick)
 #define CMD_PULSE_READ           0x0107u // [] -> [count u32 LE] x8 (GP2..GP9 running totals)
 #define CMD_PULSE_CLEAR          0x0108u // [mask u8] bit i -> clear GP(HIL_GPIO_BASE+i); 0xFF=all
 #define CMD_PULSE_READCLR        0x0114u // COUNTER: read-and-clear all 8 counts atomically -> [count u32]x8
@@ -1648,6 +1650,9 @@ static uint16_t isqrt32(uint32_t v) {
 
 // Cached blackboard slot pointers (chain_tree-facing 10 Hz streams), bound once.
 static int32_t *g_bb_mean[ADC_NCH], *g_bb_max[ADC_NCH], *g_bb_rms[ADC_NCH];
+// Step 6b: bench-input slots — GPIO raw/debounced bitmaps + the 8 pulse counters,
+// republished every engine tick so a KB condition/watch leaf reads them like a stream.
+static int32_t *g_bb_gpio_raw, *g_bb_gpio_deb, *g_bb_cnt[HIL_GPIO_COUNT];
 
 // ---- pulse-count service (1 kHz software edge counter, GP2..GP9, zero PIO) --
 // Counts are running totals exposed as globals (like g_adc_latest), cleared only
@@ -1994,6 +1999,17 @@ static void adc_publish_10hz(void) {
         if (g_bb_max[ch])  *g_bb_max[ch]  = (int32_t)s[ch].max;
         if (g_bb_rms[ch])  *g_bb_rms[ch]  = (int32_t)s[ch].rms;
     }
+}
+
+// Step 6b: republish the current bench inputs (GPIO raw/debounced bitmaps + the 8 pulse
+// counters) into the chain_tree blackboard every engine tick, so a KB condition/watch
+// leaf can read any bench input like an ADC stream. Engine-thread context (same as
+// adc_publish_10hz). Cheap (11 word stores); the ISR-owned sources are single-word reads.
+static void bench_publish(void) {
+    if (g_bb_gpio_raw) *g_bb_gpio_raw = (int32_t)g_gpio_raw;
+    if (g_bb_gpio_deb) *g_bb_gpio_deb = (int32_t)g_gpio_deb;
+    for (int i = 0; i < HIL_GPIO_COUNT; i++)
+        if (g_bb_cnt[i]) *g_bb_cnt[i] = (int32_t)g_pulse_count[i];
 }
 
 // ---- servo bank: one PIO SM drives up to 8 RC servos (GP2..GP9, 50 Hz) ------
@@ -2401,6 +2417,7 @@ void cfl_embed_pre_tick(void) {
     }
 
     adc_publish_10hz();   // finalize 10 Hz mean/max/rms -> blackboard streams
+    bench_publish();      // Step 6b: GPIO bitmaps + counters -> blackboard (bench-input streams)
 
     // STREAM pacing: emit a report set every period while enabled + host connected.
     if (g_stream_on && g_host_connected) {
@@ -2713,6 +2730,19 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         if (cap < 2) return SHELL_BAD_ARGS;
         out[0] = g_gpio_raw; out[1] = g_gpio_deb; *outlen = 2; return SHELL_OK;
     }
+    case CMD_BENCH_BB: {           // Step 6b: read the engine's bench blackboard (as republished each tick)
+        if (cap < (uint8_t)(3u + HIL_GPIO_COUNT * 4u)) return SHELL_BAD_ARGS;
+        uint8_t bound = (g_bb_gpio_raw && g_bb_gpio_deb) ? 1u : 0u;   // 0 = engine/bb not up
+        uint8_t n = 0;
+        out[n++] = bound;
+        out[n++] = (uint8_t)(g_bb_gpio_raw ? *g_bb_gpio_raw : 0);
+        out[n++] = (uint8_t)(g_bb_gpio_deb ? *g_bb_gpio_deb : 0);
+        for (uint8_t i = 0; i < HIL_GPIO_COUNT; i++) {
+            uint32_t v = g_bb_cnt[i] ? (uint32_t)*g_bb_cnt[i] : 0u;
+            out[n++]=(uint8_t)v; out[n++]=(uint8_t)(v>>8); out[n++]=(uint8_t)(v>>16); out[n++]=(uint8_t)(v>>24);
+        }
+        *outlen = n; return SHELL_OK;
+    }
     case CMD_IO_MODE: {            // discovery: node io_mode + per-pin sub-config (data-driven bench)
         if (cap < (uint8_t)(2u + HIL_GPIO_COUNT)) return SHELL_BAD_ARGS;
         uint8_t n = 0;
@@ -2912,6 +2942,13 @@ static void engine_runtime_bringup(void) {
         g_bb_mean[ch] = (int32_t *)cfl_bb_field_by_name(g_rt, nm_mean[ch]);
         g_bb_max[ch]  = (int32_t *)cfl_bb_field_by_name(g_rt, nm_max[ch]);
         g_bb_rms[ch]  = (int32_t *)cfl_bb_field_by_name(g_rt, nm_rms[ch]);
+    }
+    // Step 6b: bench-input slots (GPIO bitmaps + counters), NULL if the field is absent.
+    g_bb_gpio_raw = (int32_t *)cfl_bb_field_by_name(g_rt, "gpio_raw");
+    g_bb_gpio_deb = (int32_t *)cfl_bb_field_by_name(g_rt, "gpio_deb");
+    for (int i = 0; i < HIL_GPIO_COUNT; i++) {
+        char nm[8]; nm[0]='c'; nm[1]='n'; nm[2]='t'; nm[3]=(char)('0'+i); nm[4]=0;
+        g_bb_cnt[i] = (int32_t *)cfl_bb_field_by_name(g_rt, nm);
     }
 }
 

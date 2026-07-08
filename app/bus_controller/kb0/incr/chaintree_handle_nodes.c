@@ -2,26 +2,26 @@
 #include "chaintree_handle_nodes.h"
 
 /* Node array - preserves original indices; filtered nodes leave gaps */
-const chaintree_node_t ct_offkyu7f_nodes[54] = {
+const chaintree_node_t ct_j5te5xxi_nodes[54] = {
     /* [0] _0 */
     {
         .node_index = 0,
         .parent_index = 65535,
         .depth = 0,
-        .link_start = 0,
+        .link_start = 3,
         .link_count = 0x0002,  /* count=2, auto_start=false */
         .main_function_index = 3,
         .init_function_index = 8,
         .aux_function_index = 2,
         .term_function_index = 9,
-        .node_data_id = 1
+        .node_data_id = 2
     },
     /* [1] _0 [AUTO_START] */
     {
         .node_index = 1,
         .parent_index = 0,
         .depth = 1,
-        .link_start = 2,
+        .link_start = 5,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
         .init_function_index = 6,
@@ -34,20 +34,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 2,
         .parent_index = 1,
         .depth = 2,
-        .link_start = 5,
+        .link_start = 8,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
         .init_function_index = 10,
         .aux_function_index = 3,
         .term_function_index = 11,
-        .node_data_id = 2
+        .node_data_id = 3
     },
     /* [3] _1 */
     {
         .node_index = 3,
         .parent_index = 1,
         .depth = 2,
-        .link_start = 5,
+        .link_start = 8,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
         .init_function_index = 12,
@@ -60,7 +60,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 4,
         .parent_index = 1,
         .depth = 2,
-        .link_start = 5,
+        .link_start = 8,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 4,
         .init_function_index = 0,
@@ -73,7 +73,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 5,
         .parent_index = 0,
         .depth = 1,
-        .link_start = 5,
+        .link_start = 8,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
         .init_function_index = 6,
@@ -86,20 +86,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 6,
         .parent_index = 5,
         .depth = 2,
-        .link_start = 8,
+        .link_start = 11,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
         .init_function_index = 10,
         .aux_function_index = 3,
         .term_function_index = 11,
-        .node_data_id = 3
+        .node_data_id = 4
     },
     /* [7] _1 */
     {
         .node_index = 7,
         .parent_index = 5,
         .depth = 2,
-        .link_start = 8,
+        .link_start = 11,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
         .init_function_index = 13,
@@ -112,7 +112,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 8,
         .parent_index = 5,
         .depth = 2,
-        .link_start = 8,
+        .link_start = 11,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 4,
         .init_function_index = 0,
@@ -125,20 +125,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 9,
         .parent_index = 65535,
         .depth = 0,
-        .link_start = 8,
+        .link_start = 11,
         .link_count = 0x0001,  /* count=1, auto_start=false */
         .main_function_index = 3,
         .init_function_index = 8,
         .aux_function_index = 2,
         .term_function_index = 9,
-        .node_data_id = 4
+        .node_data_id = 5
     },
     /* [10] _0 [AUTO_START] */
     {
         .node_index = 10,
         .parent_index = 9,
         .depth = 1,
-        .link_start = 9,
+        .link_start = 12,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
         .init_function_index = 6,
@@ -151,20 +151,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 11,
         .parent_index = 10,
         .depth = 2,
-        .link_start = 12,
+        .link_start = 15,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
         .init_function_index = 10,
         .aux_function_index = 3,
         .term_function_index = 11,
-        .node_data_id = 5
+        .node_data_id = 6
     },
     /* [12] _1 */
     {
         .node_index = 12,
         .parent_index = 10,
         .depth = 2,
-        .link_start = 12,
+        .link_start = 15,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
         .init_function_index = 1,
@@ -177,7 +177,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 13,
         .parent_index = 10,
         .depth = 2,
-        .link_start = 12,
+        .link_start = 15,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 4,
         .init_function_index = 0,
@@ -190,20 +190,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 14,
         .parent_index = 65535,
         .depth = 0,
-        .link_start = 12,
+        .link_start = 15,
         .link_count = 0x0004,  /* count=4, auto_start=false */
         .main_function_index = 3,
         .init_function_index = 8,
         .aux_function_index = 2,
         .term_function_index = 9,
-        .node_data_id = 6
+        .node_data_id = 7
     },
     /* [15] _0 [AUTO_START] */
     {
         .node_index = 15,
         .parent_index = 14,
         .depth = 1,
-        .link_start = 16,
+        .link_start = 19,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
         .init_function_index = 6,
@@ -216,20 +216,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 16,
         .parent_index = 15,
         .depth = 2,
-        .link_start = 19,
+        .link_start = 22,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
         .init_function_index = 10,
         .aux_function_index = 3,
         .term_function_index = 11,
-        .node_data_id = 7
+        .node_data_id = 8
     },
     /* [17] _1 */
     {
         .node_index = 17,
         .parent_index = 15,
         .depth = 2,
-        .link_start = 19,
+        .link_start = 22,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
         .init_function_index = 2,
@@ -242,7 +242,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 18,
         .parent_index = 15,
         .depth = 2,
-        .link_start = 19,
+        .link_start = 22,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 4,
         .init_function_index = 0,
@@ -255,7 +255,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 19,
         .parent_index = 14,
         .depth = 1,
-        .link_start = 19,
+        .link_start = 22,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
         .init_function_index = 6,
@@ -268,20 +268,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 20,
         .parent_index = 19,
         .depth = 2,
-        .link_start = 22,
+        .link_start = 25,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
         .init_function_index = 10,
         .aux_function_index = 3,
         .term_function_index = 11,
-        .node_data_id = 8
+        .node_data_id = 9
     },
     /* [21] _1 */
     {
         .node_index = 21,
         .parent_index = 19,
         .depth = 2,
-        .link_start = 22,
+        .link_start = 25,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
         .init_function_index = 3,
@@ -294,7 +294,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 22,
         .parent_index = 19,
         .depth = 2,
-        .link_start = 22,
+        .link_start = 25,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 4,
         .init_function_index = 0,
@@ -307,7 +307,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 23,
         .parent_index = 14,
         .depth = 1,
-        .link_start = 22,
+        .link_start = 25,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
         .init_function_index = 6,
@@ -320,20 +320,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 24,
         .parent_index = 23,
         .depth = 2,
-        .link_start = 25,
+        .link_start = 28,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
         .init_function_index = 10,
         .aux_function_index = 3,
         .term_function_index = 11,
-        .node_data_id = 9
+        .node_data_id = 10
     },
     /* [25] _1 */
     {
         .node_index = 25,
         .parent_index = 23,
         .depth = 2,
-        .link_start = 25,
+        .link_start = 28,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
         .init_function_index = 4,
@@ -346,7 +346,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 26,
         .parent_index = 23,
         .depth = 2,
-        .link_start = 25,
+        .link_start = 28,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 4,
         .init_function_index = 0,
@@ -359,7 +359,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 27,
         .parent_index = 14,
         .depth = 1,
-        .link_start = 25,
+        .link_start = 0,
         .link_count = 0x8003,  /* count=3, auto_start=true */
         .main_function_index = 1,
         .init_function_index = 6,
@@ -372,20 +372,20 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 28,
         .parent_index = 27,
         .depth = 2,
-        .link_start = 28,
+        .link_start = 3,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 5,
         .init_function_index = 10,
         .aux_function_index = 3,
         .term_function_index = 11,
-        .node_data_id = 10
+        .node_data_id = 0
     },
     /* [29] _1 */
     {
         .node_index = 29,
         .parent_index = 27,
         .depth = 2,
-        .link_start = 28,
+        .link_start = 3,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 2,
         .init_function_index = 5,
@@ -398,7 +398,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 30,
         .parent_index = 27,
         .depth = 2,
-        .link_start = 28,
+        .link_start = 3,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 4,
         .init_function_index = 0,
@@ -411,7 +411,7 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 31,
         .parent_index = 65535,
         .depth = 0,
-        .link_start = 12,
+        .link_start = 15,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 0,
         .init_function_index = 0,
@@ -454,12 +454,12 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .aux_function_index = 0, .term_function_index = 0,
         .node_data_id = 0xFFFF
     },
-    /* [37] kb0 */
+    /* [37] kbapp */
     {
         .node_index = 37,
         .parent_index = 65535,
         .depth = 0,
-        .link_start = 8,
+        .link_start = 3,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 0,
         .init_function_index = 0,
@@ -502,12 +502,12 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .aux_function_index = 0, .term_function_index = 0,
         .node_data_id = 0xFFFF
     },
-    /* [43] kbapp */
+    /* [43] kb0 */
     {
         .node_index = 43,
         .parent_index = 65535,
         .depth = 0,
-        .link_start = 28,
+        .link_start = 11,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 0,
         .init_function_index = 0,
@@ -583,12 +583,12 @@ const chaintree_node_t ct_offkyu7f_nodes[54] = {
         .node_index = 53,
         .parent_index = 65535,
         .depth = 0,
-        .link_start = 0,
+        .link_start = 3,
         .link_count = 0x0000,  /* count=0, auto_start=false */
         .main_function_index = 0,
         .init_function_index = 0,
         .aux_function_index = 0,
         .term_function_index = 0,
-        .node_data_id = 0
+        .node_data_id = 1
     },
 };

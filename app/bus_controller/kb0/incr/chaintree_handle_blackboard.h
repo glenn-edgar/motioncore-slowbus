@@ -6,7 +6,7 @@
 
 /* ===== Blackboard: adc_streams ===== */
 
-#define BB_ADC_STREAMS_SIZE 36
+#define BB_ADC_STREAMS_SIZE 76
 
 #define BB_ADC0_MEAN_OFFSET                      0
 #define BB_ADC0_MAX_OFFSET                       4
@@ -17,15 +17,25 @@
 #define BB_ADC2_MEAN_OFFSET                      24
 #define BB_ADC2_MAX_OFFSET                       28
 #define BB_ADC2_RMS_OFFSET                       32
+#define BB_GPIO_RAW_OFFSET                       36
+#define BB_GPIO_DEB_OFFSET                       40
+#define BB_CNT0_OFFSET                           44
+#define BB_CNT1_OFFSET                           48
+#define BB_CNT2_OFFSET                           52
+#define BB_CNT3_OFFSET                           56
+#define BB_CNT4_OFFSET                           60
+#define BB_CNT5_OFFSET                           64
+#define BB_CNT6_OFFSET                           68
+#define BB_CNT7_OFFSET                           72
 
-extern cfl_bb_field_t ct_offkyu7f_bb_fields[];
-extern cfl_bb_record_t ct_offkyu7f_bb_record;
+extern cfl_bb_field_t ct_j5te5xxi_bb_fields[];
+extern cfl_bb_record_t ct_j5te5xxi_bb_record;
 
-extern cfl_bb_table_t ct_offkyu7f_bb_table;
-void ct_offkyu7f_bb_init_hashes(void);
+extern cfl_bb_table_t ct_j5te5xxi_bb_table;
+void ct_j5te5xxi_bb_init_hashes(void);
 
 /* ===== Stable aliases (use these from application code) ===== */
-#define chaintree_handle_bb_table       ct_offkyu7f_bb_table
-#define chaintree_handle_bb_init_hashes ct_offkyu7f_bb_init_hashes
+#define chaintree_handle_bb_table       ct_j5te5xxi_bb_table
+#define chaintree_handle_bb_init_hashes ct_j5te5xxi_bb_init_hashes
 
 #endif /* CHAINTREE_HANDLE_BLACKBOARD_H */

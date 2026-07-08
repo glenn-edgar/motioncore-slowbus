@@ -74,13 +74,20 @@ local function build_kbapp(ct)
     ct:end_test()
 end
 
--- 10 Hz ADC streams the engine can read from the shared blackboard.
+-- Bench inputs the engine can read from the shared blackboard. ADC = 10 Hz windowed
+-- streams; GPIO raw/debounced bitmaps + the 8 pulse counters are republished every tick
+-- (Step 6b) so a KB condition/watch leaf reads any bench input like an ADC stream.
 local function build_blackboard(ct)
     ct:define_blackboard("adc_streams")
     for ch = 0, 2 do
         ct:bb_field("adc" .. ch .. "_mean", "int32", 0)
         ct:bb_field("adc" .. ch .. "_max",  "int32", 0)
         ct:bb_field("adc" .. ch .. "_rms",  "int32", 0)
+    end
+    ct:bb_field("gpio_raw", "int32", 0)          -- GPIO mode: raw input bitmap (bit i = GP(2+i))
+    ct:bb_field("gpio_deb", "int32", 0)          -- GPIO mode: debounced input bitmap
+    for i = 0, 7 do
+        ct:bb_field("cnt" .. i, "int32", 0)      -- COUNTER mode: running edge total for GP(2+i)
     end
     ct:end_blackboard()
 end
