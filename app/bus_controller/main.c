@@ -2226,35 +2226,24 @@ static inline uint8_t hil_role_of(uint8_t pin) {
 }
 
 // ---- GPIO + pulse-count command surface (handled inline on core1) -----------
-// Reply-sink dispatch (Step 2): ship one operate-command reply to the sink the
-// issuer chose. SINK_USB -> the core1->core0 up-queue (usb_pump relays to the host);
-// SINK_BUS -> the slave's bus reply window (used by the slave's async service task,
-// Step 5); SINK_ENGINE -> the chain-tree (Step 6, not yet wired -> drop).
+// Reply-sink dispatch (Step 2/5): ship one operate-command reply to the sink the
+// issuer chose. SINK_USB and SINK_BUS BOTH ride g_up_q as an OP_SHELL_REPLY frame;
+// the role's reply pump ships it by `dest` — usb_pump (master) relays to the host
+// with dest=APPCORE; node_reply_pump (slave) ships to the bus with dest=the node
+// that asked. Going through g_up_q keeps bus_node_queue single-core (only the core0
+// pump calls it), which matters because an async issuer (the i2c_service_task) runs
+// on core1. SINK_ENGINE -> the chain-tree (Step 6, not yet wired -> drop).
 static void reply_sink_send(const reply_sink_t *s, uint8_t status,
                             const uint8_t *res, uint8_t rlen) {
-    switch (s->kind) {
-    case SINK_BUS: {
-        uint8_t r[BUS_PAYLOAD_MAX]; uint8_t n = 0;
-        r[n++] = (uint8_t)(OP_SHELL_REPLY & 0xFF); r[n++] = (uint8_t)(OP_SHELL_REPLY >> 8);
-        r[n++] = (uint8_t)s->req_id;               r[n++] = (uint8_t)(s->req_id >> 8);
-        r[n++] = status;
-        for (uint8_t i = 0; i < rlen && n < BUS_PAYLOAD_MAX; i++) r[n++] = res[i];
-        (void)bus_node_queue(s->dest, BUS_FT_DATA, r, n);
-        return;
-    }
-    case SINK_ENGINE:
-        return;   // Step 6: route into the chain-tree; no engine-async issuer yet -> drop
-    case SINK_USB:
-    default: {
-        appcore_rep_t r; r.dest = BUS_ADDR_APPCORE; r.opcode = OP_SHELL_REPLY;
-        uint8_t n = 0;
-        r.payload[n++] = (uint8_t)s->req_id; r.payload[n++] = (uint8_t)(s->req_id >> 8);
-        r.payload[n++] = status;
-        for (uint8_t i = 0; i < rlen && n < APPCORE_PAY_MAX; i++) r.payload[n++] = res[i];
-        r.len = n; (void)xQueueSend(g_up_q, &r, 0);
-        return;
-    }
-    }
+    if (s->kind == SINK_ENGINE) return;   // Step 6: route into the chain-tree; no issuer yet
+    appcore_rep_t r;
+    r.dest   = (s->kind == SINK_BUS) ? s->dest : BUS_ADDR_APPCORE;
+    r.opcode = OP_SHELL_REPLY;
+    uint8_t n = 0;
+    r.payload[n++] = (uint8_t)s->req_id; r.payload[n++] = (uint8_t)(s->req_id >> 8);
+    r.payload[n++] = status;
+    for (uint8_t i = 0; i < rlen && n < APPCORE_PAY_MAX; i++) r.payload[n++] = res[i];
+    r.len = n; (void)xQueueSend(g_up_q, &r, 0);
 }
 // Execute one queued request on the bus (blocking) + post its reply. Runs on the
 // i2c_service_task — the only context that touches i2c1, so no locking needed.
@@ -2801,8 +2790,9 @@ uint8_t node_cmd_dispatch(uint16_t cmd, const uint8_t *args, uint8_t alen,
         // hwio_apply(). Runtime reconfiguration is not permitted — operate, don't reconfigure.
         return SHELL_BAD_ARGS;
     // ---- async I2C: enqueue with the reply sink; the i2c_service_task ships the reply
-    // later via reply_sink_send(). g_i2c_req_q is NULL on a node with no I2C service
-    // (slave, pre-Step-5) -> fall through to CMD_NOT_MINE (UNKNOWN), unchanged behavior.
+    // later via reply_sink_send(). Both roles run the service now (master: app_engine +
+    // main task block; slave: node_engine_start, Step 5). g_i2c_req_q NULL only on a node
+    // with no engine/I2C service at all -> CMD_NOT_MINE (UNKNOWN), safe fallback.
     case CMD_I2C_SCAN: {
         if (!g_i2c_req_q) return CMD_NOT_MINE;
         i2c_req_t q; memset(&q, 0, sizeof q); q.sink = *sink; q.op = I2C_OP_SCAN;
@@ -2966,13 +2956,21 @@ static void node_engine_task(void *arg) {
 // Called from node_role_run() (slave) to bring up the engine + bus<->engine plumbing.
 void node_engine_start(void) {
     appcore_queues_init();
-    TaskHandle_t t_eng, t_pump;
+    TaskHandle_t t_eng, t_pump, t_i2c;
     // engine on core1 (prio 3, below the interlock tick prio 4 — safety preempts the app)
     xTaskCreate(node_engine_task, "app", configMINIMAL_STACK_SIZE * 8, NULL, 3, &t_eng);
     vTaskCoreAffinitySet(t_eng, 1u << 1);
     // reply pump on core0 (prio 2), alongside the node responder
     xTaskCreate(node_reply_pump_task, "epump", configMINIMAL_STACK_SIZE * 2, NULL, 2, &t_pump);
     vTaskCoreAffinitySet(t_pump, 1u << 0);
+    // Step 5: the slave gets its OWN I2C manager (GP10/11) + service task, so bus- and
+    // engine-issued I2C works on a node too. Same as the master: HW inited here, drained
+    // by i2c_service_task on core1 (prio 1) where the engine (prio 3) preempts it so a
+    // blocking transfer never delays a tick. Its reply rides g_up_q -> node_reply_pump ->
+    // the bus (SINK_BUS), keeping bus_node_queue single-core.
+    i2c_init_hw();
+    xTaskCreate(i2c_service_task, "i2c", configMINIMAL_STACK_SIZE * 4, NULL, 1, &t_i2c);
+    vTaskCoreAffinitySet(t_i2c, 1u << 1);
 }
 
 // ---- watchdog: free-running-clock liveness gate -> pet HW WDT ---------------
