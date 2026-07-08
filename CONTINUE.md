@@ -2,20 +2,29 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-07-01 (I/O-mode restructure)**. Branch: **`master`** (clean; commit `eb22386`).
-**★RESUME HERE: I/O-MODE RESTRUCTURE — Steps 1, 3(GPIO+COUNTER), 4 DONE + HW-verified (2026-07-01).**
-Node model = ADC(always) + ONE io_mode {GPIO(+debounce) | COUNTER | SERVO} frozen@commission + interlock
-(10 eq) + chain-tree. Design doc `docs/io-mode-model.md`; detail in memory [[pico-io-mode-model]]. Done:
-RP2350 ADC frozen-ISR fix→core1 + analog bench (33474ad); ADC stats→SAMD21 model 48kHz/WIN_SEL/AC-rms
-(0045904); io_mode + hwio v2 + IO_MODE discovery + mode-gating (e6ccf44); commission tool v2 (1581b0f);
-GPIO mode complete — debounce/raw-deb/READ_ALL/UNUSED-read/OC-OC_PU-write/IPOL (7cfbcca,a3414fc); COUNTER
-mode complete — config-byte + read-clear (5cbe2cc,fa820ce); ADC-window interlock operands _adcN{min,max,
-avg,rms} (eb22386). End-to-end commission (CAF4→counter→GPIO→ADC-rms-trip) all HW-verified.
-**NEXT = Step 2 (operate layer + reply-sink dispatch) → Step 5 (I2C unified + slave i2c_service_task +
-engine route) → Step 6 (chain-tree bench bridge); SERVO mode deferred.** No task in flight.★
-★GOTCHAS: hwio is now schema v2 (idnt+hwio+ilcN via `cfg_image.lua --mode/--io/--il`); NEVER toggle
-ADC_IRQ_FIFO off-core (use save/restore_interrupts) — it re-freezes the ADC. Prior: base interlock
-(9924c37); grace-redrain (`f1c3045`). Older sections are history/reference.★
+Last updated **2026-07-08 (I/O-mode model COMPLETE)**. Branch: **`master`** (clean; commit `b471044`).
+**★RESUME HERE (2026-07-09): work on the TWO I2C MODELS.★** The I/O-mode restructure (steps 1-6) is
+DONE + HW-verified — node model = ADC(always) + ONE io_mode {GPIO(+debounce) | COUNTER | SERVO}
+frozen@commission + interlock(10 eq) + chain-tree bench bridge. Design doc `docs/io-mode-model.md`;
+full detail in memory [[pico-io-mode-model]]. Steps this line (all on master):
+- 1 io_mode+hwio v2+IO_MODE (e6ccf44) · commission tool v2 (1581b0f)
+- 3 GPIO mode (7cfbcca,a3414fc) + COUNTER mode (5cbe2cc,fa820ce)
+- 4 ADC-window interlock operands _adcN{min,max,avg,rms} (eb22386)
+- 2 operate layer + reply-sink dispatch — reply_sink_t{USB/BUS/ENGINE}+SHELL_ASYNC, async I2C folded
+  into node_cmd_dispatch (ee4fdcf)
+- 5 slave gets its own i2c_service_task; SINK_BUS routed via g_up_q→node_reply_pump (single-core) (be4d546)
+- 6a engine-operate KB leaf CMD_APP_OP 0x0306 — a kbapp action leaf calls node_cmd_dispatch, reply to the
+  asker (sync inline / async I2C via sink) (a543bbe)
+- 6b blackboard READ half — bench_publish() → gpio_raw/gpio_deb/cnt0..7 bb fields each tick; CMD_BENCH_BB
+  0x0116 read-window (b471044)
+Bench: **E661 master RP2040 = ACM1**; **CAF4 slave RP2350 node 9 = ACM0** (both on this firmware; GPIO mode).
+**NEXT = the two I2C models (2026-07-09).** OPTIONAL leftovers: SERVO mode (deferred 3rd io_mode); true
+engine-park on async I2C (SINK_ENGINE injected event — currently drops); a concrete autonomous KB rule.
+★GOTCHAS: KB edits = `app/bus_controller/kb0/kb0.lua` then `bash tools/gen_kb.sh` (re-rolls a random symbol
+prefix → whole incr/ churns, semantically idempotent, commit it). Two RP on USB → old picotool can't select;
+1200-touch the target's OWN port (`luajit -e 'require([[libcomm]]).touch_1200([[/dev/ttyACMx]])'`) then
+`picotool load`; RP2350 build tree = `build-pico2` (pico2_w/rp2350). hwio schema v2 (`cfg_image.lua
+--mode/--io/--il`); NEVER toggle ADC_IRQ_FIFO off-core (use save/restore_interrupts) — re-freezes the ADC.★
 
 ---
 
