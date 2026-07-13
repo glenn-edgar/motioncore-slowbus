@@ -363,25 +363,29 @@ coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gai
 4. `CFG_WRITE/READ/LIST/COMMIT` over the bus (SINK_BUS, async) + write-gate + per-file apply policy.
 5. (If zero-USB) blank-node UID enrollment protocol.
 
-### 15.9 I/O model revision — per-pin assignment + I2S mode (decided 2026-07-13)
+### 15.9 I/O model revision — FULLY per-pin roles (decided 2026-07-13)
 
-Revises the original "one `io_mode` for the whole GP2–9 block" rule (§2/§3, all-GPIO or all-COUNTER or
-all-SERVO). Two decisions:
+**Removes the block `io_mode` entirely.** There is no "one mode for the whole GP2–9 block" (§2/§3 obsolete)
+and **no block modes at all** — **every pin 1–8 (= GP2..GP9) is individually assigned a role**, and *all*
+functions, **including I2S and servo**, are expressed as per-pin roles. A node freely mixes them (e.g. pin
+1 input, pin 2 counter, pin 3 servo, pins 4–6 the I2S mic, pins 7–8 output).
 
-- **GPIO pins 1–8 (= GP2..GP9) are INDIVIDUALLY ASSIGNED.** Each pin's `hwio` subconfig byte independently
-  selects its own function — mixable within one node (e.g. pin 1 = input, pin 2 = output, pin 3 = counter,
-  pin 4 = OC), rather than the whole block sharing one mode. The per-pin byte already exists in `hwio` v2;
-  this makes its role field authoritative **per pin** instead of interpreted through a single block mode.
-  Closer to the old free-mix model, but keeping the structured `(debounce<<4)|role` byte.
-- **The I2S mic is ONE (whole-node) mode.** Like SERVO, some functions claim the pin group as a unit and
-  can't be mixed per-pin — I2S microphone capture is such a mode: selecting it repurposes the needed pins
-  as BCLK/WS/SD and runs a **PIO I2S RX + DMA** path (1 SM; RP2350 preferred, PIO2 free) delivering PCM,
-  which feeds the ADC-style windowed stats / the blackboard for the KB to read.
+**Unified per-pin role set** (the `hwio` byte per pin; `io_mode` block selector is dropped — `hwio` becomes
+just the 8 role bytes + ADC annotation):
+`UNUSED · INPUT · IN_PU · IN_PD · OUTPUT · OC · OC_PU · COUNTER · SERVO · I2S_BCLK · I2S_WS · I2S_SD`
+(input roles keep the `(debounce<<4)|role` nibble). `hwio_apply` walks the 8 bytes, applies each pin's
+role, then **assembles composite functions from the roles present**: pins tagged `I2S_*` → bring up one
+PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo feeder; `COUNTER` pins → the 1 kHz edge sampler.
 
-**Resulting `hwio` shape:** a node-level selector chooses **`PER_PIN`** (individual pin roles — the general
-case) **vs a block mode** {`SERVO`, `I2S_MIC`, …} that takes over the group. In `PER_PIN` the 8 role bytes
-are each honored independently; a block mode ignores them and applies its fixed pin map.
+**Implementation constraints to VALIDATE at commission (per-pin config is free; the silicon isn't):**
+- **I2S** needs `I2S_BCLK` + `I2S_WS` + `I2S_SD` present as a set, and PIO side-set drives BCLK/WS so those
+  two must be **adjacent** (SD is a separate `in` pin). The RP is I2S master (generates BCLK/WS, reads SD)
+  for a mic. 1 PIO SM + 1 DMA; PCM → windowed stats/blackboard for the KB. (RP2350 preferred, PIO2 free.)
+- **SERVO** per-pin: the current servo PIO frame drives a **contiguous** pin run from one base. Arbitrary
+  non-contiguous servo pins ⇒ either keep servo pins contiguous, or spend one SM per servo pin (SM budget:
+  RP2040 has ~6 free, RP2350 ~10 — see the PIO stock-take). Decide at implementation.
+- **Counter** is already a per-pin software sampler → no constraint.
 
-**OPEN:** does **COUNTER** become a per-pin role (mixable under `PER_PIN`, alongside GPIO/OC) — or stay a
-block mode? (Per-pin counter is feasible since edge counting is already the software 1 kHz sampler per pin.)
-Leaning per-pin for GPIO/COUNTER/OC (fully mixable), block-mode only for SERVO + I2S_MIC.
+So: **config = one role enum, per pin, fully mixable**; the firmware derives I2S/servo/counter groups from
+which pins carry which roles, and the commission tool rejects assignments the hardware can't honor
+(missing/ non-adjacent I2S pins, over-budget servo SMs).
