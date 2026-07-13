@@ -311,9 +311,10 @@ coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gai
   a blank node be enrolled over the bus too? First-commission-USB-OK avoids the enrollment protocol.
 
 ### 15.4 Interlock removed → KB-owned safety
-- The `node/interlock/` engine and `ilc0..ilc9` files are **deleted**. Safety/interlock is a **KB rule**:
-  read `adc0_rms`/GP1/etc. from the blackboard → drive the GP0 veto via the operate layer. (The
-  HW-verified ADC-rms overcurrent trip becomes exactly this rule.)
+- The `node/interlock/` engine and `ilc0..ilc9` files are **deleted**. Safety/interlock is a **KB LEAF
+  construct** (§15.10): read `adc0_rms`/GP1/etc. from the blackboard → drive the GP0 veto. Equation
+  structure compiled + `kb_id`-guarded; trip thresholds EEPROM-tunable (`ilim`). (The HW-verified ADC-rms
+  overcurrent trip becomes exactly this leaf.)
 - **Fail-safe backstop stays in hardware/boot, NOT the KB** (this preserves the safety guarantee the
   separate task used to give):
   - GP0 defaults **veto-asserted** on reset/unpowered (open-drain wired-OR — already the case);
@@ -340,12 +341,14 @@ coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gai
 | File | Holds | Role | Apply |
 |---|---|---|---|
 | `idnt` | UID + chip, variant, RS-485 addr/baud, **`kb_id` (+`kb_hash`)** | both | reboot |
-| `hwio` | io_mode + 8 pin subconfig + ADC annotation | both | reboot |
+| `hwio` | 8 per-pin role bytes + ADC annotation (§15.9; block `io_mode` dropped) | both | reboot |
+| `ilim` | interlock trip thresholds (numeric limits for the §15.10 guard leaves) | both | **hot** |
 | `neti` | WiFi APs + agent endpoint | master | hot |
 | `slvr` | slave roster (addr/class/flags) | master | hot |
 
-- **`ilc0..ilc9` REMOVED** (14 rows → 4). A pure **slave node record = `idnt` + `hwio`**; master adds
-  `neti` + `slvr`. **OPEN:** keep the per-file 256-B rows, or store the node record as one atomic CBOR
+- **`ilc0..ilc9` REMOVED** (14 rows → 3–4). Slave **node record = `idnt` + `hwio`** (+ `ilim` if it has
+  interlock leaves); master adds `neti` + `slvr`. **OPEN:** keep the per-file 256-B rows, or store the node
+  record as one atomic CBOR
   blob `{v, idnt, hwio}` (simplest for a slave, one seq/CRC)?
 
 ### 15.7 Open decisions
@@ -465,3 +468,30 @@ Before accepting an `hwio` map the tool computes and validates the resource tall
 The tally depends on the PIO-vs-hardware choice per role (UART PIO/HW, STEP PIO/PWM), so those selections are
 part of the `hwio` map. Over-budget ⇒ **reject at commission** (with the shortfall reported) — nudges
 feature-dense nodes to the RP2350. This is a superset of the earlier "over-budget servo SMs" note.
+
+### 15.10 Interlock as a KB LEAF construct + EEPROM-tunable limits (decided 2026-07-13)
+
+The concrete mechanism for §15.4 (interlock → KB). Chosen: **Option B — a dedicated construct — and it MUST
+be a LEAF node.** The interlock equation is captured *entirely within a single terminal (leaf) node*, NOT
+decomposed into a subtree of condition/action nodes.
+
+- **Leaf construct.** A new ChainTree DSL construct emits **one leaf node** whose C evaluator runs the whole
+  equation each tick: read operands from the blackboard → evaluate the boolean → drive the output → apply
+  latch/grace. (Ports the old `interlock_eval` into a leaf evaluator; nothing spreads across the tree.)
+- **Expression = the existing interlock DNF DSL** (`&& || ~`, `watch[operand:op:value]`, `out:od` /
+  `out_err[gp0:0]`, the `slave_dsl`/`dsl_compile` grammar) reused as the leaf's authoring syntax. The
+  equation **structure compiles into the leaf's node data → covered by `kb_id`** (§15.5): the safety shape
+  is hash-verified + mis-flash-guarded (stronger than the old separately-writable `ilcN`).
+- **EEPROM-tunable limits (the hybrid — AGREED).** The equation *structure* (operands, operators, output,
+  latch/grace) is compiled + `kb_id`-guarded; the numeric **trip thresholds** live in a small EEPROM config
+  table (e.g. `ilim`), **hot-tunable over the bus** (per §15.3 apply policy). The compiled equation
+  references a named limit slot; boot / `CFG_WRITE` fills its value into the leaf's RAM state. So "trip at
+  1800 vs 2000" is a field-adjustable number while the shape stays fixed and verified.
+- **Operands:** blackboard fields — `adcN.{min,max,avg,rms}`, `gpio_deb`/`gpio_raw` bits, `gp1`,
+  `_nodesdead` (all published by Step 6b + ADC).
+- **Output:** drive the GP0 veto via a **direct/fast path** (not the async operate queue); latch + grace
+  held in the leaf.
+- **Determinism:** the guard leaf is ticked **every cycle, early** (top of the KB), backed by the §15.4
+  hardware fail-safe (GP0 default-veto + watchdog→veto). Multiple interlock equations = multiple guard
+  leaves. Net: safety is a compiled, `kb_id`-verified leaf with field-tunable limits — declarative like the
+  old `ilcN`, but auditable, mis-flash-guarded, and still bus-adjustable where it matters (the numbers).
