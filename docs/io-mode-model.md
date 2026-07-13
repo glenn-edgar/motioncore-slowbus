@@ -362,3 +362,26 @@ coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gai
 3. `i2c0` system bus + EEPROM-backed `cfg_load`/`cfg_save` + boot RAM cache; keep flash as fallback.
 4. `CFG_WRITE/READ/LIST/COMMIT` over the bus (SINK_BUS, async) + write-gate + per-file apply policy.
 5. (If zero-USB) blank-node UID enrollment protocol.
+
+### 15.9 I/O model revision — per-pin assignment + I2S mode (decided 2026-07-13)
+
+Revises the original "one `io_mode` for the whole GP2–9 block" rule (§2/§3, all-GPIO or all-COUNTER or
+all-SERVO). Two decisions:
+
+- **GPIO pins 1–8 (= GP2..GP9) are INDIVIDUALLY ASSIGNED.** Each pin's `hwio` subconfig byte independently
+  selects its own function — mixable within one node (e.g. pin 1 = input, pin 2 = output, pin 3 = counter,
+  pin 4 = OC), rather than the whole block sharing one mode. The per-pin byte already exists in `hwio` v2;
+  this makes its role field authoritative **per pin** instead of interpreted through a single block mode.
+  Closer to the old free-mix model, but keeping the structured `(debounce<<4)|role` byte.
+- **The I2S mic is ONE (whole-node) mode.** Like SERVO, some functions claim the pin group as a unit and
+  can't be mixed per-pin — I2S microphone capture is such a mode: selecting it repurposes the needed pins
+  as BCLK/WS/SD and runs a **PIO I2S RX + DMA** path (1 SM; RP2350 preferred, PIO2 free) delivering PCM,
+  which feeds the ADC-style windowed stats / the blackboard for the KB to read.
+
+**Resulting `hwio` shape:** a node-level selector chooses **`PER_PIN`** (individual pin roles — the general
+case) **vs a block mode** {`SERVO`, `I2S_MIC`, …} that takes over the group. In `PER_PIN` the 8 role bytes
+are each honored independently; a block mode ignores them and applies its fixed pin map.
+
+**OPEN:** does **COUNTER** become a per-pin role (mixable under `PER_PIN`, alongside GPIO/OC) — or stay a
+block mode? (Per-pin counter is feasible since edge counting is already the software 1 kHz sampler per pin.)
+Leaning per-pin for GPIO/COUNTER/OC (fully mixable), block-mode only for SERVO + I2S_MIC.
