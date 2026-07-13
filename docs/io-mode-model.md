@@ -372,10 +372,11 @@ functions, **including I2S and servo**, are expressed as per-pin roles. A node f
 
 **Unified per-pin role set** (the `hwio` byte per pin; `io_mode` block selector is dropped — `hwio` becomes
 just the 8 role bytes + ADC annotation):
-`UNUSED · INPUT · IN_PU · IN_PD · OUTPUT · OC · OC_PU · COUNTER · SERVO · I2S_BCLK · I2S_WS · I2S_SD`
-(input roles keep the `(debounce<<4)|role` nibble). `hwio_apply` walks the 8 bytes, applies each pin's
-role, then **assembles composite functions from the roles present**: pins tagged `I2S_*` → bring up one
-PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo feeder; `COUNTER` pins → the 1 kHz edge sampler.
+`UNUSED · INPUT · IN_PU · IN_PD · OUTPUT · OC · OC_PU · COUNTER · SERVO · I2S_BCLK · I2S_WS · I2S_SD ·
+NEOPIXEL` (input roles keep the `(debounce<<4)|role` nibble). `hwio_apply` walks the 8 bytes, applies each
+pin's role, then **assembles composite functions from the roles present**: pins tagged `I2S_*` → bring up
+one PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo feeder; `NEOPIXEL` pins → one WS2812 PIO SM
+each; `COUNTER` pins → the 1 kHz edge sampler.
 
 **Implementation constraints to VALIDATE at commission (per-pin config is free; the silicon isn't):**
 - **I2S** needs `I2S_BCLK` + `I2S_WS` + `I2S_SD` present as a set, and PIO side-set drives BCLK/WS so those
@@ -384,6 +385,11 @@ PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo feeder; `COUNTER` pi
 - **SERVO** per-pin: the current servo PIO frame drives a **contiguous** pin run from one base. Arbitrary
   non-contiguous servo pins ⇒ either keep servo pins contiguous, or spend one SM per servo pin (SM budget:
   RP2040 has ~6 free, RP2350 ~10 — see the PIO stock-take). Decide at implementation.
+- **NeoPixel** (`NEOPIXEL`, WS2812/-B): single-pin **output**, ~800 kHz — 1 PIO SM per pin running the
+  ~4-instr `ws2812` program, fed by FIFO (small strips) or DMA (larger). **No adjacency constraint** — the
+  simplest composite role; only cost is 1 SM/pin (budget: RP2040 ~6 free, RP2350 ~10). Colors are pushed by
+  an operate command (e.g. `NEOPIXEL_SET [pin][GRB…]`) → the KB or host drives status LEDs via the bench
+  bridge. Output-only (a pin can't be `NEOPIXEL` + anything else).
 - **Counter** is already a per-pin software sampler → no constraint.
 
 So: **config = one role enum, per pin, fully mixable**; the firmware derives I2S/servo/counter groups from
