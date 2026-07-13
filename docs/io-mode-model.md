@@ -416,3 +416,25 @@ UART TX/RX SM each; `COUNTER` pins → the 1 kHz edge sampler.
 So: **config = one role enum, per pin, fully mixable**; the firmware derives I2S/servo/counter groups from
 which pins carry which roles, and the commission tool rejects assignments the hardware can't honor
 (missing/ non-adjacent I2S pins, over-budget servo SMs).
+
+**Commission-time resource-budget check (per chip variant) — REQUIRED (2026-07-13).** Pins are cheap but
+the PIO/DMA/hardware blocks aren't, and SM count is the binding constraint once several PIO roles are mixed.
+Before accepting an `hwio` map the tool computes and validates the resource tally for the *target chip*:
+
+- **PIO state machines** — sum SM cost of the mapped roles and require `≤ free SMs`:
+  - fixed base: **RS-485 = 2** (always); **WiFi = 1** (master only).
+  - per role: `I2S = 1`, `SERVO = 1` (contiguous bank) *or 1/pin non-contiguous*, `NEOPIXEL = 1/pin`,
+    `STEP = 1/pin` (PIO) *or 0* (PWM-slice option), `UART_TX = 1`, `UART_RX = 1` (PIO) *or 0* (HW-UART option);
+    `GPIO/IN/OUT/OC/COUNTER = 0` (direct GPIO / software sampler).
+  - **totals:** RP2040 = 8 SM (2 blocks) → **~5 free master / ~6 slave**; RP2350 = 12 SM (3 blocks; PIO2
+    always free) → **~9 free master / ~10 slave**.
+- **PIO instruction memory** — ≤ 32 instr per block; sum the distinct programs used (RS-485 ~10, `ws2812`
+  ~4, servo ~4, uart tx+rx, i2s, step) and check per-block fit, not just SM count.
+- **DMA channels** — `I2S` (+ large NeoPixel/STEP) need a channel; require `≤ free` (RP2040 has 12).
+- **Hardware blocks** — don't oversubscribe: **≤ 2 UART** (if any role picks HW-UART), **≤ 8 PWM slices**
+  (GP22 test source uses 1; STEP-via-PWM/servo draw here), and the two I2C buses (`i2c0` config/system,
+  `i2c1` app) are system-reserved.
+
+The tally depends on the PIO-vs-hardware choice per role (UART PIO/HW, STEP PIO/PWM), so those selections are
+part of the `hwio` map. Over-budget ⇒ **reject at commission** (with the shortfall reported) — nudges
+feature-dense nodes to the RP2350. This is a superset of the earlier "over-budget servo SMs" note.
