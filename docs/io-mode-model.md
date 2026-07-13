@@ -373,11 +373,12 @@ functions, **including I2S and servo**, are expressed as per-pin roles. A node f
 **Unified per-pin role set** (the `hwio` byte per pin; `io_mode` block selector is dropped — `hwio` becomes
 just the 8 role bytes + ADC annotation):
 `UNUSED · INPUT · IN_PU · IN_PD · OUTPUT · OC · OC_PU · COUNTER · SERVO · I2S_BCLK · I2S_WS · I2S_SD ·
-NEOPIXEL · STEP · UART_TX · UART_RX` (input roles keep the `(debounce<<4)|role` nibble). `hwio_apply` walks
-the 8 bytes, applies each pin's role, then **assembles composite functions from the roles present**: pins
-tagged `I2S_*` → bring up one PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo feeder; `NEOPIXEL`
-pins → one WS2812 PIO SM each; `STEP` pins → one step-pulse generator each; `UART_TX`/`UART_RX` pins → a PIO
-UART TX/RX SM each; `COUNTER` pins → the 1 kHz edge sampler.
+NEOPIXEL · STEP · UART_TX · UART_RX · PWM_OUT` (input roles keep the `(debounce<<4)|role` nibble).
+`hwio_apply` walks the 8 bytes, applies each pin's role, then **assembles composite functions from the roles
+present**: pins tagged `I2S_*` → bring up one PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo
+feeder; `NEOPIXEL` pins → one WS2812 PIO SM each; `STEP` pins → one step-pulse generator each; `UART_TX`/
+`UART_RX` pins → a PIO UART TX/RX SM each; `PWM_OUT` pins → a hardware PWM slice/channel; `COUNTER` pins →
+the 1 kHz edge sampler.
 
 **Implementation constraints to VALIDATE at commission (per-pin config is free; the silicon isn't):**
 - **I2S** needs `I2S_BCLK` + `I2S_WS` + `I2S_SD` present as a set, and PIO side-set drives BCLK/WS so those
@@ -411,6 +412,15 @@ UART TX/RX SM each; `COUNTER` pins → the 1 kHz edge sampler.
   drives it via the bench bridge. SM cost 1/direction (budget: RP2040 ~6 free, RP2350 ~10). *Alt:* the 2
   hardware UART blocks (no SM cost) but pin-constrained (within GP2–9 only GP4/5/8/9 map to UART1) and only 2
   total — use for high-rate ports; PIO for arbitrary-pin flexibility.
+- **PWM output (`PWM_OUT`):** general variable freq/duty output on any GP2–9 pin via the **hardware PWM
+  peripheral — NO PIO SM cost** (the GP22 test-source machinery already exists; generalize `CMD_PWM_TEST`
+  → per-pin `PWM_SET [pin][freq][duty]`, KB/host-driven). Costs **1 PWM slice-channel**. **Constraint:** each
+  pin maps to a fixed slice/channel — GP2/3→slice1, GP4/5→slice2, GP6/7→slice3, GP8/9→slice4 (even pin=chan
+  A, odd=chan B); **both channels of a slice SHARE frequency** (independent duty), so two `PWM_OUT` pins on
+  the same pair must agree on frequency. Also note the **GP22 test source occupies slice3-A** (= GP6's
+  slice/channel) — so `PWM_OUT` on GP6 collides and GP7 shares its frequency. Distinct from `STEP` (step
+  pulse train) and `SERVO` (50 Hz RC pulse). For DC-motor speed etc., pair `PWM_OUT` (enable/PWM) with
+  `OUTPUT` (direction) into an H-bridge driver.
 - **Counter** is already a per-pin software sampler → no constraint.
 
 So: **config = one role enum, per pin, fully mixable**; the firmware derives I2S/servo/counter groups from
@@ -432,8 +442,9 @@ Before accepting an `hwio` map the tool computes and validates the resource tall
   ~4, servo ~4, uart tx+rx, i2s, step) and check per-block fit, not just SM count.
 - **DMA channels** — `I2S` (+ large NeoPixel/STEP) need a channel; require `≤ free` (RP2040 has 12).
 - **Hardware blocks** — don't oversubscribe: **≤ 2 UART** (if any role picks HW-UART), **≤ 8 PWM slices**
-  (GP22 test source uses 1; STEP-via-PWM/servo draw here), and the two I2C buses (`i2c0` config/system,
-  `i2c1` app) are system-reserved.
+  (`PWM_OUT`, STEP-via-PWM, and the GP22 test source all draw here — and honor the fixed pin→slice map +
+  the shared-frequency-per-slice constraint above), and the two I2C buses (`i2c0` config/system, `i2c1`
+  app) are system-reserved.
 
 The tally depends on the PIO-vs-hardware choice per role (UART PIO/HW, STEP PIO/PWM), so those selections are
 part of the `hwio` map. Over-budget ⇒ **reject at commission** (with the shortfall reported) — nudges
