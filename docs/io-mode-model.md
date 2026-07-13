@@ -284,21 +284,17 @@ coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gai
   engine is redundant — fold its logic into the KB.
 
 ### 15.2 Config store → I2C EEPROM (system bus)
-- **Part = AT24Cxx** (decided 2026-07-13) on the **dedicated system I2C bus `i2c0` (GP20/21)** @ **0x50**
-  (A2/A1/A0 = GND). Kept OFF the application bus `i2c1` (GP10/11) so identity bootstrap + user peripheral
-  traffic don't contend (the "two I2C models": **system** vs **application**).
-- **AT24Cxx driver notes** (`cfg_file.c` I2C backend must honor these):
-  - **16-bit word address** — use **AT24C32 or larger** (C32/64/128/256/512) so the memory address is 2
-    bytes (`[addr_hi][addr_lo][data…]`) and A2/A1/A0 are true device-address pins (up to 8/bus). The small
-    parts (≤C16) fold address bits into the I2C address — avoid.
-  - **Page write + ACK-poll** — writes are page-bounded (C32/64 = 32 B/page, C256 = 64, C512 = 128) and
-    **must not cross a page boundary**; a self-timed write cycle is ~5 ms → **ACK-poll** for completion. So
-    `cfg_save` of a 256-B row = split into page-aligned chunks, each ACK-polled (all on the async service
-    task, off core1 / the safety leaf).
-  - Endurance ~1M cyc, retention ~100 yr.
-  - **Size:** config-only fits **AT24C32 (4 KB = 16 × 256-B rows)**; use **C256 (32 KB) / C512 (64 KB, =
-    the old flash region, 256 rows)** if the EEPROM also holds the app-bus **device registry** / logs. →
-    resolves part of §15.7 #2 (family fixed; exact size still scope-driven).
+- **Part = AT24C256** (32 KB; decided 2026-07-13) on the **dedicated system I2C bus `i2c0` (GP20/21)** @
+  **0x50** (A2/A1/A0 = GND). Kept OFF the application bus `i2c1` (GP10/11) so identity bootstrap + user
+  peripheral traffic don't contend (the "two I2C models": **system** vs **application**).
+- **AT24C256 driver notes** (`cfg_file.c` I2C backend must honor these):
+  - **16-bit word address** — memory address is 2 bytes (`[addr_hi][addr_lo][data…]`); A2/A1/A0 are true
+    device-address pins (up to 8/bus; we use one @ 0x50).
+  - **64-byte page** — writes are page-bounded and **must not cross a 64-B boundary**; a self-timed write
+    cycle is ~5 ms → **ACK-poll** for completion. So `cfg_save` of a 256-B row = **4 page-aligned 64-B
+    writes**, each ACK-polled (all on the async service task, off core1 / the safety leaf).
+  - **Capacity 32 KB = 128 × 256-B rows** — far beyond the ~5 config files, so it also has room for the
+    app-bus **device registry** / small logs. Endurance ~1M cyc, retention ~100 yr.
 - **Seam unchanged, backing store swapped.** Keep `cfg_load(name,…)`; change `node/cfg_file.c` from an
   XIP pointer scan to an I2C read, and **add `cfg_save(name, cbor)`** (EEPROM write via the service task).
   The `idnt/hwio/neti/slvr` readers above the seam don't change.
@@ -365,8 +361,8 @@ coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gai
 
 ### 15.7 Open decisions
 1. First-commission USB-OK (then bus updates) **vs** zero-USB enrollment from blank (§15.3).
-2. EEPROM **family = AT24Cxx, fixed** (§15.2); only the **size** is open — AT24C32 (config-only) vs
-   C256/C512 (if it also holds the app-bus device registry / logs).
+2. ~~EEPROM part/size~~ **RESOLVED: AT24C256 (32 KB, 64-B page) @ 0x50 on i2c0** (§15.2). 128 × 256-B rows —
+   room for config + the app-bus device registry.
 3. Per-file rows **vs** one atomic node-config CBOR blob (§15.6).
 4. Whether `neti`/`slvr` live in the same EEPROM or stay in internal flash (master always has USB).
 
