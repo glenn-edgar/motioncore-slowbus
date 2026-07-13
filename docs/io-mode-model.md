@@ -373,10 +373,11 @@ functions, **including I2S and servo**, are expressed as per-pin roles. A node f
 **Unified per-pin role set** (the `hwio` byte per pin; `io_mode` block selector is dropped — `hwio` becomes
 just the 8 role bytes + ADC annotation):
 `UNUSED · INPUT · IN_PU · IN_PD · OUTPUT · OC · OC_PU · COUNTER · SERVO · I2S_BCLK · I2S_WS · I2S_SD ·
-NEOPIXEL · STEP` (input roles keep the `(debounce<<4)|role` nibble). `hwio_apply` walks the 8 bytes, applies
-each pin's role, then **assembles composite functions from the roles present**: pins tagged `I2S_*` → bring
-up one PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo feeder; `NEOPIXEL` pins → one WS2812 PIO SM
-each; `STEP` pins → one step-pulse generator each; `COUNTER` pins → the 1 kHz edge sampler.
+NEOPIXEL · STEP · UART_TX · UART_RX` (input roles keep the `(debounce<<4)|role` nibble). `hwio_apply` walks
+the 8 bytes, applies each pin's role, then **assembles composite functions from the roles present**: pins
+tagged `I2S_*` → bring up one PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo feeder; `NEOPIXEL`
+pins → one WS2812 PIO SM each; `STEP` pins → one step-pulse generator each; `UART_TX`/`UART_RX` pins → a PIO
+UART TX/RX SM each; `COUNTER` pins → the 1 kHz edge sampler.
 
 **Implementation constraints to VALIDATE at commission (per-pin config is free; the silicon isn't):**
 - **I2S** needs `I2S_BCLK` + `I2S_WS` + `I2S_SD` present as a set, and PIO side-set drives BCLK/WS so those
@@ -401,6 +402,15 @@ each; `STEP` pins → one step-pulse generator each; `COUNTER` pins → the 1 kH
   resolution); fully MCU-controlled (± EN/M0/M1/M2/FAULT) ≈ 7 pins → 1 motor. **OPEN:** MCU-direct coil
   microstepping (4-PWM sine, no driver chip) and multi-axis COORDINATED motion (interpolation) are separate,
   heavier layers — out of scope for the per-pin roles unless required.
+- **UART (`UART_TX`, `UART_RX`):** a pin can be a UART output or a UART input. **PIO UART, any pin** — 1 SM
+  per direction (reuses the RS-485 PHY's PIO-UART machinery; an 8-bit variant of the existing `uart_tx9`/
+  `uart_rx9`). `UART_TX` = output, `UART_RX` = input; a TX pin + an RX pin form a full-duplex port (2 pins,
+  2 SMs), or either alone is a one-way link. Needs a **baud** per port (companion config in `hwio`). Data
+  flows through the operate layer + an async **uart service task** (RX ring buffer): `UART_WRITE [pin][bytes]`
+  / `UART_READ [pin]` (or stream RX to the blackboard) — same async/reply-sink pattern as I2C, so the KB/host
+  drives it via the bench bridge. SM cost 1/direction (budget: RP2040 ~6 free, RP2350 ~10). *Alt:* the 2
+  hardware UART blocks (no SM cost) but pin-constrained (within GP2–9 only GP4/5/8/9 map to UART1) and only 2
+  total — use for high-rate ports; PIO for arbitrary-pin flexibility.
 - **Counter** is already a per-pin software sampler → no constraint.
 
 So: **config = one role enum, per pin, fully mixable**; the firmware derives I2S/servo/counter groups from
