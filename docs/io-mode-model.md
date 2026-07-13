@@ -373,12 +373,13 @@ functions, **including I2S and servo**, are expressed as per-pin roles. A node f
 **Unified per-pin role set** (the `hwio` byte per pin; `io_mode` block selector is dropped — `hwio` becomes
 just the 8 role bytes + ADC annotation):
 `UNUSED · INPUT · IN_PU · IN_PD · OUTPUT · OC · OC_PU · COUNTER · SERVO · I2S_BCLK · I2S_WS · I2S_SD ·
-NEOPIXEL · STEP · UART_TX · UART_RX · PWM_OUT` (input roles keep the `(debounce<<4)|role` nibble).
-`hwio_apply` walks the 8 bytes, applies each pin's role, then **assembles composite functions from the roles
-present**: pins tagged `I2S_*` → bring up one PIO I2S RX + DMA on them; pins tagged `SERVO` → the servo
-feeder; `NEOPIXEL` pins → one WS2812 PIO SM each; `STEP` pins → one step-pulse generator each; `UART_TX`/
-`UART_RX` pins → a PIO UART TX/RX SM each; `PWM_OUT` pins → a hardware PWM slice/channel; `COUNTER` pins →
-the 1 kHz edge sampler.
+NEOPIXEL · STEP · UART_TX · UART_RX · PWM_OUT · QUAD_A · QUAD_B` (input roles — incl. `QUAD_A`/`QUAD_B` —
+keep the `(debounce<<4)|role` nibble). `hwio_apply` walks the 8 bytes, applies each pin's role, then
+**assembles composite functions from the roles present**: pins tagged `I2S_*` → bring up one PIO I2S RX +
+DMA on them; pins tagged `SERVO` → the servo feeder; `NEOPIXEL` pins → one WS2812 PIO SM each; `STEP` pins →
+one step-pulse generator each; `UART_TX`/`UART_RX` pins → a PIO UART TX/RX SM each; `PWM_OUT` pins → a
+hardware PWM slice/channel; a `QUAD_A`+`QUAD_B` pair → one debounced software quadrature channel; `COUNTER`
+pins → the 1 kHz edge sampler.
 
 **Implementation constraints to VALIDATE at commission (per-pin config is free; the silicon isn't):**
 - **I2S** needs `I2S_BCLK` + `I2S_WS` + `I2S_SD` present as a set, and PIO side-set drives BCLK/WS so those
@@ -421,6 +422,16 @@ the 1 kHz edge sampler.
   slice/channel) — so `PWM_OUT` on GP6 collides and GP7 shares its frequency. Distinct from `STEP` (step
   pulse train) and `SERVO` (50 Hz RC pulse). For DC-motor speed etc., pair `PWM_OUT` (enable/PWM) with
   `OUTPUT` (direction) into an H-bridge driver.
+- **Debounced quadrature counter (`QUAD_A`, `QUAD_B`):** for **mechanical flow meters / reed-relay
+  quadrature contacts** that BOUNCE — a fast PIO decoder would miscount bounce, so this is a **software**
+  decoder in the existing 1 kHz sampler: debounce A and B each (the same `(debounce<<4)|role` N-consecutive
+  integrator as GPIO — set a heavy depth for relays, e.g. 4–15 = 4–15 ms), then run the quadrature Gray-code
+  transition table on the *debounced* (A,B) → a **signed** count (direction = flow forward/reverse). A
+  `QUAD_A` pin must be paired with a `QUAD_B` pin (both present); up to 4 channels (8 pins). **Zero PIO/DMA/
+  PWM cost** (software sampler, like `COUNTER`). Read via `QUAD_READ`/`QUAD_READCLR [chan]` → signed count.
+  **Rate:** debounce caps it (~`1000/depth` Hz/edge) — ample for flow meters (a few–tens of Hz); depth 0 =
+  passthrough (~hundreds of Hz). *For a fast OPTICAL encoder* (closed-loop stepper) use the PIO decoder
+  instead (`quadrature_encoder.pio`, 1 SM) — a separate high-speed variant, not this debounced one.
 - **Counter** is already a per-pin software sampler → no constraint.
 
 So: **config = one role enum, per pin, fully mixable**; the firmware derives I2S/servo/counter groups from
