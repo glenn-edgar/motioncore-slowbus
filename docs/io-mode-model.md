@@ -1,13 +1,16 @@
-# Pico I/O-mode model — node = ADC + one io_mode + interlock + chain-tree
+# Pico I/O-mode model — node = ADC + one io_mode + chain-tree (KB-owned safety)
 
-Status: **DESIGN** (2026-07-01, not yet implemented). Target: `app/bus_controller/main.c` (shared
-by RP2040 / RP2350 via `port/rp2040/board.h`), the `node/interlock/` engine, and the chain-tree
-runtime. Read with `docs/three-thread-design.md`, `docs/interlock-port-map.md`, and the SAMD21
-reference in `~/xiao_blocks` (`contract/samd21/registers.h`, `records.h`,
-`firmware/samd21/device/samd21_commands.c`).
+Status: **io_mode model (steps 1–6) SHIPPED + HW-verified (2026-07-08).** Target:
+`app/bus_controller/main.c` (shared by RP2040 / RP2350 via `port/rp2040/board.h`) + the chain-tree
+runtime. Read with `docs/three-thread-design.md` and the SAMD21 reference in `~/xiao_blocks`.
 
-Supersedes the current free-mix `hwio` per-pad role model (`UNUSED/INPUT/IN_PU/IN_PD/OUTPUT/SERVO/
-PULSE_COUNT`, any pad any role). **This changes the commission format** (`hwio`).
+**★ Node redesign — DESIGN (2026-07-13). See §15 below. ★** Simplifies the RP2040/RP2350 node:
+config moves to an **I2C EEPROM** (writable at runtime → commission over the RS-485 bus, no USB); the
+**dedicated interlock engine is removed** — safety/interlock logic becomes **KB (chain-tree) code**,
+using the Step-6 bench bridge; `idnt` gains a whole-set **`kb_id`** hard-checked at boot. §7 (interlock)
+is **SUPERSEDED** by §15; §2's interlock line and §10's commission format are revised there.
+
+Supersedes the original free-mix `hwio` per-pad role model. **This changes the commission format**.
 
 ---
 
@@ -38,11 +41,13 @@ node =  ADC          always on   — limited SAMD21 analog model: 3ch (GP26/27/2
                                     per-window {seq,min,max,avg,AC-rms}.  (shipped: commit 0045904)
       + io_mode      exactly ONE of { GPIO(+per-pin debounce) | COUNTER | SERVO }, on GP2..GP9,
                                     FROZEN at commission (like the SAMD21 REG_MODE, set at idnt).
-      + interlock    always on   — GP0/GP1 wired-OR veto, 10 equations (slot0 built-in GP1 +
-                                    ilc1..ilc9), DNF DSL.
-      + chain-tree   always on   — the app engine; can READ and DRIVE the whole bench surface,
-                                    incl. async I2C, via the operate layer + reply-sink dispatch.
+      + chain-tree   always on   — the app engine (a compiled KB, selected/guarded by idnt.kb_id);
+                                    READs bench inputs from the blackboard + DRIVEs outputs (incl. the
+                                    GP0 veto) via the operate layer + reply-sink dispatch. OWNS safety
+                                    (§15) — the interlock is now KB logic, not a separate engine.
 ```
+**Redesign note (2026-07-13):** the old separate `interlock` layer is gone; safety is a KB rule with a
+GP0 hardware fail-safe default + watchdog→veto backstop (§15). Config now lives in an I2C EEPROM (§15).
 
 "Limited SAMD21 ADC" = the `MODE_ADC`/`MODE_MIXED` **stats** model (min/max/avg/AC-rms over
 selectable windows). It does **not** include the SAMD21 `MODE_HIPERF` multi-band analysis or the DAC
@@ -123,6 +128,12 @@ Reference: commit `0045904`. 3 channels (GP26/27/28), `CMD_ADC_READ` (1 kHz deci
 ---
 
 ## 7. Interlock (always on) — 10 equations + ADC-window operands
+
+> **★ SUPERSEDED by §15 (Node redesign, 2026-07-13). ★** The dedicated interlock engine and the
+> `ilc0..ilc9` config files are **removed**; safety/interlock logic is now KB (chain-tree) code. The
+> operand set below (GP1, `adcN.{min,max,avg,rms}`, GP2–9, `_nodesdead`, GP0 veto) still describes what
+> the KB reads from the blackboard / drives via the operate layer — only the *host* of the logic
+> changed. Kept here as the operand reference; the "always-on separate engine" framing is obsolete.
 
 10 slots: slot 0 built-in GP1 safety, `ilc1..ilc9` config equations (DNF DSL). Always on,
 independent of io_mode.
@@ -254,3 +265,100 @@ Deferred:
 - Counter "rate" (edges/window) as an interlock operand — start with raw-count thresholds + host
   differencing; add rate later if a real trip needs it.
 - Opcode numbers for the new commands — assigned during implementation.
+
+---
+
+## 15. Node redesign — EEPROM config + KB-owned safety + `kb_id` guard (DESIGN 2026-07-13)
+
+Simplify the RP2040/RP2350 node and make it **field-commissionable over RS-485 without USB**. Three
+coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gains a hard-checked `kb_id`.
+
+### 15.1 Why
+- **Reconfigure/commission over the bus, no USB at the node.** Internal-flash config can't be written
+  at runtime safely (erasing a sector drops XIP for ~tens of ms → stalls core1, where the safety/ADC
+  ISR live). An **external I2C EEPROM** is written by the async I2C service — core1 and the safety line
+  are never touched — so config is writable live, and the whole `picotool` two-step BOOTSEL flash goes
+  away for config (firmware still flashes normally).
+- **One control layer.** The Step-6 bench bridge already lets a KB read every bench input (blackboard)
+  and drive every output (operate layer, incl. the GP0 open-drain veto). So the dedicated interlock
+  engine is redundant — fold its logic into the KB.
+
+### 15.2 Config store → I2C EEPROM (system bus)
+- **Dedicated system I2C bus = `i2c0` (GP20/21)** carries the config EEPROM (24C-series, 0x50–0x57;
+  size per registry needs). Kept OFF the application bus `i2c1` (GP10/11) so identity bootstrap and
+  user peripheral traffic don't contend. (This is the "two I2C models": **system** vs **application**.)
+- **Seam unchanged, backing store swapped.** Keep `cfg_load(name,…)`; change `node/cfg_file.c` from an
+  XIP pointer scan to an I2C read, and **add `cfg_save(name, cbor)`** (EEPROM write via the service task).
+  The `idnt/hwio/neti/slvr` readers above the seam don't change.
+- **Cache at boot.** EEPROM reads are ~ms I2C txns (vs instant XIP) → read the store into a small RAM
+  cache once at boot; `cfg_load` scans RAM; `cfg_save` writes EEPROM **and** updates the cache.
+- **Atomicity/wear.** Reuse the 256-B boot-store row format (magic/`seq`/name/len/CRC-8/CBOR) → last-
+  writer-wins + torn-write detection for free; EEPROM endurance (~1M cyc) suits frequent writes.
+- **Bootstrap ordering.** `i2c0` + the `idnt` read must run very early in `main()` (before role
+  selection), with a safe fallback (quarantine, as today) if the EEPROM is absent/corrupt.
+
+### 15.3 Over-bus commissioning
+- `CFG_WRITE [name][cbor]` / `CFG_READ [name]` / `CFG_LIST` / `CFG_COMMIT`, dispatched through
+  `node_cmd_dispatch` with a **`SINK_BUS`** reply. The EEPROM write is async (its own cfg/I2C service
+  task) → returns `SHELL_ASYNC`, reply-when-done — never blocks the engine or safety. Reuses the
+  reply-sink + async-service substrate from Steps 2/5/6.
+- **Write-gate / commission lifecycle** (mirror SAMD21 `[[samd21-commission-lifecycle]]`): online-vs-
+  offline gate so config can't be corrupted on a live machine; per-file **apply policy** — identity/
+  io_mode/kb_id ⇒ reboot-to-apply; tunables ⇒ hot-apply.
+- **Enrollment of a blank node** (zero-USB from blank) is a separate, larger piece: unconfigured node
+  comes up at a default baud + commissioning address, master enumerates it **by UID** and writes `idnt`.
+  **OPEN:** is first-commission USB-allowed (bench/manufacture) with the bus for field updates — or must
+  a blank node be enrolled over the bus too? First-commission-USB-OK avoids the enrollment protocol.
+
+### 15.4 Interlock removed → KB-owned safety
+- The `node/interlock/` engine and `ilc0..ilc9` files are **deleted**. Safety/interlock is a **KB rule**:
+  read `adc0_rms`/GP1/etc. from the blackboard → drive the GP0 veto via the operate layer. (The
+  HW-verified ADC-rms overcurrent trip becomes exactly this rule.)
+- **Fail-safe backstop stays in hardware/boot, NOT the KB** (this preserves the safety guarantee the
+  separate task used to give):
+  - GP0 defaults **veto-asserted** on reset/unpowered (open-drain wired-OR — already the case);
+  - the **watchdog → veto**: an engine stall/crash drops the veto (KB alive ⇒ KB controls veto; KB dead
+    ⇒ hardware safe).
+- **Tradeoff (accepted):** safety now runs at the engine's priority / event-driven latency rather than
+  the old dedicated prio-4 1 kHz task. Acceptable given the hardware backstop; note the loss of the
+  separate-task determinism.
+
+### 15.5 `idnt.kb_id` — whole-set, hard boot-check
+- The KB is **compiled into the firmware** (not data-loaded) — deterministic, auditable, no interpreter
+  surface. `kb_id` is a **cross-check, not a selector**, joining the existing mis-flash guards
+  (`BUILD_VARIANT`, chip-id, UID).
+- **Whole-set:** `kb_id` identifies the entire compiled KB set, as a **stable content hash of the
+  canonical `kb0.json`** (semantics-based, INDEPENDENT of the codegen's per-run random symbol prefix —
+  `gen_kb.sh` must emit a deterministic `KB_ID`/`KB_HASH`/`KB_VER` constant, not the random prefix).
+- **Hard check:** firmware carries `{KB_ID,KB_HASH,KB_VER}`; `idnt` carries the expected `kb_id`
+  (+ optional `kb_hash`); boot compares → **mismatch ⇒ `g_identity_refused` (quarantine) + GP0 veto
+  asserted.** A mismatched node is *safe*, not just quiet.
+- **Fleet audit:** extend the identity/`CMD_IO_MODE` report to return live `{kb_id,kb_hash,kb_ver}` so a
+  master can verify every node runs the KB its `idnt` was commissioned for.
+
+### 15.6 Config files after the redesign
+| File | Holds | Role | Apply |
+|---|---|---|---|
+| `idnt` | UID + chip, variant, RS-485 addr/baud, **`kb_id` (+`kb_hash`)** | both | reboot |
+| `hwio` | io_mode + 8 pin subconfig + ADC annotation | both | reboot |
+| `neti` | WiFi APs + agent endpoint | master | hot |
+| `slvr` | slave roster (addr/class/flags) | master | hot |
+
+- **`ilc0..ilc9` REMOVED** (14 rows → 4). A pure **slave node record = `idnt` + `hwio`**; master adds
+  `neti` + `slvr`. **OPEN:** keep the per-file 256-B rows, or store the node record as one atomic CBOR
+  blob `{v, idnt, hwio}` (simplest for a slave, one seq/CRC)?
+
+### 15.7 Open decisions
+1. First-commission USB-OK (then bus updates) **vs** zero-USB enrollment from blank (§15.3).
+2. EEPROM part/size (24C32 config-only … 24C256/512 if it also holds the app-bus device registry).
+3. Per-file rows **vs** one atomic node-config CBOR blob (§15.6).
+4. Whether `neti`/`slvr` live in the same EEPROM or stay in internal flash (master always has USB).
+
+### 15.8 Build order (proposed)
+1. `gen_kb.sh` emits deterministic `KB_ID/KB_HASH/KB_VER`; boot compares vs `idnt.kb_id` (hard,
+   quarantine+veto). *(No EEPROM needed yet — hash lives in firmware, `kb_id` can start in flash `idnt`.)*
+2. Port the safety interlock into a KB rule (GP0 veto from `adc0_rms`/GP1); add the GP0 boot fail-safe +
+   watchdog→veto backstop; then **delete `node/interlock/` + `ilc*`**. HW-verify the ADC-rms trip parity.
+3. `i2c0` system bus + EEPROM-backed `cfg_load`/`cfg_save` + boot RAM cache; keep flash as fallback.
+4. `CFG_WRITE/READ/LIST/COMMIT` over the bus (SINK_BUS, async) + write-gate + per-file apply policy.
+5. (If zero-USB) blank-node UID enrollment protocol.
