@@ -18,6 +18,12 @@ full detail in memory [[pico-io-mode-model]]. Steps this line (all on master):
 - 6b blackboard READ half — bench_publish() → gpio_raw/gpio_deb/cnt0..7 bb fields each tick; CMD_BENCH_BB
   0x0116 read-window (b471044)
 Bench: **E661 master RP2040 = ACM1**; **CAF4 slave RP2350 node 9 = ACM0** (both on this firmware; GPIO mode).
+Resident config files (dumped 2026-07-13, `picotool save` of the 64 KB region): **master** = idnt(36)+
+slvr(24)+neti(103), NO hwio/ilc (runs default all-UNUSED GPIO + built-in GP1 interlock only); **slave** =
+idnt(36)+hwio(7)+ilc1(75, the ADC-rms trip). ★Master needs an `hwio` commissioned before its GP2-9 can
+drive/count (currently all UNUSED).★ Config region: RP2040 base 0x101F0000 / RP2350 0x103F0000, len 64 KB,
+256-B rows (magic 0x10C0FFEE, name@+8, len@+12). No soft-reboot cmd — banner only at boot; to dump: 1200-touch
+→ `picotool save -r <base> <base+0x10000> f.bin` → parse rows → `picotool reboot` (back to app).
 **NEXT = the two I2C models (2026-07-09).** OPTIONAL leftovers: SERVO mode (deferred 3rd io_mode); true
 engine-park on async I2C (SINK_ENGINE injected event — currently drops); a concrete autonomous KB rule.
 ★GOTCHAS: KB edits = `app/bus_controller/kb0/kb0.lua` then `bash tools/gen_kb.sh` (re-rolls a random symbol
