@@ -363,7 +363,12 @@ coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gai
 4. `CFG_WRITE/READ/LIST/COMMIT` over the bus (SINK_BUS, async) + write-gate + per-file apply policy.
 5. (If zero-USB) blank-node UID enrollment protocol.
 
-### 15.9 I/O model revision — FULLY per-pin roles (decided 2026-07-13)
+### 15.9 I/O model revision — FULLY per-pin roles (★ FROZEN 2026-07-13 ★)
+
+**Frozen role palette (18):** `UNUSED · INPUT · IN_PU · IN_PD · OUTPUT · OC · OC_PU · COUNTER · SERVO ·
+I2S_BCLK · I2S_WS · I2S_SD · NEOPIXEL · STEP · UART_TX · UART_RX · PWM_OUT · QUAD_A · QUAD_B`. Resource
+pools: software-sampled (IN/OUT/OC/COUNTER/QUAD — 0 cost), hardware PWM (PWM_OUT / STEP-PWM / SERVO-PWM),
+PIO SM (I2S/NEOPIXEL/UART/STEP-PIO/SERVO-bank). Commission validates the per-chip resource budget (above).
 
 **Removes the block `io_mode` entirely.** There is no "one mode for the whole GP2–9 block" (§2/§3 obsolete)
 and **no block modes at all** — **every pin 1–8 (= GP2..GP9) is individually assigned a role**, and *all*
