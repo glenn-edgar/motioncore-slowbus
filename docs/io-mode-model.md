@@ -366,14 +366,35 @@ coupled changes: config → I2C EEPROM; interlock engine → KB code; `idnt` gai
 3. Per-file rows **vs** one atomic node-config CBOR blob (§15.6).
 4. Whether `neti`/`slvr` live in the same EEPROM or stay in internal flash (master always has USB).
 
-### 15.8 Build order (proposed)
-1. `gen_kb.sh` emits deterministic `KB_ID/KB_HASH/KB_VER`; boot compares vs `idnt.kb_id` (hard,
-   quarantine+veto). *(No EEPROM needed yet — hash lives in firmware, `kb_id` can start in flash `idnt`.)*
-2. Port the safety interlock into a KB rule (GP0 veto from `adc0_rms`/GP1); add the GP0 boot fail-safe +
-   watchdog→veto backstop; then **delete `node/interlock/` + `ilc*`**. HW-verify the ADC-rms trip parity.
-3. `i2c0` system bus + EEPROM-backed `cfg_load`/`cfg_save` + boot RAM cache; keep flash as fallback.
-4. `CFG_WRITE/READ/LIST/COMMIT` over the bus (SINK_BUS, async) + write-gate + per-file apply policy.
-5. (If zero-USB) blank-node UID enrollment protocol.
+### 15.8 Build order — PHASED (2026-07-13)
+
+**Overriding principle:** build the whole redesign on a **single node over USB first (NO slaves / no bus
+traffic)**, then bring up **WiFi (still no slaves)**, and defer the **RS-485 slave / multi-node** dimension
+to the end; **slave configuration is the very last phase.** The per-pin **GPIO roles are integrated one at a
+time** (step by step), each HW-verified, within Phase A.
+
+**Phase A — USB, no slaves** (single node, USB transport; the whole architecture lands here first):
+  - A1. `gen_kb.sh` emits deterministic `KB_ID/KB_HASH/KB_VER`; boot hard-checks vs `idnt.kb_id`
+    (mismatch → quarantine + GP0 veto). *(No EEPROM yet — hash in firmware, `kb_id` can start in flash.)*
+  - A2. Interlock → **KB LEAF construct** (§15.10) + GP0 boot fail-safe + watchdog→veto backstop; then
+    **delete `node/interlock/` + `ilc*`**. HW-verify ADC-rms trip parity.
+  - A3. **AT24C256** config store — `i2c0` backend for `cfg_load` + `cfg_save` (page/ACK-poll) + boot RAM
+    cache; `CFG_WRITE/READ/LIST/COMMIT` **over USB** + write-gate + per-file apply policy. (Flash fallback
+    during bring-up.)
+  - A4. **Per-pin GPIO role model (§15.9) — integrated ROLE BY ROLE, each HW-verified:** begin with the
+    shipped set (INPUT/OUTPUT/OC/COUNTER), then add incrementally PWM_OUT · QUAD · NEOPIXEL · STEP · UART ·
+    I2S · SERVO, plus the commission resource-budget check.
+  - A5. `ilim` EEPROM-tunable interlock limits (hot-apply).
+
+**Phase B — WiFi, no slaves:** bring the redesigned node up on the WiFi transport (dual-transport exists;
+re-verify against the new EEPROM config store + per-pin roles). Still a single node.
+
+**Phase C — Add slaves:** the RS-485 multi-node dimension — redesigned node as a slave; `CFG_*` **over the
+bus** (`SINK_BUS`, async); roster; over-bus reach. *(If zero-USB is required, the blank-node UID enrollment
+protocol lands here — see §15.7 #1.)*
+
+**Phase D — Slave configurations:** commission/configure slaves entirely over the bus — per-pin `hwio`,
+`ilim`, and `kb_id` verify per slave; fleet audit.
 
 ### 15.9 I/O model revision — FULLY per-pin roles (★ FROZEN 2026-07-13 ★)
 
