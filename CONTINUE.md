@@ -2,30 +2,47 @@
 
 Read first on any session resume. Companion to `README.md` (orientation),
 `docs/three-thread-design.md` (architecture), and `docs/README.md` (full spec).
-Last updated **2026-07-08 (I/O-mode model COMPLETE)**. Branch: **`master`** (clean; commit `b471044`).
-**★RESUME HERE (2026-07-09): work on the TWO I2C MODELS.★** The I/O-mode restructure (steps 1-6) is
-DONE + HW-verified — node model = ADC(always) + ONE io_mode {GPIO(+debounce) | COUNTER | SERVO}
-frozen@commission + interlock(10 eq) + chain-tree bench bridge. Design doc `docs/io-mode-model.md`;
-full detail in memory [[pico-io-mode-model]]. Steps this line (all on master):
-- 1 io_mode+hwio v2+IO_MODE (e6ccf44) · commission tool v2 (1581b0f)
-- 3 GPIO mode (7cfbcca,a3414fc) + COUNTER mode (5cbe2cc,fa820ce)
-- 4 ADC-window interlock operands _adcN{min,max,avg,rms} (eb22386)
-- 2 operate layer + reply-sink dispatch — reply_sink_t{USB/BUS/ENGINE}+SHELL_ASYNC, async I2C folded
-  into node_cmd_dispatch (ee4fdcf)
-- 5 slave gets its own i2c_service_task; SINK_BUS routed via g_up_q→node_reply_pump (single-core) (be4d546)
-- 6a engine-operate KB leaf CMD_APP_OP 0x0306 — a kbapp action leaf calls node_cmd_dispatch, reply to the
-  asker (sync inline / async I2C via sink) (a543bbe)
-- 6b blackboard READ half — bench_publish() → gpio_raw/gpio_deb/cnt0..7 bb fields each tick; CMD_BENCH_BB
-  0x0116 read-window (b471044)
-Bench: **E661 master RP2040 = ACM1**; **CAF4 slave RP2350 node 9 = ACM0** (both on this firmware; GPIO mode).
-Resident config files (dumped 2026-07-13, `picotool save` of the 64 KB region): **master** = idnt(36)+
-slvr(24)+neti(103), NO hwio/ilc (runs default all-UNUSED GPIO + built-in GP1 interlock only); **slave** =
-idnt(36)+hwio(7)+ilc1(75, the ADC-rms trip). ★Master needs an `hwio` commissioned before its GP2-9 can
-drive/count (currently all UNUSED).★ Config region: RP2040 base 0x101F0000 / RP2350 0x103F0000, len 64 KB,
-256-B rows (magic 0x10C0FFEE, name@+8, len@+12). No soft-reboot cmd — banner only at boot; to dump: 1200-touch
-→ `picotool save -r <base> <base+0x10000> f.bin` → parse rows → `picotool reboot` (back to app).
-**NEXT = the two I2C models (2026-07-09).** OPTIONAL leftovers: SERVO mode (deferred 3rd io_mode); true
-engine-park on async I2C (SINK_ENGINE injected event — currently drops); a concrete autonomous KB rule.
+Last updated **2026-07-13 (NODE REDESIGN — design complete, phased)**. Branch: **`master`** (clean; commit `339782c`).
+**★RESUME HERE (2026-07-14): START THE §15 NODE REDESIGN — Phase A1.★** A big design session locked a
+ground-up node simplification (design doc `docs/io-mode-model.md` **§15**, memory [[node-redesign-eeprom-kb]]).
+NOT yet built. Decisions locked:
+- **Config → I2C EEPROM = AT24C256** (32 KB, 64-B page, @0x50 on a DEDICATED SYSTEM bus `i2c0` GP20/21;
+  app peripherals stay on `i2c1` GP10/11 = "two I2C models"). Runtime-writable → **commission over RS-485,
+  NO USB** at the node. `cfg_load` seam kept, backing store XIP→I2C + add `cfg_save` (4 page-aligned 64-B
+  ACK-polled writes/row) + boot RAM cache. `CFG_WRITE/READ/LIST/COMMIT` via the reply-sink async substrate.
+- **Interlock engine REMOVED → KB-owned safety as a LEAF construct (§15.10):** one ChainTree DSL leaf node,
+  C evaluator runs the DNF each tick (reuses the OLD interlock DNF DSL as leaf syntax) → drives GP0. Equation
+  STRUCTURE compiled → covered by kb_id; trip THRESHOLDS in a new hot-tunable EEPROM file **`ilim`**. Fail-safe
+  stays in HW/BOOT: GP0 default-veto + watchdog→veto. Delete `node/interlock/` + `ilc*`.
+- **idnt += whole-set `kb_id`** = STABLE content hash of canonical kb0.json (gen_kb.sh must emit deterministic
+  KB_ID/HASH/VER, NOT the random prefix); boot HARD-check → mismatch = quarantine + veto; fleet-audit read-back.
+- **I/O = FULLY PER-PIN, block io_mode DROPPED. FROZEN 18-role palette (§15.9):** UNUSED/INPUT/IN_PU/IN_PD/
+  OUTPUT/OC/OC_PU/COUNTER/SERVO/I2S_BCLK/I2S_WS/I2S_SD/NEOPIXEL/STEP/UART_TX/UART_RX/PWM_OUT/QUAD_A/QUAD_B.
+  Each pin's hwio byte independently sets its role, all mixable; hwio_apply assembles composite funcs (I2S RX+
+  DMA, servo, ws2812, step-gen, PIO-UART, debounced-quad, HW-PWM) from roles present. Commission tool VALIDATES
+  a per-chip resource budget (PIO SMs / PWM slices / DMA / HW-UART / instr-mem) + reject over-budget.
+  Key roles: STEP=DRV8825 step/dir; QUAD_A/B=DEBOUNCED software quad for mechanical/reed-relay flow meters;
+  I2S mic 44.1k mono=1 SM+DMA. SM budget: RP2040 ~5-6 free, RP2350 ~9-10 (PIO2 free).
+
+**★BUILD ORDER — PHASED (§15.8): whole redesign on a SINGLE NODE over USB first (NO slaves), then WiFi (no
+slaves), add RS-485 SLAVES last, slave config the very last phase. GPIO roles integrated ONE AT A TIME.★**
+- **Phase A (USB, no slaves) = NEXT:** A1 gen_kb.sh deterministic KB_ID + boot hard-check (no EEPROM/HW yet —
+  the low-risk entry point). A2 interlock→KB leaf + GP0/watchdog backstop, delete node/interlock/+ilc*, HW-verify
+  ADC-rms parity. A3 AT24C256 cfg_load/cfg_save + cache + CFG_* over USB. A4 per-pin roles role-by-role (INPUT/
+  OUT/OC/COUNTER first, then PWM_OUT/QUAD/NEOPIXEL/STEP/UART/I2S/SERVO + resource check). A5 ilim tunable limits.
+- Phase B (WiFi, no slaves) → Phase C (add slaves; CFG_* over bus) → Phase D (slave configurations).
+
+Open (§15.7, non-blocking): first-commission-USB (Phase A) vs zero-USB blank-node enrollment (Phase C);
+per-file 256-B rows vs one CBOR node blob; neti/slvr in EEPROM vs flash.
+
+**Superseded background (SHIPPED, still true):** the io_mode model steps 1-6 (all on master) — 1 io_mode+hwio v2
+(e6ccf44) · 2 reply-sink dispatch (ee4fdcf) · 3 GPIO+COUNTER (7cfbcca,a3414fc,5cbe2cc,fa820ce) · 4 ADC-window
+interlock operands (eb22386) · 5 slave i2c_service_task (be4d546) · 6a CMD_APP_OP engine-operate leaf (a543bbe)
+· 6b bench_publish blackboard read half + CMD_BENCH_BB (b471044). §15 reshapes this (per-pin, EEPROM, KB safety).
+Bench: **E661 master RP2040 = ACM1**; **CAF4 slave RP2350 node 9 = ACM0**. Resident config (dumped 2026-07-13):
+master = idnt+slvr+neti, NO hwio/ilc; slave = idnt+hwio+ilc1(ADC-rms trip). Config region RP2040 @0x101F0000 /
+RP2350 @0x103F0000, 64 KB, 256-B rows (magic 0x10C0FFEE, name@+8, len@+12); dump via 1200-touch→`picotool save`
+→parse→`picotool reboot`. Pre-redesign next-steps (ADC/GPIO/PWM jumper matrix across chip×role) folded into Phase A.
 ★GOTCHAS: KB edits = `app/bus_controller/kb0/kb0.lua` then `bash tools/gen_kb.sh` (re-rolls a random symbol
 prefix → whole incr/ churns, semantically idempotent, commit it). Two RP on USB → old picotool can't select;
 1200-touch the target's OWN port (`luajit -e 'require([[libcomm]]).touch_1200([[/dev/ttyACMx]])'`) then
