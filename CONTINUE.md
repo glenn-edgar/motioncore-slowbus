@@ -39,7 +39,9 @@ per-file 256-B rows vs one CBOR node blob; neti/slvr in EEPROM vs flash.
 (e6ccf44) · 2 reply-sink dispatch (ee4fdcf) · 3 GPIO+COUNTER (7cfbcca,a3414fc,5cbe2cc,fa820ce) · 4 ADC-window
 interlock operands (eb22386) · 5 slave i2c_service_task (be4d546) · 6a CMD_APP_OP engine-operate leaf (a543bbe)
 · 6b bench_publish blackboard read half + CMD_BENCH_BB (b471044). §15 reshapes this (per-pin, EEPROM, KB safety).
-Bench: **E661 master RP2040 = ACM1**; **CAF4 slave RP2350 node 9 = ACM0**. Resident config (dumped 2026-07-13):
+Bench: **E661 master RP2040 = ACM1**; **CAF4 slave RP2350 node 9 = ACM0**. **NO JUMPERS currently deployed on
+either Pico** (2026-07-13) — bare boards; any ADC/GPIO/PWM loopback (e.g. GP22→GP26 for ADC, GP22→GP2 for
+GPIO/PWM) must be wired before those checks. Resident config (dumped 2026-07-13):
 master = idnt+slvr+neti, NO hwio/ilc; slave = idnt+hwio+ilc1(ADC-rms trip). Config region RP2040 @0x101F0000 /
 RP2350 @0x103F0000, 64 KB, 256-B rows (magic 0x10C0FFEE, name@+8, len@+12); dump via 1200-touch→`picotool save`
 →parse→`picotool reboot`. Pre-redesign next-steps (ADC/GPIO/PWM jumper matrix across chip×role) folded into Phase A.
